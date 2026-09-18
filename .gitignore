@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+.venv/
+venv/
+env/
+
+RESOURCES/aurora/v0.1/model/
+RESOURCES/aurora/v0.1/aurora_qlora/
+
+*.log
+.env

@@ -1,0 +1,57 @@
+### Aurora model problems observed
+
+1. **False memory**
+
+   * Claims memories that don't exist.
+   * Example: “what you mentioned yesterday.”
+
+2. **False continuity**
+
+   * Acts as though previous events/conversations happened when they didn't.
+
+3. **Poor instruction execution**
+
+   * “Tell me something funny” → doesn't actually tell a joke.
+
+4. **Indirect responses**
+
+   * Frequently talks *around* the question instead of answering it.
+
+5. **Topic drift**
+
+   * Brings PRIMORA/architecture into unrelated conversations.
+
+6. **Meta-response habit**
+
+   * Says what it *will* do instead of actually doing it.
+
+7. **Unsupported personal knowledge**
+
+   * Claims to know things about Amir without being able to identify what it knows.
+
+8. **Over-personification without grounding**
+
+   * Sometimes invents preferences/memories, e.g. “Aurora's favorite color.”
+
+9. **Overuse of learned Aurora patterns**
+
+   * “I’ll tell you…”, “I’d rather…”, “what matters next…” can become repetitive templates.
+
+10. **Weak conversational grounding**
+
+* Doesn't consistently use the immediate user message as the primary source of truth.
+
+### But there are positives
+
+* Identity is now substantially better.
+* It responds naturally.
+* It can accept corrections.
+* It can follow explicit behavioral instructions.
+* Personality is present.
+
+So the problem isn't **“Aurora has no personality.”**
+
+It's closer to:
+
+> **Aurora has personality, but her model needs substantially better grounding, instruction-following, and truthful memory behavior.**
+

@@ -1,0 +1,2 @@
+change interface - create a dashboard
+installing venv in primora
