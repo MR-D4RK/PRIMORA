@@ -1,5 +1,7 @@
+import os
 import sys
 import json
+import tempfile
 sys.path.insert(0, "C:\\PRIMORA PROJECT")
 
 from PRIMORA.aurora import Aurora
@@ -43,12 +45,22 @@ class MockScriptedBrain(Brain):
         self._model = model
         self.seen_messages = []
 
-    def generate(self, messages: list[dict[str, str]]) -> BrainResult:
+    def generate(self, messages: list[dict[str, str]], max_output_tokens=None) -> BrainResult:
         self.seen_messages.append(list(messages))
         return self._outputs.pop(0)
 
     def get_model_name(self) -> str:
         return self._model
+
+
+_TEST_TMPDIR = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
+def _test_context():
+    from PRIMORA.prime.context import ContextManager
+    fd, path = tempfile.mkstemp(suffix=".db", dir=_TEST_TMPDIR.name)
+    os.close(fd)
+    return ContextManager(db_path=path)
 
 
 def test_extract_valid_request():
@@ -129,7 +141,7 @@ def test_respond_valid_request_reaches_prime():
         BrainResult.success("Done.", "m"),
     ])
 
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     result = aurora.respond([
         {"role": "user", "content": "What is 2+3?"}
     ])
@@ -146,7 +158,7 @@ def test_respond_prime_result_returned_to_brain():
         BrainResult.success(VALID_BLOCK, "m"),
         BrainResult.success("Done: 5", "m"),
     ])
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     aurora.respond([{"role": "user", "content": "Compute"}])
     assert len(brain.seen_messages) == 2
     followup = brain.seen_messages[1]
@@ -162,7 +174,7 @@ def test_respond_multiple_blocks_no_execution():
     provider = MockProvider({"calculate": PrimeResult.success({"result": 5})})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.success(VALID_BLOCK + "\n" + VALID_BLOCK, "m")])
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     result = aurora.respond([{"role": "user", "content": "Hi"}])
     assert len(provider.calls) == 0
     assert len(brain.seen_messages) == 1
@@ -173,7 +185,7 @@ def test_respond_prose_no_execution():
     provider = MockProvider({"calculate": PrimeResult.success({"result": 5})})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.success("I'll ask Prime to handle this.", "m")])
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     result = aurora.respond([{"role": "user", "content": "Hi"}])
     assert len(provider.calls) == 0
     assert result.content == "I'll ask Prime to handle this."
@@ -183,7 +195,7 @@ def test_respond_plain_chat_unchanged():
     provider = MockProvider({})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.success("Hello there!", "m")])
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     result = aurora.respond([{"role": "user", "content": "Hi"}])
     assert len(provider.calls) == 0
     assert len(brain.seen_messages) == 1
@@ -195,7 +207,7 @@ def test_respond_first_think_failure_no_execution():
     provider = MockProvider({"calculate": PrimeResult.success({"result": 5})})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.failure("Model unavailable", "m")])
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     result = aurora.respond([{"role": "user", "content": "Hi"}])
     assert len(provider.calls) == 0
     assert not result.success
@@ -206,7 +218,7 @@ def test_respond_malformed_block_no_execution():
     provider = MockProvider({"calculate": PrimeResult.success({"result": 5})})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.success("<prime_request>{broken</prime_request>", "m")])
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     result = aurora.respond([{"role": "user", "content": "Hi"}])
     assert len(provider.calls) == 0
     assert len(brain.seen_messages) == 1
@@ -236,7 +248,7 @@ def test_respond_context_metadata_pass_through():
         BrainResult.success(block, "m"),
         BrainResult.success("ok", "m"),
     ])
-    aurora = Aurora(prime, brain=brain)
+    aurora = Aurora(prime, brain=brain, context_manager=_test_context())
     aurora.respond([{"role": "user", "content": "Hi"}])
     assert len(provider.calls) == 0  # Specialist handles it, not provider
 

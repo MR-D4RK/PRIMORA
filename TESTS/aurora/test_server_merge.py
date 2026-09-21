@@ -1,5 +1,7 @@
+import os
 import sys
 import json
+import tempfile
 import threading
 import time
 import urllib.request
@@ -41,7 +43,7 @@ class MockScriptedBrain(Brain):
         self._outputs = list(outputs)
         self._model = model
 
-    def generate(self, messages: list[dict[str, str]]) -> BrainResult:
+    def generate(self, messages: list[dict[str, str]], max_output_tokens=None) -> BrainResult:
         return self._outputs.pop(0)
 
     def get_model_name(self) -> str:
@@ -52,6 +54,16 @@ def _test_config(**kwargs):
     params = dict(model_path="/fake/model", adapter_path="/fake/adapter")
     params.update(kwargs)
     return AuroraConfig(**params)
+
+
+_TEST_TMPDIR = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
+def _test_context():
+    from PRIMORA.prime.context import ContextManager
+    fd, path = tempfile.mkstemp(suffix=".db", dir=_TEST_TMPDIR.name)
+    os.close(fd)
+    return ContextManager(db_path=path)
 
 
 def _start_server(aurora, port):
@@ -85,7 +97,7 @@ def test_server_has_no_duplicate_init():
 def test_ui_uses_same_aurora_instance():
     provider = MockProvider()
     brain = MockScriptedBrain([BrainResult.success("Hello from the one Aurora!", "merge-test-model")])
-    aurora = Aurora(Prime(provider), brain=brain, config=_test_config())
+    aurora = Aurora(Prime(provider), brain=brain, config=_test_config(), context_manager=_test_context())
     _start_server(aurora, TEST_PORT)
     data = _post(TEST_PORT, [{"role": "user", "content": "Hi"}])
     assert data["success"] is True
@@ -105,7 +117,8 @@ def test_ui_prime_flow_over_http():
     aurora = Aurora(
         Prime(provider),
         brain=brain,
-        config=_test_config()
+        config=_test_config(),
+        context_manager=_test_context()
     )
 
     _start_server(aurora, TEST_PORT + 1)

@@ -11,3 +11,6 @@ RESOURCES/aurora/v0.1/aurora_qlora/
 
 *.log
 .env
+
+# Runtime conversation database (Context Manager store)
+PRIMORA/data/

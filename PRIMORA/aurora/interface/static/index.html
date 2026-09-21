@@ -304,6 +304,24 @@
   <div class="vignette" aria-hidden="true"></div>
 
   <div class="wordmark"><span class="mark"></span>AURORA</div>
+  <button id="newchat" type="button" title="Start a new conversation">New chat</button>
+  <style>
+    #newchat{
+      position: fixed;
+      top: 28px;
+      right: 32px;
+      z-index: 5;
+      background: transparent;
+      border: 1px solid rgba(255,255,255,0.14);
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      border-radius: 999px;
+      padding: 6px 14px;
+      cursor: pointer;
+    }
+    #newchat:hover{ color: var(--text); border-color: rgba(63,224,197,0.45); }
+  </style>
 
   <main>
     <div class="presence" id="presence"></div>
@@ -375,6 +393,32 @@
   const conversation = [];
   let started = false;
 
+  // ---------- session ----------
+  // One browser conversation keeps one session_id so the server can tell
+  // a continued chat apart from a brand-new one. Persisted locally only.
+  function newSessionId(){
+    if(window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return 'sess-' + Date.now().toString(36) + '-'
+      + Math.floor(Math.random() * 1e9).toString(36);
+  }
+  let sessionId = null;
+  try{ sessionId = localStorage.getItem('primora_session_id'); }catch(e){}
+  if(!sessionId){
+    sessionId = newSessionId();
+    try{ localStorage.setItem('primora_session_id', sessionId); }catch(e){}
+  }
+  const newChatBtn = document.getElementById('newchat');
+  newChatBtn.addEventListener('click', () => {
+    conversation.length = 0;
+    thread.innerHTML = '';
+    sessionId = newSessionId();
+    try{ localStorage.setItem('primora_session_id', sessionId); }catch(e){}
+    started = false;
+    intro.classList.remove('hidden');
+    presence.classList.remove('compact');
+    input.focus();
+  });
+
   function autoGrow(){
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 120) + 'px';
@@ -413,7 +457,7 @@
       const res = await fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ messages: conversation })
+        body: JSON.stringify({ messages: conversation, session_id: sessionId })
       });
 
       let data;
@@ -428,6 +472,11 @@
         const reason = (data && data.error) ? data.error : `request failed (${res.status})`;
         addMessage('system', `Aurora couldn't respond: ${reason}`);
         return;
+      }
+
+      if(data.session_id && data.session_id !== sessionId){
+        sessionId = data.session_id;
+        try{ localStorage.setItem('primora_session_id', sessionId); }catch(e){}
       }
 
       addMessage('aurora', data.content);

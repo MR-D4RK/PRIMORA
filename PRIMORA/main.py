@@ -60,7 +60,10 @@ def main():
             break
 
         try:
-            result = aurora.respond([{"role": "user", "content": user_input}])
+            result = aurora.respond(
+                [{"role": "user", "content": user_input}],
+                session_id=os.environ.get("PRIMORA_SESSION_ID", "default"),
+            )
 
             if result.success:
                 print(f"Aurora: {result.content}\n")

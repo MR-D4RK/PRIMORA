@@ -20,7 +20,7 @@ class MockBrain(Brain):
         self._model = model
         self.warmup_calls = 0
 
-    def generate(self, messages: list[dict[str, str]]) -> BrainResult:
+    def generate(self, messages: list[dict[str, str]], max_output_tokens=None) -> BrainResult:
         return BrainResult.success("mock response", self._model)
 
     def get_model_name(self) -> str:
@@ -54,7 +54,7 @@ class CountingBrain(AuroraBrain):
 
 def test_default_brain_warmup_returns_none():
     class PlainBrain(Brain):
-        def generate(self, messages):
+        def generate(self, messages, max_output_tokens=None):
             return BrainResult.success("ok", "m")
 
         def get_model_name(self):

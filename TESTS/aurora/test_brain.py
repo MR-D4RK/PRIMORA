@@ -13,7 +13,7 @@ def test_brain_interface():
         def __init__(self, model: str):
             self._model = model
 
-        def generate(self, messages: list[dict[str, str]]) -> BrainResult:
+        def generate(self, messages: list[dict[str, str]], max_output_tokens=None) -> BrainResult:
             return BrainResult.success("mock", self._model)
 
         def get_model_name(self) -> str:
@@ -98,7 +98,13 @@ def test_aurora_brain_generation_logic():
     mock_torch = MagicMock()
     mock_transformers = MagicMock()
     mock_peft = MagicMock()
-    
+    # Production _initialize() prints package versions; MagicMock blocks
+    # implicit dunder access, so set them explicitly like any other attr.
+    mock_torch.__version__ = "test"
+    mock_transformers.__version__ = "test"
+    mock_peft.__version__ = "test"
+    mock_torch.cuda.is_available.return_value = False
+
     def mock_import(name, *args, **kwargs):
         if name == 'torch':
             return mock_torch
@@ -111,12 +117,11 @@ def test_aurora_brain_generation_logic():
     with patch('builtins.__import__', side_effect=mock_import):
         mock_tokenizer = MagicMock()
         mock_tokenizer.apply_chat_template.return_value = "test prompt"
-        # Return a proper tensor-like object with .to() method
+        # Return a proper tensor-like object with .to() method.
+        # Shape indexing must yield real ints for the context-size math.
         mock_inputs = MagicMock()
         mock_inputs.to.return_value = mock_inputs
-        mock_inputs.__getitem__ = lambda self, key: mock_torch.tensor([[1, 2, 3]])
-        mock_inputs.__setitem__ = lambda self, key, value: None
-        mock_inputs.shape = [1, 3]
+        mock_inputs.__getitem__.return_value.shape = [0, 5]
         mock_tokenizer.return_value = mock_inputs
         mock_tokenizer.decode.return_value = "Generated response"
         mock_tokenizer.eos_token_id = 2
@@ -127,7 +132,9 @@ def test_aurora_brain_generation_logic():
 
         mock_model = MagicMock()
         mock_model.device = "cpu"
-        mock_model.generate.return_value = [mock_torch.tensor([1, 2, 3, 4, 5, 6])]
+        mock_generated = MagicMock()
+        mock_generated.__getitem__.return_value.shape = [6]
+        mock_model.generate.return_value = [mock_generated]
         mock_peft.PeftModel.from_pretrained.return_value = mock_model
 
         config = AuroraConfig(model_path="/fake/model", adapter_path="/fake/adapter")

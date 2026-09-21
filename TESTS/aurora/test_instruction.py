@@ -1,5 +1,6 @@
 import sys
 import os
+import tempfile
 sys.path.insert(0, "C:\\PRIMORA PROJECT")
 
 from PRIMORA.aurora import Aurora
@@ -79,7 +80,7 @@ class MockScriptedBrain(Brain):
         self._model = model
         self.seen_messages = []
 
-    def generate(self, messages: list[dict[str, str]]) -> BrainResult:
+    def generate(self, messages: list[dict[str, str]], max_output_tokens=None) -> BrainResult:
         self.seen_messages.append(list(messages))
         return self._outputs.pop(0)
 
@@ -94,6 +95,16 @@ def _test_config(**kwargs):
     )
     params.update(kwargs)
     return AuroraConfig(**params)
+
+
+_TEST_TMPDIR = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+
+def _test_context():
+    from PRIMORA.prime.context import ContextManager
+    fd, path = tempfile.mkstemp(suffix=".db", dir=_TEST_TMPDIR.name)
+    os.close(fd)
+    return ContextManager(db_path=path)
 
 
 def test_instruction_default_content():
@@ -123,7 +134,7 @@ def test_respond_prepends_instruction_once():
     provider = MockProvider({})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.success("Hello!", "m")])
-    aurora = Aurora(prime, brain=brain, config=_test_config())
+    aurora = Aurora(prime, brain=brain, config=_test_config(), context_manager=_test_context())
     aurora.respond([{"role": "user", "content": "Hi"}])
 
     first_seen = brain.seen_messages[0]
@@ -139,7 +150,7 @@ def test_respond_does_not_duplicate_caller_system():
     provider = MockProvider({})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.success("Hello!", "m")])
-    aurora = Aurora(prime, brain=brain, config=_test_config())
+    aurora = Aurora(prime, brain=brain, config=_test_config(), context_manager=_test_context())
     aurora.respond([
         {"role": "system", "content": "Caller system."},
         {"role": "user", "content": "Hi"},
@@ -158,7 +169,7 @@ def test_respond_followup_keeps_single_instruction():
         BrainResult.success(VALID_BLOCK, "m"),
         BrainResult.success("The answer is 5.", "m"),
     ])
-    aurora = Aurora(prime, brain=brain, config=_test_config())
+    aurora = Aurora(prime, brain=brain, config=_test_config(), context_manager=_test_context())
 
     result = aurora.respond([{"role": "user", "content": "What is 2+3?"}])
 
@@ -177,7 +188,7 @@ def test_respond_plain_chat_no_request():
     provider = MockProvider({})
     prime = Prime(provider)
     brain = MockScriptedBrain([BrainResult.success("Hello there!", "m")])
-    aurora = Aurora(prime, brain=brain, config=_test_config())
+    aurora = Aurora(prime, brain=brain, config=_test_config(), context_manager=_test_context())
     result = aurora.respond([{"role": "user", "content": "Hi"}])
     assert len(provider.calls) == 0
     assert len(brain.seen_messages) == 1
@@ -193,7 +204,7 @@ def test_respond_valid_request_reaches_prime():
         BrainResult.success("Done.", "m"),
     ])
 
-    aurora = Aurora(prime, brain=brain, config=_test_config())
+    aurora = Aurora(prime, brain=brain, config=_test_config(), context_manager=_test_context())
     result = aurora.respond([
         {"role": "user", "content": "What is 2+3?"}
     ])

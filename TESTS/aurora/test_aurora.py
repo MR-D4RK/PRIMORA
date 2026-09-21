@@ -24,7 +24,7 @@ class MockBrain(Brain):
     def __init__(self, model: str = "test-model"):
         self._model = model
 
-    def generate(self, messages: list[dict[str, str]]) -> BrainResult:
+    def generate(self, messages: list[dict[str, str]], max_output_tokens=None) -> BrainResult:
         return BrainResult.success("mock response", self._model)
 
     def get_model_name(self) -> str:

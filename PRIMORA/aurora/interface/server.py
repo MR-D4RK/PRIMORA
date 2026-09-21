@@ -98,16 +98,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "Missing or invalid 'messages'"})
             return
 
+        session_id = body.get("session_id") or body.get("conversation_id") or "default"
+        if not isinstance(session_id, str) or not session_id:
+            session_id = "default"
+
         try:
-            result = aurora.respond(messages)
+            result = aurora.respond(messages, session_id=session_id)
         except Exception as e:
             self._send_json(500, {"error": f"Aurora error: {e}"})
             return
 
         if result.success:
-            self._send_json(200, {"success": True, "content": result.content, "model": result.model})
+            self._send_json(200, {"success": True, "content": result.content,
+                                  "model": result.model, "session_id": session_id})
         else:
-            self._send_json(200, {"success": False, "error": result.error, "model": result.model})
+            self._send_json(200, {"success": False, "error": result.error,
+                                  "model": result.model, "session_id": session_id})
 
 
 if __name__ == "__main__":

@@ -57,13 +57,23 @@ class AuroraConfig:
     top_p: float = 0.9
     repetition_penalty: float = 1.08
     system_instruction: str = DEFAULT_SYSTEM_INSTRUCTION
+    context_target: int = 1000
+    context_ceiling: int = 1100
+    context_output_reserve: int = 128
+    context_total: int = 1228
 
     @classmethod
     def from_env(cls) -> "AuroraConfig":
         root = get_project_root()
         default_model = str(root / "RESOURCES" / "aurora" / "v0.1" / "model")
         default_adapter = str(root / "RESOURCES" / "aurora" / "v0.1" / "aurora_qlora")
-        
+
+        def _int(name: str, default: int) -> int:
+            try:
+                return int(os.environ.get(name, str(default)))
+            except (TypeError, ValueError):
+                return default
+
         return cls(
             model_path=os.environ.get("PRIMORA_AURORA_MODEL_PATH", default_model),
             adapter_path=os.environ.get("PRIMORA_AURORA_ADAPTER_PATH", default_adapter),
@@ -71,7 +81,11 @@ class AuroraConfig:
             temperature=float(os.environ.get("PRIMORA_AURORA_TEMPERATURE", "0.75")),
             top_p=float(os.environ.get("PRIMORA_AURORA_TOP_P", "0.9")),
             repetition_penalty=float(os.environ.get("PRIMORA_AURORA_REPETITION_PENALTY", "1.08")),
-            system_instruction=os.environ.get("PRIMORA_AURORA_SYSTEM_INSTRUCTION", DEFAULT_SYSTEM_INSTRUCTION)
+            system_instruction=os.environ.get("PRIMORA_AURORA_SYSTEM_INSTRUCTION", DEFAULT_SYSTEM_INSTRUCTION),
+            context_target=_int("PRIMORA_AURORA_CONTEXT_TARGET", 1000),
+            context_ceiling=_int("PRIMORA_AURORA_CONTEXT_CEILING", 1100),
+            context_output_reserve=_int("PRIMORA_AURORA_CONTEXT_OUTPUT_RESERVE", 128),
+            context_total=_int("PRIMORA_AURORA_CONTEXT_TOTAL", 1228)
         )
 
     def validate(self) -> Optional[str]:

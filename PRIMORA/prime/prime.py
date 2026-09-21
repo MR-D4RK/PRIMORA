@@ -1,3 +1,4 @@
+from .context import ContextManager
 from .contract import PrimeRequest, PrimeResult
 from .orchestrator import Orchestrator
 from .providers import Provider
@@ -9,12 +10,18 @@ class Prime:
         if provider is None:
             raise ValueError("Prime requires a Provider")
         self._registry = CapabilityRegistry()
+        self._context = ContextManager()
         self._orchestrator = Orchestrator(provider, self._registry)
 
     @property
     def registry(self) -> CapabilityRegistry:
         """Read-only access to the capability registry for Aurora's awareness."""
         return self._registry
+
+    @property
+    def context(self) -> ContextManager:
+        """Prime-owned conversation context infrastructure."""
+        return self._context
 
     def handle(self, request: PrimeRequest) -> PrimeResult:
         if not isinstance(request, PrimeRequest):
