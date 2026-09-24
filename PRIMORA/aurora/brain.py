@@ -150,10 +150,14 @@ class AuroraBrain(Brain):
                 trust_remote_code=True,
             )
 
+            # Deterministic all-GPU placement. device_map="auto" lets
+            # Accelerate spill modules to CPU/disk based on transient free
+            # VRAM, which bitsandbytes 4-bit then rejects. {"": 0} keeps
+            # every module on GPU 0; genuine shortage surfaces as CUDA OOM.
             base_model = AutoModelForCausalLM.from_pretrained(
                 self._config.model_path,
                 quantization_config=bnb_config,
-                device_map="auto",
+                device_map={"": 0},
                 trust_remote_code=True,
                 dtype=torch.float16,
                 attn_implementation="sdpa",
@@ -167,7 +171,7 @@ class AuroraBrain(Brain):
             self._model = PeftModel.from_pretrained(
                 base_model,
                 self._config.adapter_path,
-                device_map="auto",
+                device_map={"": 0},
             )
 
             self._model.eval()

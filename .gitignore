@@ -14,3 +14,9 @@ RESOURCES/aurora/v0.1/aurora_qlora/
 
 # Runtime conversation database (Context Manager store)
 PRIMORA/data/
+
+# Local specialist model - too large for Git
+RESOURCES/specialists/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+
+NOTES/
+
