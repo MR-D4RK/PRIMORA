@@ -1,0 +1,59 @@
+# PRIMORA's local-only SearXNG settings, bind-mounted into the container at
+# /etc/searxng/settings.yml by RESOURCES/searxng/docker-compose.yml.
+#
+# Everything not listed here falls back to the upstream defaults
+# (use_default_settings).
+
+use_default_settings: true
+
+search:
+  # The research provider requests format=json; without this entry SearXNG
+  # answers every JSON search with HTML and the provider reports the
+  # malformed response honestly instead of guessing.
+  formats:
+    - html
+    - json
+
+server:
+  # Local-only instance: no public-instance features (link-token bot
+  # detection, image proxy) and no request limiter. Reachability is bounded
+  # by the compose port mapping, which binds 127.0.0.1:8888 exclusively.
+  public_instance: false
+  limiter: false
+  # secret_key deliberately omitted: generated per start by
+  # PRIMORA.research.service and injected as SEARXNG_SECRET, so no secret -
+  # real or placeholder - is ever committed.
+
+engines:
+  # With use_default_settings, this upstream build loads a wikidata engine
+  # that fails to register, yet every search still resolves against it and
+  # dies with KeyError. Disabling it (and the tor-oriented engines whose
+  # configs are absent) keeps the engine set deterministic; PRIMORA's
+  # research only needs the ordinary web engines.
+  - name: wikidata
+    disabled: true
+  - name: ahmia
+    disabled: true
+  - name: torch
+    disabled: true
+  - name: yacy images
+    disabled: true
+  # The four default general web engines (google, brave, duckduckgo,
+  # startpage) rate-limit aggressively under automated use and can leave a
+  # search with zero results. These alternates are more tolerant of local
+  # aggregator traffic and keep the instance useful when the defaults are
+  # suspended.
+  - name: mojeek
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: qwant
+    disabled: false
+  - name: mwmbl
+    disabled: false
+  - name: stract
+    disabled: false
+  - name: seznam
+    disabled: false
+  - name: yahoo
+    disabled: false

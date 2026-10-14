@@ -8,10 +8,7 @@ from PRIMORA.aurora.configuration import AuroraConfig, DEFAULT_SYSTEM_INSTRUCTIO
 from PRIMORA.prime import Prime
 from PRIMORA.prime.providers import Provider
 from PRIMORA.prime.contract import PrimeResult
-from PRIMORA.prime.capability import CapabilityRegistry, CapabilitySpec
-from PRIMORA.prime.execution import Execution
 from PRIMORA.aurora.brain import Brain, BrainResult
-from PRIMORA.prime.orchestrator import Orchestrator
 from typing import Any
 
 
@@ -26,40 +23,6 @@ CHAT_BLOCK = (
     '{"action": "chat", "payload": {"messages": []}, "context": null, "metadata": null}\n'
     '</prime_request>'
 )
-
-
-
-def _make_test_prime(provider, registry=None):
-    """Create a Prime instance with a custom registry for testing."""
-    if registry is None:
-        registry = _make_test_registry()
-    # Register chat capability with mock specialist
-    class MockChatSpecialist:
-        name = "chat"
-        def handle(self, payload):
-            return PrimeResult.success({"result": "ok"})
-    registry.register(
-        CapabilitySpec(
-            name="chat",
-            description="Test chat capability",
-            payload_schema={"type": "object", "properties": {"messages": {"type": "array"}}, "required": ["messages"]},
-            required_fields=["messages"],
-            optional_fields=[]
-        ),
-        MockChatSpecialist()
-    )
-    from PRIMORA.prime.orchestrator import Orchestrator
-    from PRIMORA.prime.execution import Execution
-    # Create execution with chat specialist
-    execution = Execution(provider, specialists={"chat": MockChatSpecialist()})
-    from PRIMORA.prime.orchestrator import Orchestrator
-    orchestrator = Orchestrator(provider, registry)
-    orchestrator._execution = execution
-    
-    prime = Prime.__new__(Prime)
-    prime._orchestrator = orchestrator
-    prime._registry = registry
-    return prime
 
 
 class MockProvider(Provider):

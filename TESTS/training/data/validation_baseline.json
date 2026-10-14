@@ -1,0 +1,105 @@
+{
+  "examples": 166,
+  "totals": {
+    "n": 166,
+    "block": 2,
+    "valid": 2,
+    "multi": 0,
+    "narrated": 36,
+    "direct_ok": 58,
+    "action_ok": 2,
+    "steps": 3
+  },
+  "per_category": {
+    "C1_act_not_announce": {
+      "n": 18,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 5,
+      "direct_ok": 0,
+      "action_ok": 0,
+      "steps": 0
+    },
+    "C2_single_block": {
+      "n": 18,
+      "block": 2,
+      "valid": 2,
+      "multi": 0,
+      "narrated": 5,
+      "direct_ok": 0,
+      "action_ok": 2,
+      "steps": 0
+    },
+    "C3_action_wrapper": {
+      "n": 18,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 7,
+      "direct_ok": 0,
+      "action_ok": 0,
+      "steps": 0
+    },
+    "C4_continue_cognition": {
+      "n": 18,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 10,
+      "direct_ok": 0,
+      "action_ok": 0,
+      "steps": 3
+    },
+    "C5_answer_directly": {
+      "n": 22,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 0,
+      "direct_ok": 22,
+      "action_ok": 0,
+      "steps": 0
+    },
+    "C6_delegate_when_useful": {
+      "n": 18,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 5,
+      "direct_ok": 0,
+      "action_ok": 0,
+      "steps": 0
+    },
+    "C7_deliberate_recall": {
+      "n": 18,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 2,
+      "direct_ok": 0,
+      "action_ok": 0,
+      "steps": 0
+    },
+    "C8_stay_direct": {
+      "n": 18,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 0,
+      "direct_ok": 18,
+      "action_ok": 0,
+      "steps": 0
+    },
+    "C9_uncertainty_natural": {
+      "n": 18,
+      "block": 0,
+      "valid": 0,
+      "multi": 0,
+      "narrated": 2,
+      "direct_ok": 18,
+      "action_ok": 0,
+      "steps": 0
+    }
+  }
+}

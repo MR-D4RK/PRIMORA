@@ -1,0 +1,9 @@
+{
+  "split": "holdout",
+  "count": 180,
+  "seeds": 30,
+  "status": "protected - evaluation only",
+  "rule": "Not used during generation, tuning or wording decisions. Read only when the holdout is actually being scored.",
+  "generator_version": "aurora-brain-v0.4-build-1",
+  "schema_version": "aurora.train.v2"
+}

@@ -13,8 +13,33 @@ Item {
     property int brightCount: 8
     property real energy: 0.62
     property real dim: 1.0
+    // Reveal progress 0..1, driven by the Universe star clock (wall-clock
+    // startup time, never model progress). Default full for standalone use.
+    property real reveal: 1.0
     property double t0: 0
     property var stars: []
+
+    // Per-star reveal threshold in [0, 1), derived from the star's own
+    // seeded twinkle phase: deterministic, spread across the population,
+    // independent of position, size, or brightness.
+    function revealStart(phase) {
+        var s = (phase * 0.15915494) % 1.0
+        return s < 0 ? s + 1.0 : s
+    }
+
+    // Visibility gate 0..1 for one star at the current reveal progress.
+    // Smooth 0.15-wide fade per star; 0 before its threshold, 1 at full
+    // reveal for every phase. No timers, no model state involved.
+    function gateFor(phase) {
+        var start = revealStart(phase)
+        var end = start + 0.15
+        if (end > 1.0) {
+            end = 1.0
+        }
+        var t = (reveal - start) / (end - start)
+        t = Math.min(1, Math.max(0, t))
+        return t * t * (3 - 2 * t)
+    }
 
     function lcg(seed) {
         var s = seed >>> 0
@@ -81,7 +106,7 @@ Item {
             for (var i = 0; i < list.length; i++) {
                 var s = list[i]
                 var tw = 0.55 + 0.45 * Math.sin(t * s.speed + s.phase)
-                var a = s.base * tw * glow
+                var a = s.base * tw * glow * gateFor(s.phase)
                 if (a > 1.0) a = 1.0
                 var x = s.x * w
                 var y = s.y * h

@@ -1,0 +1,28 @@
+# PRIMORA's local-only SearXNG instance.
+#
+# Started and stopped exclusively by PRIMORA.research.service, which invokes
+# this file with fixed argument lists (compose up -d / compose stop), never a
+# shell. The compose project name is pinned to "primora-searxng" both here
+# and in the service, so every launch manages the same deterministic stack.
+#
+# Security posture:
+#   * The host port is bound to loopback only: 127.0.0.1:8888.
+#   * The secret key is generated per start and injected as SEARXNG_SECRET
+#     through the subprocess environment. It is never written to this file
+#     or any other tracked file.
+#   * FORCE_OWNERSHIP=false keeps the container entrypoint from chown-ing
+#     the bind-mounted, tracked settings.yml (it only warns instead).
+name: primora-searxng
+
+services:
+  searxng:
+    # Pinned by version+commit, not `latest`: a reproducible deployment that
+    # cannot silently change underneath the research capability.
+    image: searxng/searxng:2025.11.5-1be19f8b5
+    ports:
+      - "127.0.0.1:8888:8080"
+    environment:
+      SEARXNG_SECRET: "${SEARXNG_SECRET}"
+      FORCE_OWNERSHIP: "false"
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro

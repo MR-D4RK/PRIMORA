@@ -169,6 +169,60 @@ def test_cli_preserves_sync_warmup_and_loop():
     assert order[1] == "run_cli"
 
 
+def test_cli_does_not_start_web_ui():
+    model_dir, adapter_dir = _temp_model_dirs()
+    import threading as _threading
+    thread_starts = []
+    real_thread = _threading.Thread
+    real_warmup = Aurora.warmup
+
+    class RecordingThread(real_thread):
+        def start(self):
+            thread_starts.append(self)
+            # Do not actually start: serve is patched and must not run.
+
+    Aurora.warmup = lambda self: None
+    _threading.Thread = RecordingThread
+    try:
+        outcome, result, calls = _run_main(
+            ["main.py", "--cli"],
+            {"PRIMORA_OLLAMA_MODEL": "custom:model",
+             "PRIMORA_AURORA_MODEL_PATH": model_dir,
+             "PRIMORA_AURORA_ADAPTER_PATH": adapter_dir},
+        )
+    finally:
+        _threading.Thread = real_thread
+        Aurora.warmup = real_warmup
+    assert thread_starts == [], "CLI must not start the web UI thread"
+    assert len(calls["run_cli"]) == 1
+
+
+def test_gui_starts_web_ui():
+    model_dir, adapter_dir = _temp_model_dirs()
+    import threading as _threading
+    thread_starts = []
+    real_thread = _threading.Thread
+
+    class RecordingThread(real_thread):
+        def start(self):
+            thread_starts.append(self)
+            # Do not actually start: serve is patched and must not run.
+
+    _threading.Thread = RecordingThread
+    try:
+        outcome, result, calls = _run_main(
+            ["main.py"],
+            {"PRIMORA_AURORA_MODEL_PATH": model_dir,
+             "PRIMORA_AURORA_ADAPTER_PATH": adapter_dir},
+        )
+    finally:
+        _threading.Thread = real_thread
+    assert outcome == "return", result
+    # GUI keeps the historical behaviour of exposing the web interface.
+    assert len(thread_starts) == 1, "GUI should start the web UI thread"
+    assert len(calls["run_gui"]) == 1
+
+
 def test_async_load_flag_applied_for_transformers():
     # main.py must set the upstream switch before any model load so
     # Transformers materializes safetensors sequentially.

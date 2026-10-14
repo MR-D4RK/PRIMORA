@@ -32,6 +32,36 @@ _STOPWORDS = frozenset(
     "do does did can could should would will just very really there here".split()
 )
 
+# Query words that only look plural. Stemming them would corrupt the term,
+# so they are pinned here instead.
+_NON_PLURAL = frozenset(
+    "news means series species lens bus gas plus always perhaps".split()
+)
+
+
+def singular(word: str) -> str:
+    """Conservative plural fold, applied only where two sides are compared.
+
+    A query and a stored fact have to compare as the same term or the fact
+    is never retrieved: "what about my fav car" could not reach a stored
+    "zr1x the most in cars" because ``car`` and ``cars`` were different
+    tokens. Deliberately NOT applied inside :func:`tokenize`: the same
+    tokens are handed to the FTS index, which stores the raw word, so
+    folding them there would trade one missed match for another. One
+    direction only, and never a stem beyond the plural - folding a word the
+    wrong way would create a match that does not exist, which is worse than
+    missing one.
+    """
+    if len(word) < 4 or word in _NON_PLURAL:
+        return word
+    if word.endswith("ies") and len(word) > 4:
+        return word[:-3] + "y"
+    if word.endswith(("sses", "shes", "ches", "xes", "zes")):
+        return word[:-2]
+    if word.endswith("s") and not word.endswith(("ss", "us", "is", "as", "os")):
+        return word[:-1]
+    return word
+
 
 def tokenize(text: str) -> list[str]:
     return [
@@ -56,11 +86,17 @@ def importance_of(text: str, role: str) -> float:
 
 
 def relevance(candidate_terms: list[str], query_terms: list[str]) -> float:
-    """Overlap of candidate terms with query terms, in [0, 1]."""
+    """Overlap of candidate terms with query terms, in [0, 1].
+
+    Both sides are folded to singular first, so a question in the singular
+    still finds a fact stored in the plural and vice versa. Folding happens
+    here, at the point of comparison, and not in :func:`tokenize`: the same
+    raw tokens feed the FTS index, which stores the word as written.
+    """
     if not query_terms or not candidate_terms:
         return 0.0
-    query_set = set(query_terms)
-    hits = sum(1 for t in set(candidate_terms) if t in query_set)
+    query_set = {singular(t) for t in query_terms}
+    hits = sum(1 for t in {singular(c) for c in candidate_terms} if t in query_set)
     return hits / max(1, len(query_set))
 
 

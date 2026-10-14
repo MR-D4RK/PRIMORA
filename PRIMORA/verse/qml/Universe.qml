@@ -1,11 +1,11 @@
 import QtQuick
 
 // M3 Universe root: depth-ordered layers sharing one energy value and two
-// paint timers. Background -> far stars -> ribbons -> strands -> soft
-// illumination -> central presence. A slow camera drift moves the whole
-// world a few pixels so the space feels alive without demanding attention.
-// `active` is the M4 sleep/wake hook: when false, timers stop and the
-// presence breathing pauses, leaving the last frame resting in place.
+// paint timers. Background -> far stars -> aurora veil -> soft atmospheric
+// haze. A slow camera drift moves the whole world a few pixels so the space
+// feels alive without demanding attention.
+// `active` is the M4 sleep/wake hook: when false, timers stop, leaving the
+// last frame resting in place.
 // `dormancy` is the awakening hook: 1.0 is deep sleep (almost-black space,
 // faint stars, no aurora), 0.0 is fully awake. Shell eases it down while
 // Aurora warms up and settles it to 0 on the real warmup result.
@@ -18,6 +18,23 @@ Item {
     property real wakefulness: 1.0 - dormancy
     property real energy: 0.62
     property double t0: 0
+
+    // Staggered emergence: each layer fades in over its own wakefulness
+    // window (smoothstep), so awakening reads as phases rather than a
+    // uniform brightening. Diffuse haze next, ray curtains later.
+    // At dormancy 1 all veil layers are exactly 0.
+    function emerge(lo, hi) {
+        var t = (wakefulness - lo) / (hi - lo)
+        t = Math.min(1, Math.max(0, t))
+        return t * t * (3 - 2 * t)
+    }
+    // Star reveal clock: wall-clock seconds since this Universe appeared.
+    // Driven by the fast timer below. Deliberately independent of dormancy
+    // and model readiness: stars own their timeline (first light ~2 s,
+    // full field ~12 s), so they never wait on model loading.
+    property real starReveal: 0.0
+    property real glowDim: emerge(0.10, 0.55)
+    property real ribbonDim: emerge(0.30, 0.75)
 
     Component.onCompleted: {
         t0 = Date.now()
@@ -55,28 +72,23 @@ Item {
         Starfield {
             anchors.fill: parent
             energy: universe.energy
-            dim: 0.12 + 0.88 * universe.wakefulness
+            dim: 1.0
+            reveal: universe.starReveal
         }
 
         AuroraRibbons {
             anchors.fill: parent
             energy: universe.energy
-            opacity: 0.05 + 0.95 * universe.wakefulness
+            intensity: universe.ribbonDim
         }
 
-        AuroraStrands {
-            anchors.fill: parent
-            energy: universe.energy
-            opacity: 0.04 + 0.96 * universe.wakefulness
-        }
-
-        // Soft illumination the presence casts onto nearby space.
+        // Soft atmospheric haze over the lower sky.
         Canvas {
             id: auraLight
             objectName: "auraLight"
             anchors.fill: parent
             renderTarget: Canvas.FramebufferObject
-            opacity: 0.08 + 0.92 * universe.wakefulness
+            opacity: universe.glowDim
 
             function repaint() {
                 requestPaint()
@@ -96,16 +108,6 @@ Item {
                 ctx.fillRect(0, 0, width, height)
             }
         }
-
-        Presence {
-            objectName: "presenceItem"
-            anchors.centerIn: parent
-            width: Math.min(parent.width, parent.height) * 0.30
-            height: width
-            energy: universe.energy
-            active: universe.active
-            opacity: 0.22 + 0.78 * universe.wakefulness
-        }
     }
 
     // Fast tick: evolving layers + shared energy (~30fps).
@@ -119,9 +121,15 @@ Item {
         onTriggered: {
             var t = universe.elapsedSeconds()
             var w = universe.wakefulness
-            universe.energy = 0.05 + w * (0.57
+            universe.energy = 0.03 + w * (0.59
                 + 0.10 * Math.sin(t * 0.11)
                 + 0.05 * Math.sin(t * 0.043 + 1.7))
+            // Star reveal timeline: first light ~2 s after Verse appears,
+            // full population ~12 s, eased. Wall-clock only — never gated
+            // on dormancy or model readiness.
+            var r = (t - 2.0) / 10.0
+            r = Math.min(1, Math.max(0, r))
+            universe.starReveal = r * r * (3 - 2 * r)
             var kids = camera.children
             for (var i = 0; i < kids.length; i++) {
                 if (kids[i] !== auraLight && typeof kids[i].repaint === "function") {

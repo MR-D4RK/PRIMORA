@@ -1,0 +1,28 @@
+{
+  "generator_version": "aurora-brain-v0.3-build-1",
+  "schema_version": "aurora.train.v2",
+  "system_ref": "aurora.system.v1@bafa84d4e39f18a0",
+  "capabilities": [
+    "calculate",
+    "consult_specialist",
+    "learn",
+    "recall",
+    "research",
+    "use_tool"
+  ],
+  "counts": {
+    "train": 1518,
+    "validation": 180,
+    "holdout": 120
+  },
+  "expansion": {
+    "conversational": 10,
+    "capability": 5,
+    "evaluation_depth": 8,
+    "max_target_repeat": 3
+  },
+  "split_overrides": {
+    "C15-R01": "train",
+    "C15-R04": "holdout"
+  }
+}

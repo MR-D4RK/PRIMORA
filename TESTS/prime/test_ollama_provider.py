@@ -16,11 +16,26 @@ class MockOllamaHandler(BaseHTTPRequestHandler):
     response_data = {"message": {"role": "assistant", "content": "Test response"}}
     status_code = 200
 
-    def do_POST(self):
+    def _read_request_body(self) -> bytes:
+        # The POST body must be consumed before this handler returns.
+        # Closing a socket with unread received data makes Windows send
+        # RST instead of FIN, which discards the already-written response
+        # and surfaces on the client as an intermittent WinError 10053
+        # abort instead of the behavior under test.
+        length = int(self.headers.get("Content-Length", 0))
+        return self.rfile.read(length) if length else b""
+
+    def _send_json(self):
+        body = json.dumps(self.response_data).encode("utf-8")
         self.send_response(self.status_code)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(json.dumps(self.response_data).encode("utf-8"))
+        self.wfile.write(body)
+
+    def do_POST(self):
+        self._read_request_body()
+        self._send_json()
 
     def log_message(self, format, *args):
         pass
@@ -68,10 +83,15 @@ def test_ollama_provider_http_error():
 def test_ollama_provider_malformed_response():
     class BadResponseHandler(BaseHTTPRequestHandler):
         def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            body = b"not valid json"
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(b"not valid json")
+            self.wfile.write(body)
         def log_message(self, format, *args):
             pass
 
@@ -101,10 +121,15 @@ def test_ollama_provider_empty_content():
     class EmptyContentHandler(BaseHTTPRequestHandler):
         response_data = {"message": {"role": "assistant", "content": ""}}
         def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            if length:
+                self.rfile.read(length)
+            body = json.dumps(self.response_data).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(json.dumps(self.response_data).encode("utf-8"))
+            self.wfile.write(body)
         def log_message(self, format, *args):
             pass
 

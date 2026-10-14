@@ -1,0 +1,139 @@
+{
+  "label": "Aurora v0.5 merged dataset validation",
+  "contract": {
+    "counts": {
+      "records": {
+        "train": 1297,
+        "validation": 180,
+        "holdout": 180
+      },
+      "total": 1657
+    },
+    "schema": {
+      "records": 1657,
+      "tool_turns": 257,
+      "block_turns": 291
+    },
+    "provenance": {
+      "merged_records": 217,
+      "v4_records": 1440,
+      "bad_system_ref": 0,
+      "bad_fingerprint": 0,
+      "bad_provenance": 0,
+      "seeds": 318,
+      "straddling_seeds": 0
+    },
+    "eval_identity": {
+      "validation": {
+        "records": 180,
+        "membership_ok": true,
+        "content_ok": true,
+        "v5_digest": "5f959f894ed12a6d2d1a1ea08b3d061cbb1edb80b2d80a9aeec0cd31ea2ff067",
+        "v4_digest": "5f959f894ed12a6d2d1a1ea08b3d061cbb1edb80b2d80a9aeec0cd31ea2ff067"
+      },
+      "holdout": {
+        "records": 180,
+        "membership_ok": true,
+        "content_ok": true,
+        "v5_digest": "1ec646aa8fb50393173a7e73525720ef41fde09423da236b25ef96c356f3dd06",
+        "v4_digest": "1ec646aa8fb50393173a7e73525720ef41fde09423da236b25ef96c356f3dd06"
+      }
+    },
+    "repetition": {
+      "limit": 2,
+      "distinct_exact": 861,
+      "max_exact_repeat": 2,
+      "over_limit_exact": 0,
+      "distinct_normalised": 859,
+      "max_normalised_repeat": 4,
+      "over_limit_normalised": [
+        [
+          "3",
+          4
+        ],
+        [
+          "three",
+          4
+        ]
+      ],
+      "note": "the gate fails on exact text; normalised collapses are reported so punctuation-only duplicates stay visible"
+    },
+    "leakage": {
+      "shared_values": 0,
+      "shared_final_asks": 0,
+      "cross_seed_shared_targets_report_only": 9,
+      "cross_seed_samples": [
+        [
+          [
+            "C08",
+            "C5-A08",
+            "C7-M03"
+          ],
+          "three"
+        ],
+        [
+          [
+            "C2-D02",
+            "C2-D13"
+          ],
+          "prime request action recall payload query the bert"
+        ],
+        [
+          [
+            "C3-P13",
+            "C3-P15"
+          ],
+          "prime request action use tool payload name word co"
+        ],
+        [
+          [
+            "C5-A08",
+            "C7-M03"
+          ],
+          "5 400"
+        ],
+        [
+          [
+            "C5-A08",
+            "C7-M03"
+          ],
+          "22 mm"
+        ]
+      ]
+    },
+    "coverage": {
+      "distinct_block_targets": 17,
+      "block_target_sample": [
+        "<prime_request>\n{\"action\": \"calculate\", \"payload\": {\"expression\": \"15% of 2400\"}, \"context\": null, \"metadata\": null}\n</prime_request>",
+        "<prime_request>\n{\"action\": \"consult_specialist\", \"payload\": {\"query\": \"the reasoning behind the decision\"}, \"context\": null, \"metadata\": null}\n</prime_request>",
+        "<prime_request>\n{\"action\": \"consult_specialist\", \"payload\": {\"query\": \"the trade-off before committing\"}, \"context\": null, \"metadata\": null}\n</prime_request>"
+      ],
+      "actions": {
+        "None": 1182,
+        "recall": 58,
+        "research": 25,
+        "consult_specialist": 18,
+        "use_tool": 8,
+        "learn": 4,
+        "calculate": 2
+      },
+      "action_kinds": 6
+    },
+    "tools": {
+      "tool_turns": 257,
+      "payload_findings": 0
+    },
+    "masking": {
+      "available": true,
+      "records": 1657,
+      "trained_turns": 1903,
+      "trained_tokens": 40330,
+      "truncated_records": 0
+    }
+  },
+  "pathology": {
+    "note": "normalised collapses, cross-seed shared targets and Jaccard are reported, not gated; the gate is exact target text and split leakage"
+  },
+  "problem_count": 0,
+  "problems": []
+}

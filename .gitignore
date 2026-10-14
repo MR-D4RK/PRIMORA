@@ -1,19 +1,54 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 .venv/
 venv/
 env/
 
-RESOURCES/aurora/v0.1/model/
-RESOURCES/aurora/v0.1/aurora_qlora/
+# Model weights and LoRA training artifacts for every version (the v0.1 rule
+# generalized in Stage 2): base weights, final adapters, intermediate
+# checkpoints, and optimizer/rng/scheduler states. Text configs and metric
+# reports next to them stay trackable.
+RESOURCES/aurora/*/model/
+RESOURCES/aurora/*/aurora_qlora/
+RESOURCES/aurora/*/checkpoint-*/
 
+# Logs (launcher transcript + any stray *.log anywhere in the tree)
+logs/
 *.log
 .env
 
-# Runtime conversation database (Context Manager store)
+# Runtime conversation database (Context Manager store). The whole data tree,
+# including the designated context/backups/ directory, stays out of Git.
 PRIMORA/data/
+
+# SQLite write-ahead/lock sidecars, wherever a .db lives (test temp copies,
+# harness stores, the canonical store). Never commit these.
+*.db-wal
+*.db-shm
+
+# Stray database files outside the canonical data dir. Canonical store and its
+# backups live under PRIMORA/data/ (already ignored above); anything else is
+# scratch and must not be committed. Scoped so an intentional .db fixture under
+# TESTS/ would still be trackable if one is ever added deliberately.
+/*.db
+/TESTS/**/*.db
+/TRAINING/**/*.db
+
+# Backup files outside the designated backup dir (PRIMORA/data/context/backups).
+# Ignore stray *.bak / *.backup anywhere else in the tree.
+*.bak
+*.backup
+
+# Disposable test/pytest output at the repo root
+/.pytest_cache/
+test-results/
+junit*.xml
 
 # Local specialist model - too large for Git
 RESOURCES/specialists/models/Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf

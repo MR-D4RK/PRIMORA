@@ -1,0 +1,95 @@
+{
+  "label": "v0.4_rep",
+  "split": "holdout",
+  "rule": "Protected 180-record holdout, scored with the dataset's own static gates (validate_dataset_v4.score_reply). No training, no config/model changes; the only variable between the two adapters is PRIMORA_AURORA_ADAPTER_PATH.",
+  "adapter_path": "C:\\PRIMORA PROJECT\\RESOURCES\\aurora\\v0.4\\aurora_qlora",
+  "model_path": "C:\\PRIMORA PROJECT\\RESOURCES\\aurora\\v0.1\\model",
+  "generation": {
+    "temperature": 0.75,
+    "top_p": 0.9,
+    "repetition_penalty": 1.08,
+    "max_new_tokens": 256,
+    "system_instruction": "DEFAULT",
+    "per_record_seed": null
+  },
+  "scorer": "validate_dataset_v4.score_reply",
+  "records": 180,
+  "overall": {
+    "pass": 62,
+    "fail": 118,
+    "pass_rate_percent": 34.4
+  },
+  "per_category": {
+    "A": {
+      "n": 30,
+      "pass": 11,
+      "pass_rate_percent": 36.7
+    },
+    "B": {
+      "n": 24,
+      "pass": 15,
+      "pass_rate_percent": 62.5
+    },
+    "C": {
+      "n": 30,
+      "pass": 10,
+      "pass_rate_percent": 33.3
+    },
+    "D": {
+      "n": 24,
+      "pass": 2,
+      "pass_rate_percent": 8.3
+    },
+    "E": {
+      "n": 24,
+      "pass": 7,
+      "pass_rate_percent": 29.2
+    },
+    "F": {
+      "n": 24,
+      "pass": 9,
+      "pass_rate_percent": 37.5
+    },
+    "G": {
+      "n": 24,
+      "pass": 8,
+      "pass_rate_percent": 33.3
+    }
+  },
+  "per_difficulty": {
+    "1": {
+      "n": 48,
+      "pass": 28,
+      "pass_rate_percent": 58.3
+    },
+    "2": {
+      "n": 48,
+      "pass": 12,
+      "pass_rate_percent": 25.0
+    },
+    "3": {
+      "n": 42,
+      "pass": 12,
+      "pass_rate_percent": 28.6
+    },
+    "4": {
+      "n": 42,
+      "pass": 10,
+      "pass_rate_percent": 23.8
+    }
+  },
+  "failed_checks": {
+    "must": 148,
+    "unsourced": 12,
+    "idk": 5,
+    "must_not": 3,
+    "repetition": 3,
+    "certainty": 1,
+    "amir": 1
+  },
+  "actions": {},
+  "history_fallbacks": 0,
+  "errors": 0,
+  "elapsed_seconds": 762.0,
+  "results_jsonl": "C:\\PRIMORA PROJECT\\TESTS\\training\\holdout_eval\\v0.4_rep_results.jsonl"
+}

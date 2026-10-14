@@ -1,8 +1,12 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Optional
+import json
 import os
+import re
 import time
+import urllib.error
+import urllib.request
 
 from PRIMORA.logutil import emit_block
 
@@ -45,6 +49,29 @@ class Brain(ABC):
         )
 
 
+def aurora_backend_from_env(env=None) -> str:
+    """Select Aurora's generation backend from PRIMORA_AURORA_BACKEND.
+
+    ``transformers`` (the default, for an absent or empty value) is the
+    local HuggingFace + bitsandbytes path that loads the configured model
+    and QLoRA adapter. ``openai`` (alias ``llamacpp``) generates through
+    the OpenAI-compatible ``/chat/completions`` endpoint served by
+    llama.cpp llama-server and never loads the HF model, adapter, or
+    tokenizer. An explicit but unsupported value fails closed
+    (ValueError) rather than silently substituting a backend.
+    """
+    source = os.environ if env is None else env
+    choice = str(source.get("PRIMORA_AURORA_BACKEND") or "").strip().lower()
+    if choice in ("", "transformers"):
+        return "transformers"
+    if choice in ("openai", "llamacpp"):
+        return "openai"
+    raise ValueError(
+        f"unsupported PRIMORA_AURORA_BACKEND={choice!r}; expected "
+        "'transformers' or 'openai'"
+    )
+
+
 class AuroraBrain(Brain):
     def __init__(self, config: Optional["AuroraConfig"] = None):
         from PRIMORA.aurora.configuration import AuroraConfig
@@ -54,12 +81,20 @@ class AuroraBrain(Brain):
         self._tokenizer = None
         self._initialized = False
 
-        # Hard safety ceiling for the entire generation sequence.
-        # This includes input + generated tokens.
+        # Hard safety ceiling for the entire generation sequence: input plus
+        # generated tokens.
+        #
+        # Derived from AuroraConfig.context_total so the two can never
+        # disagree: a ceiling below it silently trims a context the budget
+        # believed would fit, and a ceiling above it asks this 8 GB card for
+        # more than it can hold, which is how a long turn turned into
+        # "CUDA out of memory, 0 bytes free" instead of a slow answer.
+        # PRIMORA_AURORA_MAX_CONTEXT_TOKENS still wins when an operator sets
+        # it deliberately.
         self._max_context_tokens = int(
             os.environ.get(
                 "PRIMORA_AURORA_MAX_CONTEXT_TOKENS",
-                "1200",
+                str(self._config.context_total),
             )
         )
 
@@ -82,6 +117,15 @@ class AuroraBrain(Brain):
             return None
 
         try:
+            # Reduce allocator fragmentation. With the model occupying 88% of
+            # VRAM the allocator is the difference between a long context
+            # running and failing with "0 bytes free", and PyTorch reads this
+            # when the CUDA allocator initialises, so it must be set before
+            # the model is loaded. setdefault, so an operator can override it.
+            os.environ.setdefault(
+                "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"
+            )
+
             import torch
             import transformers
             import peft
@@ -500,3 +544,196 @@ class AuroraBrain(Brain):
                 f"Generation error: {e}",
                 self.get_model_name(),
             )
+
+
+# Qwen3-style thinking fences. The transformers path disables thinking via
+# the chat template (enable_thinking=False); an external server applies its
+# own template, so any thinking trace it emits has to be removed here before
+# the text reaches the loop.
+_THINKING_FENCE_RE = re.compile(r"```think.*?```", re.DOTALL | re.IGNORECASE)
+
+
+class OpenAIBrain(Brain):
+    """Aurora's generation brain over an OpenAI-compatible HTTP endpoint.
+
+    Selected with ``PRIMORA_AURORA_BACKEND=openai`` (alias ``llamacpp``).
+    Generates through ``{base_url}/chat/completions`` - llama.cpp
+    llama-server by default - and never loads the HF model, adapter, or
+    tokenizer. Generation settings map 1:1 from ``AuroraConfig``
+    (``PRIMORA_AURORA_MAX_TOKENS`` / ``_TEMPERATURE`` / ``_TOP_P`` /
+    ``_REPETITION_PENALTY``); the endpoint comes from the same variables
+    the Prime OpenAI provider reads (``PRIMORA_OPENAI_URL`` /
+    ``PRIMORA_OPENAI_MODEL`` / ``PRIMORA_OPENAI_TIMEOUT``). Messages
+    arrive fully assembled - system prompt included - from Aurora's
+    instruction builder, identical to the transformers path.
+    Construction performs no network I/O.
+    """
+
+    def __init__(
+        self,
+        config: Optional["AuroraConfig"] = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        timeout: int | None = None,
+    ):
+        from PRIMORA.aurora.configuration import AuroraConfig
+
+        self._config = config or AuroraConfig.from_env()
+        self._base_url = base_url or os.environ.get(
+            "PRIMORA_OPENAI_URL", "http://localhost:8080/v1")
+        self._model = model or os.environ.get(
+            "PRIMORA_OPENAI_MODEL", "llama-server")
+        self._timeout = timeout or int(
+            os.environ.get("PRIMORA_OPENAI_TIMEOUT", "120"))
+
+    def get_model_name(self) -> str:
+        return self._model
+
+    def count_tokens(self, messages: list[dict[str, str]]) -> int:
+        """Heuristic count; this backend has no local tokenizer.
+
+        Exact counting needs the HF tokenizer, which this backend
+        deliberately does not load. Uses the same character estimate the
+        ContextManager falls back to, so budgeting stays consistent and
+        the selection path never degrades with a counter failure.
+        """
+        from PRIMORA.prime.context.manager import estimate_tokens
+
+        return sum(
+            estimate_tokens(m.get("content", "")) + 4 for m in messages
+        )
+
+    @staticmethod
+    def _strip_thinking(content: str) -> str:
+        content = _THINKING_FENCE_RE.sub("", content)
+        return content.replace("```", "").strip()
+
+    def generate(
+        self,
+        messages: list[dict[str, str]],
+        max_output_tokens: Optional[int] = None,
+    ) -> BrainResult:
+        if not isinstance(messages, list) or not messages:
+            return BrainResult.failure(
+                "Missing or invalid 'messages'",
+                self.get_model_name(),
+            )
+
+        generation_tokens = self._config.max_new_tokens
+        if max_output_tokens is not None:
+            generation_tokens = min(
+                generation_tokens,
+                max(0, max_output_tokens),
+            )
+        if generation_tokens < 1:
+            return BrainResult.failure(
+                "No generation capacity remains inside "
+                "Aurora's current context safety limit.",
+                self.get_model_name(),
+            )
+
+        # Qwen3-class chat templates think by default. On llama-server with
+        # --jinja the reasoning lands in reasoning_content, and a thinking
+        # budget that consumes max_tokens leaves content empty - which the
+        # loop reports as "Model returned empty response". Disable thinking
+        # by default, matching the transformers path's enable_thinking=False;
+        # an operator can turn it back on with PRIMORA_OPENAI_ENABLE_THINKING=1.
+        _thinking = str(
+            os.environ.get("PRIMORA_OPENAI_ENABLE_THINKING", "0")
+        ).strip().lower()
+        enable_thinking = _thinking in ("1", "true", "yes", "on")
+
+        request_body: dict = {
+            "model": self._model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": generation_tokens,
+            "temperature": self._config.temperature,
+            "top_p": self._config.top_p,
+            # llama-server accepts repeat_penalty as an extension on its
+            # OpenAI-compatible endpoint; strict OpenAI servers ignore
+            # the extra key rather than rejecting the request.
+            "repeat_penalty": self._config.repetition_penalty,
+            # Passed through to the Jinja chat template. OpenAI-compatible
+            # servers that do not understand the key ignore it.
+            "chat_template_kwargs": {"enable_thinking": enable_thinking},
+        }
+
+        url = f"{self._base_url.rstrip('/')}/chat/completions"
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(request_body).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                if resp.status != 200:
+                    return BrainResult.failure(
+                        f"OpenAI HTTP {resp.status}: "
+                        f"{resp.read().decode('utf-8')}",
+                        self.get_model_name(),
+                    )
+                response_data = json.loads(resp.read().decode("utf-8"))
+
+        except urllib.error.HTTPError as e:
+            return BrainResult.failure(
+                f"OpenAI HTTP error {e.code}: {e.read().decode('utf-8')}",
+                self.get_model_name(),
+            )
+        except urllib.error.URLError as e:
+            return BrainResult.failure(
+                f"OpenAI connection error: {e.reason}",
+                self.get_model_name(),
+            )
+        except json.JSONDecodeError as e:
+            return BrainResult.failure(
+                f"OpenAI malformed response: {e}",
+                self.get_model_name(),
+            )
+        except TimeoutError:
+            return BrainResult.failure(
+                f"OpenAI timeout after {self._timeout}s",
+                self.get_model_name(),
+            )
+        except Exception as e:
+            return BrainResult.failure(
+                f"OpenAI unexpected error: {e}",
+                self.get_model_name(),
+            )
+
+        try:
+            choices = response_data.get("choices") or []
+            message = choices[0].get("message", {}) if choices else {}
+            content = message.get("content") or ""
+        except Exception as e:
+            return BrainResult.failure(
+                f"OpenAI response parse error: {e}",
+                self.get_model_name(),
+            )
+
+        content = self._strip_thinking(content)
+
+        if not content:
+            # An empty body is almost always a thinking budget that ate the
+            # whole max_tokens. Report enough of the response shape for the
+            # failure to be diagnosable rather than a bare "empty response".
+            choice0 = choices[0] if choices else {}
+            finish = choice0.get("finish_reason")
+            reasoning = (
+                message.get("reasoning_content")
+                or message.get("reasoning")
+                or ""
+            )
+            detail = (
+                f"finish_reason={finish!r}, "
+                f"reasoning_chars={len(reasoning)}, "
+                f"enable_thinking={enable_thinking}"
+            )
+            return BrainResult.failure(
+                f"Model returned empty response ({detail})",
+                self.get_model_name(),
+            )
+
+        return BrainResult.success(content, self.get_model_name())

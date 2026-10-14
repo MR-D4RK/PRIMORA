@@ -1,5 +1,11 @@
 # PRIMORA Architecture Audit — Current State
 
+> **HISTORICAL — 2026-09-16. Superseded.** This is a pre-milestone snapshot
+> (empty stub files, no capability system, no specialists). It is kept only as
+> evidence of the starting state. For the current architecture see
+> `DOCS/01_architecture/`; for the Oct 2026 full audit see
+> `DOCS/02_audits/PRIMORA_FULL_AUDIT.md`.
+
 **Date**: 2026-09-16  
 **Project Root**: `C:\PRIMORA PROJECT`  
 **Auditor**: Automated inspection

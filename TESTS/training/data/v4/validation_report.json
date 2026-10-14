@@ -1,0 +1,135 @@
+{
+  "label": "Aurora v0.4 static dataset validation",
+  "contract": {
+    "counts": {
+      "records": {
+        "train": 1080,
+        "validation": 180,
+        "holdout": 180
+      },
+      "seeds": 240
+    },
+    "provenance": {
+      "seeds_emitted": 240,
+      "bad_category": 0,
+      "bad_priority": 0,
+      "bad_provenance": 0,
+      "bad_version": 0
+    },
+    "coverage": {
+      "train": {
+        "seeds": 180,
+        "difficulties": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "categories": "ABCDEFG",
+        "idk_ok_true": 64
+      },
+      "validation": {
+        "seeds": 30,
+        "difficulties": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "categories": "ABCDEFG",
+        "idk_ok_true": 13
+      },
+      "holdout": {
+        "seeds": 30,
+        "difficulties": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "categories": "ABCDEFG",
+        "idk_ok_true": 11
+      }
+    },
+    "spec_checks": {
+      "tallies": {},
+      "seeds_with_failures": 0
+    },
+    "leakage": {
+      "shared_values": 0,
+      "shared_final_asks": 0,
+      "cross_seed_shared_targets": 0
+    },
+    "repetition": {
+      "limit": 2,
+      "distinct_exact": 720,
+      "max_exact_repeat": 2,
+      "over_limit_exact": 0,
+      "distinct_normalised": 719,
+      "max_normalised_repeat": 4,
+      "over_limit_normalised": [
+        [
+          "3",
+          4
+        ]
+      ],
+      "note": "the gate fails on exact text; normalised collapses are reported so punctuation-only duplicates stay visible"
+    },
+    "tools": {
+      "tool_turns": 0,
+      "payload_findings": 0
+    },
+    "masking": {
+      "available": true,
+      "records": 1440,
+      "trained_turns": 1440,
+      "trained_tokens": 25994,
+      "truncated_records": 0
+    }
+  },
+  "pathology": {
+    "diversity": {
+      "distinct_targets": 719,
+      "distinct_openings": 705,
+      "template_openings": 0,
+      "near_duplicates_ge_0.9": 0,
+      "similar_0.6_to_0.9": 6,
+      "sample_similar": [
+        [
+          0.8,
+          "E17-04",
+          "F06-00"
+        ],
+        [
+          0.75,
+          "A25-00",
+          "A35-02"
+        ],
+        [
+          0.67,
+          "F06-00",
+          "E01-04"
+        ],
+        [
+          0.67,
+          "E03-00",
+          "E01-00"
+        ],
+        [
+          0.67,
+          "A25-02",
+          "A35-04"
+        ],
+        [
+          0.6,
+          "A25-02",
+          "A35-02"
+        ]
+      ],
+      "drift_report_only": 539,
+      "note": "drift is report-only; the others fail at their threshold"
+    }
+  },
+  "problem_count": 0,
+  "problems": []
+}

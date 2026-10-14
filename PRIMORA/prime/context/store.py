@@ -6,13 +6,32 @@ otherwise (probed, never assumed).
 """
 
 import hashlib
+import math
 import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Optional
 
-from .models import SessionRecord, StateRecord, StoredMessage
+from .entities import (
+    ENTITY_AUTHORITIES,
+    ENTITY_TYPES,
+    normalize_entity_name,
+)
+from .models import (
+    CandidateRecord,
+    EntityAliasRecord,
+    EntityRecord,
+    RelationshipRecord,
+    SessionRecord,
+    StateRecord,
+    StoredMessage,
+)
+from .relationships import (
+    RELATIONSHIP_ENDPOINTS,
+    RELATIONSHIP_STATUSES,
+    RELATIONSHIP_TYPES,
+)
 
 
 def default_db_path() -> Path:
@@ -71,12 +90,129 @@ CREATE TABLE IF NOT EXISTS states (
     created_at REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'current',
     supersedes_id INTEGER,
-    authority TEXT NOT NULL DEFAULT 'user'
+    authority TEXT NOT NULL DEFAULT 'user',
+    memory_type TEXT NOT NULL DEFAULT '',
+    confidence REAL,
+    observed_at REAL,
+    valid_from REAL,
+    valid_until REAL,
+    superseded_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_states_session_concept
     ON states(session_id, concept);
 CREATE INDEX IF NOT EXISTS idx_states_scope_concept
     ON states(scope, concept);
+CREATE TABLE IF NOT EXISTS candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    source_ids TEXT NOT NULL,
+    proposed_type TEXT NOT NULL DEFAULT '',
+    proposed_concept TEXT NOT NULL DEFAULT '',
+    proposed_value TEXT NOT NULL DEFAULT '',
+    proposed_rationale TEXT NOT NULL DEFAULT '',
+    authority TEXT NOT NULL DEFAULT 'user',
+    confidence REAL NOT NULL DEFAULT 0.3,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL,
+    expires_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_candidates_scope_concept
+    ON candidates(scope, proposed_concept);
+CREATE INDEX IF NOT EXISTS idx_candidates_status
+    ON candidates(status);
+CREATE TABLE IF NOT EXISTS entities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    merged_into_entity_id INTEGER,
+    source_ids TEXT NOT NULL,
+    authority TEXT NOT NULL DEFAULT 'user',
+    confidence REAL NOT NULL DEFAULT 0.3,
+    created_at REAL NOT NULL,
+    observed_at REAL,
+    merged_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_entities_scope_name_status
+    ON entities(scope, normalized_name, status);
+CREATE INDEX IF NOT EXISTS idx_entities_scope_status
+    ON entities(scope, status);
+CREATE INDEX IF NOT EXISTS idx_entities_merged_into
+    ON entities(merged_into_entity_id);
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    entity_id INTEGER NOT NULL,
+    alias_text TEXT NOT NULL,
+    normalized_alias TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    source_ids TEXT NOT NULL,
+    authority TEXT NOT NULL DEFAULT 'user',
+    confidence REAL NOT NULL DEFAULT 0.3,
+    created_at REAL NOT NULL,
+    observed_at REAL,
+    valid_from REAL,
+    valid_until REAL,
+    superseded_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_scope_name_status
+    ON entity_aliases(scope, normalized_alias, status);
+CREATE INDEX IF NOT EXISTS idx_entity_aliases_entity_status
+    ON entity_aliases(entity_id, status);
+CREATE TABLE IF NOT EXISTS relationships (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    relationship_type TEXT NOT NULL,
+    subject_kind TEXT NOT NULL,
+    subject_id INTEGER NOT NULL,
+    object_kind TEXT NOT NULL,
+    object_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate',
+    source_ids TEXT NOT NULL,
+    authority TEXT NOT NULL DEFAULT 'user',
+    confidence REAL NOT NULL DEFAULT 0.3,
+    created_at REAL NOT NULL,
+    observed_at REAL,
+    valid_from REAL,
+    valid_until REAL,
+    supersedes_id INTEGER,
+    superseded_at REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_relationships_current_key
+    ON relationships(scope, relationship_type, subject_id, object_id)
+    WHERE status = 'current';
+CREATE INDEX IF NOT EXISTS idx_relationships_subject
+    ON relationships(scope, subject_kind, subject_id, status);
+CREATE INDEX IF NOT EXISTS idx_relationships_object
+    ON relationships(scope, object_kind, object_id, status);
+CREATE INDEX IF NOT EXISTS idx_relationships_supersedes
+    ON relationships(supersedes_id);
+CREATE TABLE IF NOT EXISTS retrieval_vectors (
+    vector_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    ref_id INTEGER NOT NULL,
+    scope TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    dim INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    vector BLOB NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_retrieval_vectors_identity
+    ON retrieval_vectors(kind, ref_id, model_id);
+CREATE INDEX IF NOT EXISTS idx_retrieval_vectors_kind_scope
+    ON retrieval_vectors(kind, scope, model_id);
+CREATE TABLE IF NOT EXISTS retrieval_index_meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 _FTS_SCHEMA = """
@@ -123,6 +259,32 @@ class ContextStore:
                     "ALTER TABLE sessions ADD COLUMN previous_titles"
                     " TEXT NOT NULL DEFAULT '[]'"
                 )
+            state_cols = {r[1] for r in con.execute("PRAGMA table_info(states)").fetchall()}
+            if "memory_type" not in state_cols:
+                con.execute(
+                    "ALTER TABLE states ADD COLUMN memory_type TEXT NOT NULL DEFAULT ''"
+                )
+            if "confidence" not in state_cols:
+                # Nullable: legacy rows keep NULL and are read back with the
+                # authority-based default (user 1.0, otherwise 0.3), so no
+                # historical confidence is ever invented by migration.
+                con.execute(
+                    "ALTER TABLE states ADD COLUMN confidence REAL"
+                )
+            for column in (
+                "observed_at", "valid_from", "valid_until", "superseded_at",
+            ):
+                if column not in state_cols:
+                    con.execute(f"ALTER TABLE states ADD COLUMN {column} REAL")
+            con.execute(
+                "UPDATE states SET observed_at = COALESCE(observed_at, created_at),"
+                " valid_from = COALESCE(valid_from, created_at)"
+                " WHERE status = 'current'"
+            )
+            con.execute(
+                "CREATE INDEX IF NOT EXISTS idx_states_temporal"
+                " ON states(scope, concept, valid_from, valid_until)"
+            )
         # Probe FTS5 support; never claim it without verifying.
         try:
             with self._connect() as con:
@@ -227,6 +389,37 @@ class ContextStore:
             rows = con.execute(query, params).fetchall()
         return [StoredMessage(*r) for r in rows]
 
+    def fetch_message(self, message_id: int) -> Optional[StoredMessage]:
+        """One stored message by id. Used by the live hybrid admission path."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT id, session_id, seq, role, content, timestamp,"
+                " fingerprint, importance FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+        return StoredMessage(*row) if row is not None else None
+
+    def fetch_messages_by_ids(
+        self, message_ids: list[int]
+    ) -> list[StoredMessage]:
+        """Bounded bulk fetch preserving the requested id order.
+
+        The live hybrid path resolves fused items to their evidence messages
+        in one round trip instead of one query per item.
+        """
+        if not message_ids:
+            return []
+        unique = list(dict.fromkeys(int(v) for v in message_ids))
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id, session_id, seq, role, content, timestamp,"
+                " fingerprint, importance FROM messages"
+                f" WHERE id IN ({','.join('?' for _ in unique)})",
+                unique,
+            ).fetchall()
+        found = {row[0]: StoredMessage(*row) for row in rows}
+        return [found[v] for v in unique if v in found]
+
     def fetch_latest(
         self, session_id: str, limit: int
     ) -> list[StoredMessage]:
@@ -239,6 +432,21 @@ class ContextStore:
             ).fetchall()
         return [StoredMessage(*r) for r in reversed(rows)]
 
+    @staticmethod
+    def _fts_phrase(term: str) -> str:
+        """Render one user term as a single FTS5 phrase literal.
+
+        A raw term is injected into the `MATCH` grammar as-is, so any
+        character the tokenizer can keep (an apostrophe, a hyphen, a
+        question mark) is read as FTS5 syntax and raises
+        `OperationalError`; the caller then drops the term silently.
+        Quoting makes the whole term one literal phrase, which the
+        `unicode61` index tokenizes the same way it tokenized the stored
+        text. Safe words are unaffected: a one-token phrase matches
+        exactly like the bare token.
+        """
+        return '"' + term.replace('"', '""') + '"'
+
     def search(
         self, session_id: Optional[str], query: str, limit: int = 10
     ) -> list[StoredMessage]:
@@ -247,6 +455,10 @@ class ContextStore:
         LIKE fallback when no FTS5. Results carry their session_id so
         callers can separate current-session history from cross-session
         history. ORDER BY is deterministic (session, seq).
+
+        FTS5 mode passes the term as a quoted phrase, so user punctuation
+        can never escape into MATCH syntax. The LIKE fallback keeps the
+        raw term: there, punctuation is an ordinary substring.
         """
         if self.fts_available:
             sql = (
@@ -255,7 +467,7 @@ class ContextStore:
                 " FROM messages_fts f JOIN messages m ON m.id = f.rowid"
                 " WHERE messages_fts MATCH ?"
             )
-            params: list[Any] = [query]
+            params: list[Any] = [self._fts_phrase(query)]
             if session_id is not None:
                 sql += " AND m.session_id = ?"
                 params.append(session_id)
@@ -413,6 +625,77 @@ class ContextStore:
                 (status, time.time(), session_id),
             )
 
+    @staticmethod
+    def _normalize_timestamp(value: float, name: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} must be a normalized numeric timestamp")
+        normalized = float(value)
+        if not math.isfinite(normalized):
+            raise ValueError(f"{name} must be finite")
+        return normalized
+
+    @staticmethod
+    def _validate_interval(
+        valid_from: Optional[float], valid_until: Optional[float]
+    ) -> None:
+        if (valid_from is not None and valid_until is not None
+                and valid_until < valid_from):
+            raise ValueError("valid_until must not be earlier than valid_from")
+
+    def _resolve_observed_at(
+        self,
+        con,
+        source_ids: list[int],
+        created_at: float,
+        observed_at: Optional[float],
+    ) -> float:
+        if observed_at is not None:
+            return self._normalize_timestamp(observed_at, "observed_at")
+        for source_id in source_ids:
+            row = con.execute(
+                "SELECT timestamp FROM messages WHERE id = ?", (source_id,)
+            ).fetchone()
+            if row is not None:
+                try:
+                    return self._normalize_timestamp(row[0], "message timestamp")
+                except ValueError:
+                    pass
+        return created_at
+
+    def _insert_state_row(
+        self,
+        con,
+        session_id: str,
+        scope: str,
+        concept: str,
+        value: str,
+        source_ids: list[int],
+        created_at: float,
+        observed_at: float,
+        valid_from: float,
+        valid_until: Optional[float],
+        status: str,
+        supersedes_id: Optional[int],
+        authority: str,
+        superseded_at: Optional[float],
+        memory_type: str,
+        confidence: Optional[float],
+    ) -> int:
+        cur = con.execute(
+            "INSERT INTO states"
+            "(session_id, scope, concept, value, source_ids,"
+            " created_at, status, supersedes_id, authority, memory_type,"
+            " confidence, observed_at, valid_from, valid_until, superseded_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id, scope, concept, value,
+                ",".join(str(i) for i in source_ids),
+                created_at, status, supersedes_id, authority, memory_type,
+                confidence, observed_at, valid_from, valid_until, superseded_at,
+            ),
+        )
+        return int(cur.lastrowid)
+
     def create_state(
         self,
         session_id: str,
@@ -424,21 +707,227 @@ class ContextStore:
         supersedes_id: Optional[int] = None,
         authority: str = "user",
         timestamp: Optional[float] = None,
+        memory_type: str = "",
+        confidence: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        superseded_at: Optional[float] = None,
     ) -> int:
-        with self._connect() as con:
-            cur = con.execute(
-                "INSERT INTO states"
-                "(session_id, scope, concept, value, source_ids,"
-                " created_at, status, supersedes_id, authority)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    session_id, scope, concept, value,
-                    ",".join(str(i) for i in source_ids),
-                    timestamp if timestamp is not None else time.time(),
-                    status, supersedes_id, authority,
-                ),
+        if authority != "user" and status == "current":
+            raise ValueError(
+                "only user-authored states may be current "
+                f"(got authority={authority!r})"
             )
-            return cur.lastrowid
+        created_at = (
+            self._normalize_timestamp(timestamp, "created_at")
+            if timestamp is not None else time.time()
+        )
+        normalized_until = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else None
+        )
+        normalized_superseded_at = (
+            self._normalize_timestamp(superseded_at, "superseded_at")
+            if superseded_at is not None else None
+        )
+        with self._connect() as con:
+            observed = self._resolve_observed_at(
+                con, source_ids, created_at, observed_at
+            )
+            effective_from = (
+                self._normalize_timestamp(valid_from, "valid_from")
+                if valid_from is not None else observed
+            )
+            self._validate_interval(effective_from, normalized_until)
+            return self._insert_state_row(
+                con, session_id, scope, concept, value, source_ids,
+                created_at, observed, effective_from, normalized_until,
+                status, supersedes_id, authority, normalized_superseded_at,
+                memory_type, confidence,
+            )
+
+    def create_state_with_explains(
+        self,
+        session_id: str,
+        scope: str,
+        concept: str,
+        value: str,
+        source_ids: list[int],
+        explains_state_id: int,
+        memory_type: str = "RATIONALE",
+        confidence: float = 1.0,
+        timestamp: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+    ) -> tuple[int, int]:
+        sources = list(dict.fromkeys(int(item) for item in source_ids))
+        if not sources:
+            raise ValueError("explained state requires source provenance")
+        created_at = (
+            self._normalize_timestamp(timestamp, "created_at")
+            if timestamp is not None else time.time()
+        )
+        normalized_from = (
+            self._normalize_timestamp(valid_from, "valid_from")
+            if valid_from is not None else None
+        )
+        normalized_until = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else None
+        )
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            explained = con.execute(
+                "SELECT scope, status, authority FROM states WHERE id = ?",
+                (explains_state_id,),
+            ).fetchone()
+            if explained is None:
+                raise ValueError(f"state {explains_state_id} not found")
+            if explained[0] != scope:
+                raise ValueError("explained state scope does not match")
+            if explained[1] != "current" or explained[2] != "user":
+                raise ValueError("explained state must be current user state")
+            observed = self._resolve_observed_at(
+                con, sources, created_at, observed_at
+            )
+            effective_from = normalized_from if normalized_from is not None else observed
+            self._validate_interval(effective_from, normalized_until)
+            state_id = self._insert_state_row(
+                con, session_id, scope, concept, value, sources,
+                created_at, observed, effective_from, normalized_until,
+                "current", None, "user", None, memory_type, confidence,
+            )
+            relationship_id = self._insert_relationship_row(
+                con,
+                session_id,
+                scope,
+                "explains",
+                "memory_state",
+                state_id,
+                "memory_state",
+                explains_state_id,
+                sources,
+                "current",
+                "user",
+                confidence,
+                created_at,
+                observed,
+                effective_from,
+                normalized_until,
+                None,
+                None,
+            )
+        return state_id, relationship_id
+
+    def create_state_successor(
+        self,
+        session_id: str,
+        scope: str,
+        concept: str,
+        value: str,
+        source_ids: list[int],
+        predecessor_ids: list[int],
+        authority: str = "user",
+        timestamp: Optional[float] = None,
+        memory_type: str = "",
+        confidence: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        transition_time: Optional[float] = None,
+    ) -> int:
+        if authority != "user":
+            raise ValueError("only user-authored states may replace current state")
+        created_at = (
+            self._normalize_timestamp(timestamp, "created_at")
+            if timestamp is not None else time.time()
+        )
+        transition = (
+            self._normalize_timestamp(transition_time, "transition_time")
+            if transition_time is not None else created_at
+        )
+        normalized_until = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else None
+        )
+        expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            current_rows = con.execute(
+                "SELECT id FROM states"
+                " WHERE scope = ? AND concept = ? AND status = 'current'"
+                " ORDER BY id ASC",
+                (scope, concept),
+            ).fetchall()
+            current_ids = [int(row[0]) for row in current_rows]
+            if set(current_ids) != set(expected_ids):
+                raise ValueError("current state changed during replacement")
+            observed = self._resolve_observed_at(
+                con, source_ids, created_at, observed_at
+            )
+            effective_from = (
+                self._normalize_timestamp(valid_from, "valid_from")
+                if valid_from is not None else observed
+            )
+            self._validate_interval(effective_from, normalized_until)
+            predecessor_id = current_ids[0] if current_ids else None
+            new_id = self._insert_state_row(
+                con, session_id, scope, concept, value, source_ids,
+                created_at, observed, effective_from, normalized_until,
+                "current", predecessor_id, authority, None, memory_type,
+                confidence,
+            )
+            for state_id in current_ids:
+                cur = con.execute(
+                    "UPDATE states SET status = 'superseded',"
+                    " valid_from = CASE WHEN valid_from IS NOT NULL"
+                    " AND ? < valid_from THEN NULL ELSE valid_from END,"
+                    " valid_until = ?, superseded_at = ?"
+                    " WHERE id = ? AND status = 'current'",
+                    (effective_from, effective_from, transition, state_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("predecessor changed during replacement")
+            return new_id
+
+    def supersede_states(
+        self,
+        state_ids: list[int],
+        valid_until: Optional[float] = None,
+        transition_time: Optional[float] = None,
+    ) -> None:
+        ids = list(dict.fromkeys(int(i) for i in state_ids))
+        if not ids:
+            return
+        transition = (
+            self._normalize_timestamp(transition_time, "transition_time")
+            if transition_time is not None else time.time()
+        )
+        end = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else transition
+        )
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            for state_id in ids:
+                row = con.execute(
+                    "SELECT status, valid_from FROM states WHERE id = ?",
+                    (state_id,),
+                ).fetchone()
+                if row is None or row[0] != "current":
+                    raise ValueError("state changed during supersession")
+                cur = con.execute(
+                    "UPDATE states SET status = 'superseded',"
+                    " valid_from = CASE WHEN valid_from IS NOT NULL"
+                    " AND ? < valid_from THEN NULL ELSE valid_from END,"
+                    " valid_until = ?, superseded_at = ?"
+                    " WHERE id = ? AND status = 'current'",
+                    (end, end, transition, state_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("state changed during supersession")
 
     def set_state_status(self, state_id: int, status: str) -> None:
         """Transition a state row (e.g. current -> superseded). Raw kept."""
@@ -451,12 +940,23 @@ class ContextStore:
     def _state_rows_to_records(self, rows) -> list[StateRecord]:
         out = []
         for r in rows:
+            authority = r[9]
+            raw_confidence = r[11] if len(r) > 11 else None
+            if raw_confidence is None:
+                # Legacy rows predate confidence: deterministic rule only.
+                raw_confidence = 1.0 if authority == "user" else 0.3
             out.append(StateRecord(
                 state_id=r[0], session_id=r[1], scope=r[2], concept=r[3],
                 value=r[4],
                 source_ids=[int(x) for x in r[5].split(",") if x],
                 created_at=r[6], status=r[7], supersedes_id=r[8],
-                authority=r[9],
+                authority=authority,
+                memory_type=(r[10] or "") if len(r) > 10 else "",
+                confidence=raw_confidence,
+                observed_at=r[12] if len(r) > 12 else None,
+                valid_from=r[13] if len(r) > 13 else None,
+                valid_until=r[14] if len(r) > 14 else None,
+                superseded_at=r[15] if len(r) > 15 else None,
             ))
         return out
 
@@ -466,10 +966,17 @@ class ContextStore:
         scope: Optional[str] = None,
         concept: Optional[str] = None,
         status: Optional[str] = None,
+        state_ids: Optional[list[int]] = None,
+        at_time: Optional[float] = None,
+        limit: Optional[int] = None,
     ) -> list[StateRecord]:
+        if state_ids is not None and not state_ids:
+            return []
         query = (
             "SELECT id, session_id, scope, concept, value, source_ids,"
-            " created_at, status, supersedes_id, authority FROM states WHERE 1=1"
+            " created_at, status, supersedes_id, authority, memory_type,"
+            " confidence, observed_at, valid_from, valid_until, superseded_at"
+            " FROM states WHERE 1=1"
         )
         params: list[Any] = []
         if session_id is not None:
@@ -484,10 +991,1197 @@ class ContextStore:
         if status is not None:
             query += " AND status = ?"
             params.append(status)
+        if state_ids is not None:
+            query += " AND id IN (%s)" % ",".join("?" for _ in state_ids)
+            params.extend(int(value) for value in state_ids)
+        if at_time is not None:
+            evaluation_time = self._normalize_timestamp(at_time, "at_time")
+            query += (
+                " AND valid_from IS NOT NULL AND valid_from <= ?"
+                " AND (valid_until IS NULL OR ? < valid_until)"
+            )
+            params.extend([evaluation_time, evaluation_time])
         query += " ORDER BY id ASC"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params.append(limit)
         with self._connect() as con:
             rows = con.execute(query, params).fetchall()
         return self._state_rows_to_records(rows)
+
+    def create_candidate(
+        self,
+        session_id: str,
+        scope: str,
+        source_ids: list[int],
+        proposed_type: str,
+        proposed_concept: str,
+        proposed_value: str,
+        proposed_rationale: str = "",
+        authority: str = "user",
+        confidence: float = 0.3,
+        status: str = "pending",
+        timestamp: Optional[float] = None,
+        expires_at: Optional[float] = None,
+    ) -> int:
+        with self._connect() as con:
+            cur = con.execute(
+                "INSERT INTO candidates"
+                "(session_id, scope, source_ids, proposed_type,"
+                " proposed_concept, proposed_value, proposed_rationale,"
+                " authority, confidence, status, created_at, expires_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, scope,
+                    ",".join(str(i) for i in source_ids),
+                    proposed_type, proposed_concept, proposed_value,
+                    proposed_rationale, authority, confidence, status,
+                    timestamp if timestamp is not None else time.time(),
+                    expires_at,
+                ),
+            )
+            return cur.lastrowid
+
+    def _candidate_rows_to_records(self, rows) -> list[CandidateRecord]:
+        out = []
+        for r in rows:
+            out.append(CandidateRecord(
+                candidate_id=r[0], session_id=r[1], scope=r[2],
+                source_ids=[int(x) for x in r[3].split(",") if x],
+                proposed_type=r[4] or "", proposed_concept=r[5] or "",
+                proposed_value=r[6] or "", proposed_rationale=r[7] or "",
+                authority=r[8] or "user", confidence=r[9],
+                status=r[10], created_at=r[11], expires_at=r[12],
+            ))
+        return out
+
+    def fetch_candidates(
+        self,
+        scope: Optional[str] = None,
+        status: Optional[str] = None,
+        concept: Optional[str] = None,
+        candidate_id: Optional[int] = None,
+    ) -> list[CandidateRecord]:
+        query = (
+            "SELECT id, session_id, scope, source_ids, proposed_type,"
+            " proposed_concept, proposed_value, proposed_rationale,"
+            " authority, confidence, status, created_at, expires_at"
+            " FROM candidates WHERE 1=1"
+        )
+        params: list[Any] = []
+        if scope is not None:
+            query += " AND scope = ?"
+            params.append(scope)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        if concept is not None:
+            query += " AND proposed_concept = ?"
+            params.append(concept)
+        if candidate_id is not None:
+            query += " AND id = ?"
+            params.append(candidate_id)
+        query += " ORDER BY id ASC"
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return self._candidate_rows_to_records(rows)
+
+    def set_candidate_status(self, candidate_id: int, status: str) -> None:
+        with self._connect() as con:
+            con.execute(
+                "UPDATE candidates SET status = ? WHERE id = ?",
+                (status, candidate_id),
+            )
+
+    def _entity_row_to_record(self, row) -> EntityRecord:
+        return EntityRecord(
+            entity_id=row[0], session_id=row[1], scope=row[2],
+            entity_type=row[3], display_name=row[4],
+            normalized_name=row[5], status=row[6],
+            merged_into_entity_id=row[7],
+            source_ids=[int(value) for value in row[8].split(",") if value],
+            authority=row[9], confidence=row[10], created_at=row[11],
+            observed_at=row[12], merged_at=row[13],
+        )
+
+    def _entity_rows_to_records(self, rows) -> list[EntityRecord]:
+        return [self._entity_row_to_record(row) for row in rows]
+
+    def _entity_select(self) -> str:
+        return (
+            "SELECT id, session_id, scope, entity_type, display_name,"
+            " normalized_name, status, merged_into_entity_id, source_ids,"
+            " authority, confidence, created_at, observed_at, merged_at"
+            " FROM entities"
+        )
+
+    def fetch_entity(self, entity_id: int) -> Optional[EntityRecord]:
+        with self._connect() as con:
+            row = con.execute(
+                self._entity_select() + " WHERE id = ?", (entity_id,)
+            ).fetchone()
+        return self._entity_row_to_record(row) if row is not None else None
+
+    def fetch_entities(
+        self,
+        entity_id: Optional[int] = None,
+        scope: Optional[str] = None,
+        status: Optional[str] = None,
+        entity_type: Optional[str] = None,
+        normalized_name: Optional[str] = None,
+        entity_ids: Optional[list[int]] = None,
+        limit: Optional[int] = None,
+    ) -> list[EntityRecord]:
+        if entity_ids is not None and not entity_ids:
+            return []
+        query = self._entity_select() + " WHERE 1=1"
+        params: list[Any] = []
+        if entity_id is not None:
+            query += " AND id = ?"
+            params.append(entity_id)
+        if scope is not None:
+            query += " AND scope = ?"
+            params.append(scope)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        if entity_type is not None:
+            query += " AND entity_type = ?"
+            params.append(entity_type)
+        if normalized_name is not None:
+            query += " AND normalized_name = ?"
+            params.append(normalized_name)
+        if entity_ids is not None:
+            query += " AND id IN (%s)" % ",".join("?" for _ in entity_ids)
+            params.extend(int(value) for value in entity_ids)
+        query += " ORDER BY id ASC"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return self._entity_rows_to_records(rows)
+
+    def create_entity(
+        self,
+        session_id: str,
+        scope: str,
+        entity_type: str,
+        display_name: str,
+        normalized_name: str,
+        source_ids: list[int],
+        status: str = "candidate",
+        authority: str = "user",
+        confidence: float = 0.3,
+        timestamp: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        merged_into_entity_id: Optional[int] = None,
+        merged_at: Optional[float] = None,
+    ) -> int:
+        if entity_type not in ENTITY_TYPES:
+            raise ValueError(f"unknown entity_type={entity_type!r}")
+        if status not in ("candidate", "active"):
+            raise ValueError("entities must be created as candidate or active")
+        if authority not in ENTITY_AUTHORITIES:
+            raise ValueError(f"unknown authority={authority!r}")
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise ValueError("display_name must be a non-empty string")
+        if not isinstance(normalized_name, str) or not normalized_name:
+            raise ValueError("normalized_name must be a non-empty string")
+        if normalized_name != normalize_entity_name(display_name):
+            raise ValueError("normalized_name does not match deterministic normalization")
+        sources = list(dict.fromkeys(int(value) for value in source_ids))
+        if status == "active" and authority != "user":
+            raise ValueError(
+                "only user-authored entities may be active "
+                f"(got authority={authority!r})"
+            )
+        if status == "active" and not sources:
+            raise ValueError("active entities require source provenance")
+        created_at = (
+            self._normalize_timestamp(timestamp, "created_at")
+            if timestamp is not None else time.time()
+        )
+        normalized_merged_at = (
+            self._normalize_timestamp(merged_at, "merged_at")
+            if merged_at is not None else None
+        )
+        with self._connect() as con:
+            observed = self._resolve_observed_at(
+                con, sources, created_at, observed_at
+            )
+            cur = con.execute(
+                "INSERT INTO entities"
+                "(session_id, scope, entity_type, display_name,"
+                " normalized_name, status, merged_into_entity_id, source_ids,"
+                " authority, confidence, created_at, observed_at, merged_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, scope, entity_type, display_name.strip(),
+                    normalized_name, status, merged_into_entity_id,
+                    ",".join(str(value) for value in sources), authority,
+                    confidence, created_at, observed, normalized_merged_at,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def confirm_entity(
+        self, entity_id: int, confidence: float = 1.0
+    ) -> Optional[EntityRecord]:
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status, authority, source_ids FROM entities"
+                " WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"entity {entity_id} not found")
+            if row[0] != "candidate":
+                raise ValueError(f"entity {entity_id} is {row[0]}, not candidate")
+            if row[1] != "user":
+                raise ValueError(f"entity {entity_id} authority is not user")
+            if not row[2]:
+                raise ValueError(f"entity {entity_id} has no provenance")
+            cur = con.execute(
+                "UPDATE entities SET status = 'active', confidence = ?"
+                " WHERE id = ? AND status = 'candidate'",
+                (confidence, entity_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("entity changed during confirmation")
+            updated = con.execute(
+                self._entity_select() + " WHERE id = ?", (entity_id,)
+            ).fetchone()
+        return self._entity_row_to_record(updated)
+
+    def archive_entity(self, entity_id: int) -> Optional[EntityRecord]:
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status FROM entities WHERE id = ?", (entity_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"entity {entity_id} not found")
+            if row[0] != "active":
+                raise ValueError(f"entity {entity_id} is {row[0]}, not active")
+            cur = con.execute(
+                "UPDATE entities SET status = 'archived'"
+                " WHERE id = ? AND status = 'active'",
+                (entity_id,),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("entity changed during archival")
+            updated = con.execute(
+                self._entity_select() + " WHERE id = ?", (entity_id,)
+            ).fetchone()
+        return self._entity_row_to_record(updated)
+
+    def merge_entities(
+        self,
+        losing_entity_id: int,
+        canonical_entity_id: int,
+        merged_at: float,
+    ) -> Optional[EntityRecord]:
+        transition = self._normalize_timestamp(merged_at, "merged_at")
+        if losing_entity_id == canonical_entity_id:
+            raise ValueError("entity cannot be merged into itself")
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            losing = con.execute(
+                self._entity_select() + " WHERE id = ?",
+                (losing_entity_id,),
+            ).fetchone()
+            canonical = con.execute(
+                self._entity_select() + " WHERE id = ?",
+                (canonical_entity_id,),
+            ).fetchone()
+            if losing is None:
+                raise ValueError(f"entity {losing_entity_id} not found")
+            if canonical is None:
+                raise ValueError(f"entity {canonical_entity_id} not found")
+            losing_record = self._entity_row_to_record(losing)
+            canonical_record = self._entity_row_to_record(canonical)
+            if losing_record.status != "active":
+                raise ValueError(
+                    f"entity {losing_entity_id} is {losing_record.status},"
+                    " not active"
+                )
+            if canonical_record.status != "active":
+                raise ValueError(
+                    f"entity {canonical_entity_id} is {canonical_record.status},"
+                    " not active"
+                )
+            if losing_record.scope != canonical_record.scope:
+                raise ValueError("entities must share one scope to merge")
+            cur = con.execute(
+                "UPDATE entities SET status = 'merged',"
+                " merged_into_entity_id = ?, merged_at = ?"
+                " WHERE id = ? AND status = 'active'",
+                (canonical_entity_id, transition, losing_entity_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("entity changed during merge")
+            updated = con.execute(
+                self._entity_select() + " WHERE id = ?",
+                (losing_entity_id,),
+            ).fetchone()
+        return self._entity_row_to_record(updated)
+
+    def _alias_row_to_record(self, row) -> EntityAliasRecord:
+        return EntityAliasRecord(
+            alias_id=row[0], session_id=row[1], scope=row[2],
+            entity_id=row[3], alias_text=row[4], normalized_alias=row[5],
+            status=row[6],
+            source_ids=[int(value) for value in row[7].split(",") if value],
+            authority=row[8], confidence=row[9], created_at=row[10],
+            observed_at=row[11], valid_from=row[12], valid_until=row[13],
+            superseded_at=row[14],
+        )
+
+    def _alias_select(self) -> str:
+        return (
+            "SELECT id, session_id, scope, entity_id, alias_text,"
+            " normalized_alias, status, source_ids, authority, confidence,"
+            " created_at, observed_at, valid_from, valid_until, superseded_at"
+            " FROM entity_aliases"
+        )
+
+    def fetch_entity_alias(
+        self, alias_id: int
+    ) -> Optional[EntityAliasRecord]:
+        with self._connect() as con:
+            row = con.execute(
+                self._alias_select() + " WHERE id = ?", (alias_id,)
+            ).fetchone()
+        return self._alias_row_to_record(row) if row is not None else None
+
+    def fetch_entity_aliases(
+        self,
+        alias_id: Optional[int] = None,
+        entity_id: Optional[int] = None,
+        scope: Optional[str] = None,
+        status: Optional[str] = None,
+        normalized_alias: Optional[str] = None,
+        at_time: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> list[EntityAliasRecord]:
+        query = self._alias_select() + " WHERE 1=1"
+        params: list[Any] = []
+        if alias_id is not None:
+            query += " AND id = ?"
+            params.append(alias_id)
+        if entity_id is not None:
+            query += " AND entity_id = ?"
+            params.append(entity_id)
+        if scope is not None:
+            query += " AND scope = ?"
+            params.append(scope)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        if normalized_alias is not None:
+            query += " AND normalized_alias = ?"
+            params.append(normalized_alias)
+        if at_time is not None:
+            evaluation_time = self._normalize_timestamp(at_time, "at_time")
+            query += (
+                " AND valid_from IS NOT NULL AND valid_from <= ?"
+                " AND (valid_until IS NULL OR ? < valid_until)"
+            )
+            params.extend([evaluation_time, evaluation_time])
+        query += " ORDER BY id ASC"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [self._alias_row_to_record(row) for row in rows]
+
+    def create_entity_alias(
+        self,
+        entity_id: int,
+        session_id: str,
+        scope: str,
+        alias_text: str,
+        normalized_alias: str,
+        source_ids: list[int],
+        status: str = "candidate",
+        authority: str = "user",
+        confidence: float = 0.3,
+        timestamp: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+    ) -> int:
+        if status not in ("candidate", "current"):
+            raise ValueError("aliases must be created as candidate or current")
+        if authority not in ENTITY_AUTHORITIES:
+            raise ValueError(f"unknown authority={authority!r}")
+        if not isinstance(alias_text, str) or not alias_text.strip():
+            raise ValueError("alias_text must be a non-empty string")
+        if not isinstance(normalized_alias, str) or not normalized_alias:
+            raise ValueError("normalized_alias must be a non-empty string")
+        if normalized_alias != normalize_entity_name(alias_text):
+            raise ValueError("normalized_alias does not match deterministic normalization")
+        sources = list(dict.fromkeys(int(value) for value in source_ids))
+        created_at = (
+            self._normalize_timestamp(timestamp, "created_at")
+            if timestamp is not None else time.time()
+        )
+        normalized_from = (
+            self._normalize_timestamp(valid_from, "valid_from")
+            if valid_from is not None else None
+        )
+        normalized_until = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else None
+        )
+        with self._connect() as con:
+            entity = con.execute(
+                "SELECT scope, status, source_ids FROM entities"
+                " WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            if entity is None:
+                raise ValueError(f"entity {entity_id} not found")
+            if entity[0] != scope:
+                raise ValueError("alias scope must match entity scope")
+            if entity[1] not in ("candidate", "active"):
+                raise ValueError(f"entity {entity_id} is {entity[1]}")
+            if status == "current" and authority != "user":
+                raise ValueError(
+                    "only user-authored aliases may be current "
+                    f"(got authority={authority!r})"
+                )
+            if status == "current" and not sources:
+                raise ValueError("current aliases require source provenance")
+            if status == "current" and entity[1] != "active":
+                raise ValueError("aliases become current only for active entities")
+            observed = self._resolve_observed_at(
+                con, sources, created_at, observed_at
+            )
+            effective_from = (
+                normalized_from if normalized_from is not None else observed
+            )
+            self._validate_interval(effective_from, normalized_until)
+            cur = con.execute(
+                "INSERT INTO entity_aliases"
+                "(session_id, scope, entity_id, alias_text, normalized_alias,"
+                " status, source_ids, authority, confidence, created_at,"
+                " observed_at, valid_from, valid_until, superseded_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, scope, entity_id, alias_text.strip(),
+                    normalized_alias, status,
+                    ",".join(str(value) for value in sources), authority,
+                    confidence, created_at, observed, effective_from,
+                    normalized_until, None,
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def confirm_entity_alias(
+        self,
+        alias_id: int,
+        confidence: float = 1.0,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+    ) -> Optional[EntityAliasRecord]:
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                self._alias_select() + " WHERE id = ?", (alias_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"alias {alias_id} not found")
+            alias = self._alias_row_to_record(row)
+            if alias.status != "candidate":
+                raise ValueError(f"alias {alias_id} is {alias.status}")
+            if alias.authority != "user":
+                raise ValueError(f"alias {alias_id} authority is not user")
+            if not alias.source_ids:
+                raise ValueError(f"alias {alias_id} has no provenance")
+            entity = con.execute(
+                "SELECT scope, status FROM entities WHERE id = ?",
+                (alias.entity_id,),
+            ).fetchone()
+            if entity is None:
+                raise ValueError(f"entity {alias.entity_id} not found")
+            if entity[0] != alias.scope:
+                raise ValueError("alias scope must match entity scope")
+            if entity[1] != "active":
+                raise ValueError("aliases become current only for active entities")
+            effective_from = (
+                self._normalize_timestamp(valid_from, "valid_from")
+                if valid_from is not None else alias.valid_from
+            )
+            if effective_from is None:
+                effective_from = alias.observed_at
+            normalized_until = (
+                self._normalize_timestamp(valid_until, "valid_until")
+                if valid_until is not None else alias.valid_until
+            )
+            self._validate_interval(effective_from, normalized_until)
+            cur = con.execute(
+                "UPDATE entity_aliases SET status = 'current', confidence = ?,"
+                " valid_from = ?, valid_until = ?, superseded_at = NULL"
+                " WHERE id = ? AND status = 'candidate'",
+                (confidence, effective_from, normalized_until, alias_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("alias changed during confirmation")
+            updated = con.execute(
+                self._alias_select() + " WHERE id = ?", (alias_id,)
+            ).fetchone()
+        return self._alias_row_to_record(updated)
+
+    def _relationship_row_to_record(self, row) -> RelationshipRecord:
+        return RelationshipRecord(
+            relationship_id=row[0], session_id=row[1], scope=row[2],
+            relationship_type=row[3], subject_kind=row[4],
+            subject_id=row[5], object_kind=row[6], object_id=row[7],
+            status=row[8],
+            source_ids=[int(value) for value in row[9].split(",") if value],
+            authority=row[10], confidence=row[11], created_at=row[12],
+            observed_at=row[13], valid_from=row[14], valid_until=row[15],
+            supersedes_id=row[16], superseded_at=row[17],
+        )
+
+    def _relationship_select(self) -> str:
+        return (
+            "SELECT id, session_id, scope, relationship_type, subject_kind,"
+            " subject_id, object_kind, object_id, status, source_ids,"
+            " authority, confidence, created_at, observed_at, valid_from,"
+            " valid_until, supersedes_id, superseded_at FROM relationships"
+        )
+
+    def _relationship_endpoint(
+        self, con, kind: str, entity_id: int
+    ) -> Optional[tuple[str, str, str]]:
+        if kind == "entity":
+            return con.execute(
+                "SELECT scope, status, authority FROM entities WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+        if kind == "memory_state":
+            return con.execute(
+                "SELECT scope, status, authority FROM states WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+        raise ValueError(f"unknown relationship endpoint kind={kind!r}")
+
+    def _validate_relationship_endpoints(
+        self,
+        con,
+        scope: str,
+        relationship_type: str,
+        subject_kind: str,
+        subject_id: int,
+        object_kind: str,
+        object_id: int,
+        require_current: bool,
+    ) -> None:
+        if relationship_type not in RELATIONSHIP_TYPES:
+            raise ValueError(f"unknown relationship_type={relationship_type!r}")
+        expected = RELATIONSHIP_ENDPOINTS[relationship_type]
+        if (subject_kind, object_kind) != expected:
+            raise ValueError(
+                f"{relationship_type} requires endpoints {expected[0]} ->"
+                f" {expected[1]}"
+            )
+        if subject_kind == object_kind and subject_id == object_id:
+            raise ValueError("relationship endpoints must be different")
+        for kind, record_id in (
+            (subject_kind, subject_id), (object_kind, object_id)
+        ):
+            endpoint = self._relationship_endpoint(con, kind, record_id)
+            if endpoint is None:
+                raise ValueError(f"{kind} {record_id} not found")
+            if endpoint[0] != scope:
+                raise ValueError("relationship scope must match endpoint scope")
+            if require_current:
+                expected_status = "active" if kind == "entity" else "current"
+                if endpoint[1] != expected_status or endpoint[2] != "user":
+                    raise ValueError(
+                        f"{kind} {record_id} must be current user"
+                        f" {expected_status}"
+                    )
+            elif kind == "entity" and endpoint[1] not in ("candidate", "active"):
+                raise ValueError(f"entity {record_id} is {endpoint[1]}")
+
+    def _insert_relationship_row(
+        self,
+        con,
+        session_id: str,
+        scope: str,
+        relationship_type: str,
+        subject_kind: str,
+        subject_id: int,
+        object_kind: str,
+        object_id: int,
+        source_ids: list[int],
+        status: str,
+        authority: str,
+        confidence: float,
+        created_at: float,
+        observed_at: float,
+        valid_from: float,
+        valid_until: Optional[float],
+        supersedes_id: Optional[int],
+        superseded_at: Optional[float],
+    ) -> int:
+        cur = con.execute(
+            "INSERT INTO relationships"
+            "(session_id, scope, relationship_type, subject_kind, subject_id,"
+            " object_kind, object_id, status, source_ids, authority, confidence,"
+            " created_at, observed_at, valid_from, valid_until, supersedes_id,"
+            " superseded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            " ?, ?, ?)",
+            (
+                session_id, scope, relationship_type, subject_kind,
+                subject_id, object_kind, object_id, status,
+                ",".join(str(value) for value in source_ids), authority,
+                confidence, created_at, observed_at, valid_from, valid_until,
+                supersedes_id, superseded_at,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def fetch_relationship(
+        self, relationship_id: int
+    ) -> Optional[RelationshipRecord]:
+        with self._connect() as con:
+            row = con.execute(
+                self._relationship_select() + " WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+        return self._relationship_row_to_record(row) if row is not None else None
+
+    def fetch_relationships(
+        self,
+        scope: Optional[str] = None,
+        relationship_type: Optional[str] = None,
+        status: Optional[str] = None,
+        subject_kind: Optional[str] = None,
+        subject_id: Optional[int] = None,
+        object_kind: Optional[str] = None,
+        object_id: Optional[int] = None,
+        at_time: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> list[RelationshipRecord]:
+        query = self._relationship_select() + " WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (
+            ("scope", scope),
+            ("relationship_type", relationship_type),
+            ("status", status),
+            ("subject_kind", subject_kind),
+            ("subject_id", subject_id),
+            ("object_kind", object_kind),
+            ("object_id", object_id),
+        ):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
+        if at_time is not None:
+            evaluation_time = self._normalize_timestamp(at_time, "at_time")
+            query += (
+                " AND valid_from IS NOT NULL AND valid_from <= ?"
+                " AND (valid_until IS NULL OR ? < valid_until)"
+            )
+            params.extend([evaluation_time, evaluation_time])
+        query += " ORDER BY id ASC"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [self._relationship_row_to_record(row) for row in rows]
+
+    def create_relationship(
+        self,
+        session_id: str,
+        scope: str,
+        relationship_type: str,
+        subject_kind: str,
+        subject_id: int,
+        object_kind: str,
+        object_id: int,
+        source_ids: list[int],
+        status: str = "candidate",
+        authority: str = "user",
+        confidence: float = 0.3,
+        timestamp: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+    ) -> int:
+        if status not in ("candidate", "unresolved"):
+            raise ValueError("relationships must be created as candidate or unresolved")
+        if status not in RELATIONSHIP_STATUSES:
+            raise ValueError(f"unknown relationship status={status!r}")
+        if relationship_type not in RELATIONSHIP_TYPES:
+            raise ValueError(f"unknown relationship_type={relationship_type!r}")
+        if authority not in ENTITY_AUTHORITIES:
+            raise ValueError(f"unknown authority={authority!r}")
+        if scope != "global" and session_id != scope:
+            raise ValueError("session relationship must originate in its scope")
+        sources = list(dict.fromkeys(int(value) for value in source_ids))
+        created_at = (
+            self._normalize_timestamp(timestamp, "created_at")
+            if timestamp is not None else time.time()
+        )
+        normalized_from = (
+            self._normalize_timestamp(valid_from, "valid_from")
+            if valid_from is not None else None
+        )
+        normalized_until = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else None
+        )
+        with self._connect() as con:
+            self._validate_relationship_endpoints(
+                con, scope, relationship_type, subject_kind, subject_id,
+                object_kind, object_id, False,
+            )
+            observed = self._resolve_observed_at(
+                con, sources, created_at, observed_at
+            )
+            effective_from = normalized_from if normalized_from is not None else observed
+            self._validate_interval(effective_from, normalized_until)
+            return self._insert_relationship_row(
+                con, session_id, scope, relationship_type, subject_kind,
+                subject_id, object_kind, object_id, sources, status,
+                authority, confidence, created_at, observed, effective_from,
+                normalized_until, None, None,
+            )
+
+    def confirm_relationship(
+        self,
+        relationship_id: int,
+        confidence: float = 1.0,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        transition_time: Optional[float] = None,
+    ) -> Optional[RelationshipRecord]:
+        transition = (
+            self._normalize_timestamp(transition_time, "transition_time")
+            if transition_time is not None else time.time()
+        )
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                self._relationship_select() + " WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"relationship {relationship_id} not found")
+            candidate = self._relationship_row_to_record(row)
+            if candidate.status != "candidate":
+                raise ValueError(
+                    f"relationship {relationship_id} is {candidate.status},"
+                    " not candidate"
+                )
+            if candidate.authority != "user":
+                raise ValueError(
+                    f"relationship {relationship_id} authority is not user"
+                )
+            if not candidate.source_ids:
+                raise ValueError(f"relationship {relationship_id} has no provenance")
+            self._validate_relationship_endpoints(
+                con, candidate.scope, candidate.relationship_type,
+                candidate.subject_kind, candidate.subject_id,
+                candidate.object_kind, candidate.object_id, True,
+            )
+            effective_from = (
+                self._normalize_timestamp(valid_from, "valid_from")
+                if valid_from is not None else candidate.valid_from
+            )
+            if effective_from is None:
+                effective_from = candidate.observed_at
+            normalized_until = (
+                self._normalize_timestamp(valid_until, "valid_until")
+                if valid_until is not None else candidate.valid_until
+            )
+            self._validate_interval(effective_from, normalized_until)
+            current_rows = con.execute(
+                self._relationship_select() +
+                " WHERE scope = ? AND relationship_type = ? AND subject_id = ?"
+                " AND object_id = ? AND status = 'current' ORDER BY id ASC",
+                (
+                    candidate.scope, candidate.relationship_type,
+                    candidate.subject_id, candidate.object_id,
+                ),
+            ).fetchall()
+            if len(current_rows) > 1:
+                raise ValueError("multiple current relationships for one key")
+            predecessor_id = (
+                int(current_rows[0][0]) if current_rows else None
+            )
+            if predecessor_id is not None:
+                predecessor = self._relationship_row_to_record(current_rows[0])
+                cur = con.execute(
+                    "UPDATE relationships SET status = 'superseded',"
+                    " valid_from = CASE WHEN valid_from IS NOT NULL"
+                    " AND ? < valid_from THEN NULL ELSE valid_from END,"
+                    " valid_until = ?, superseded_at = ?"
+                    " WHERE id = ? AND status = 'current'",
+                    (
+                        effective_from, effective_from, transition,
+                        predecessor_id,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("relationship changed during confirmation")
+            con.execute(
+                "UPDATE relationships SET status = 'rejected'"
+                " WHERE scope = ? AND relationship_type = ? AND subject_id = ?"
+                " AND object_id = ? AND status = 'unresolved'",
+                (
+                    candidate.scope, candidate.relationship_type,
+                    candidate.subject_id, candidate.object_id,
+                ),
+            )
+            cur = con.execute(
+                "UPDATE relationships SET status = 'current', confidence = ?,"
+                " valid_from = ?, valid_until = ?, supersedes_id = ?,"
+                " superseded_at = NULL WHERE id = ? AND status = 'candidate'",
+                (
+                    confidence, effective_from, normalized_until,
+                    predecessor_id, relationship_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("relationship changed during confirmation")
+            updated = con.execute(
+                self._relationship_select() + " WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+        return self._relationship_row_to_record(updated)
+
+    def reject_relationship(
+        self, relationship_id: int
+    ) -> Optional[RelationshipRecord]:
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status FROM relationships WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"relationship {relationship_id} not found")
+            if row[0] not in ("candidate", "unresolved"):
+                raise ValueError(
+                    f"relationship {relationship_id} is {row[0]}, not rejectable"
+                )
+            cur = con.execute(
+                "UPDATE relationships SET status = 'rejected'"
+                " WHERE id = ? AND status IN ('candidate', 'unresolved')",
+                (relationship_id,),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("relationship changed during rejection")
+            updated = con.execute(
+                self._relationship_select() + " WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+        return self._relationship_row_to_record(updated)
+
+    def mark_relationship_unresolved(
+        self, relationship_id: int, transition_time: float
+    ) -> Optional[RelationshipRecord]:
+        transition = self._normalize_timestamp(
+            transition_time, "transition_time"
+        )
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status FROM relationships WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"relationship {relationship_id} not found")
+            if row[0] != "current":
+                raise ValueError(
+                    f"relationship {relationship_id} is {row[0]}, not current"
+                )
+            cur = con.execute(
+                "UPDATE relationships SET status = 'unresolved',"
+                " valid_from = CASE WHEN valid_from IS NOT NULL"
+                " AND ? < valid_from THEN NULL ELSE valid_from END,"
+                " valid_until = ?, superseded_at = NULL"
+                " WHERE id = ? AND status = 'current'",
+                (transition, transition, relationship_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("relationship changed during conflict")
+            updated = con.execute(
+                self._relationship_select() + " WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+        return self._relationship_row_to_record(updated)
+
+    def supersede_relationship(
+        self,
+        relationship_id: int,
+        valid_until: Optional[float],
+        transition_time: float,
+    ) -> Optional[RelationshipRecord]:
+        transition = self._normalize_timestamp(
+            transition_time, "transition_time"
+        )
+        end = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else transition
+        )
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT status FROM relationships WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"relationship {relationship_id} not found")
+            if row[0] != "current":
+                raise ValueError(
+                    f"relationship {relationship_id} is {row[0]}, not current"
+                )
+            cur = con.execute(
+                "UPDATE relationships SET status = 'superseded',"
+                " valid_from = CASE WHEN valid_from IS NOT NULL"
+                " AND ? < valid_from THEN NULL ELSE valid_from END,"
+                " valid_until = ?, superseded_at = ?"
+                " WHERE id = ? AND status = 'current'",
+                (end, end, transition, relationship_id),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("relationship changed during supersession")
+            updated = con.execute(
+                self._relationship_select() + " WHERE id = ?",
+                (relationship_id,),
+            ).fetchone()
+        return self._relationship_row_to_record(updated)
+
+    def supersede_states_with_relationships(
+        self,
+        state_ids: list[int],
+        explained_state_ids: Optional[list[int]] = None,
+        relationship_type: Optional[str] = None,
+        valid_until: Optional[float] = None,
+        transition_time: Optional[float] = None,
+    ) -> list[RelationshipRecord]:
+        ids = list(dict.fromkeys(int(value) for value in state_ids))
+        explained_ids = list(dict.fromkeys(
+            int(value) for value in (explained_state_ids or [])
+        ))
+        if not ids:
+            return []
+        transition = (
+            self._normalize_timestamp(transition_time, "transition_time")
+            if transition_time is not None else time.time()
+        )
+        end = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else transition
+        )
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            for state_id in ids:
+                row = con.execute(
+                    "SELECT status FROM states WHERE id = ?", (state_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"state {state_id} not found")
+                if row[0] != "current":
+                    raise ValueError(
+                        f"state {state_id} is {row[0]}, not current"
+                    )
+                cur = con.execute(
+                    "UPDATE states SET status = 'superseded',"
+                    " valid_from = CASE WHEN valid_from IS NOT NULL"
+                    " AND ? < valid_from THEN NULL ELSE valid_from END,"
+                    " valid_until = ?, superseded_at = ?"
+                    " WHERE id = ? AND status = 'current'",
+                    (end, end, transition, state_id),
+                )
+                if cur.rowcount != 1:
+                    raise ValueError("state changed during supersession")
+            relationship_ids: list[int] = []
+            if relationship_type is not None and explained_ids:
+                subject_marks = ",".join("?" for _ in ids)
+                object_marks = ",".join("?" for _ in explained_ids)
+                rows = con.execute(
+                    "SELECT id FROM relationships"
+                    " WHERE relationship_type = ? AND subject_kind = 'memory_state'"
+                    f" AND subject_id IN ({subject_marks})"
+                    " AND object_kind = 'memory_state'"
+                    f" AND object_id IN ({object_marks}) AND status = 'current'",
+                    [relationship_type, *ids, *explained_ids],
+                ).fetchall()
+                relationship_ids = [int(row[0]) for row in rows]
+                for relationship_id in relationship_ids:
+                    cur = con.execute(
+                        "UPDATE relationships SET status = 'superseded',"
+                        " valid_from = CASE WHEN valid_from IS NOT NULL"
+                        " AND ? < valid_from THEN NULL ELSE valid_from END,"
+                        " valid_until = ?, superseded_at = ?"
+                        " WHERE id = ? AND status = 'current'",
+                        (end, end, transition, relationship_id),
+                    )
+                    if cur.rowcount != 1:
+                        raise ValueError(
+                            "relationship changed during supersession"
+                        )
+            updated_rows = []
+            for relationship_id in relationship_ids:
+                row = con.execute(
+                    self._relationship_select() + " WHERE id = ?",
+                    (relationship_id,),
+                ).fetchone()
+            if row is not None:
+                updated_rows.append(self._relationship_row_to_record(row))
+        return updated_rows
+
+    # ------------------------------------------------------------------
+    # M6 semantic vector index
+    #
+    # A derived cache of embeddings for structured memory and canonical
+    # entities. It stores no source text: only a content hash, so the row
+    # can be matched against the live state/entity without duplicating it.
+    # Deleting every row is lossless; `SemanticIndex.rebuild()` recreates it.
+    # No ANN structure and no external vector database: candidate scoring is
+    # an exact float32 dot product, which is sufficient at this scale.
+    # ------------------------------------------------------------------
+    VECTOR_KINDS = ("state", "entity")
+
+    def upsert_vector(
+        self,
+        kind: str,
+        ref_id: int,
+        scope: str,
+        session_id: str,
+        model_id: str,
+        dim: int,
+        content_hash: str,
+        vector: bytes,
+        timestamp: Optional[float] = None,
+    ) -> int:
+        """Insert or refresh one embedding. Never touches memory truth."""
+        if kind not in self.VECTOR_KINDS:
+            raise ValueError(f"unknown vector kind={kind!r}")
+        created = (
+            self._normalize_timestamp(timestamp, "timestamp")
+            if timestamp is not None else time.time()
+        )
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "DELETE FROM retrieval_vectors"
+                " WHERE kind = ? AND ref_id = ? AND model_id = ?",
+                (kind, ref_id, model_id),
+            )
+            cur = con.execute(
+                "INSERT INTO retrieval_vectors"
+                "(kind, ref_id, scope, session_id, model_id, dim,"
+                " content_hash, vector, created_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (kind, ref_id, scope, session_id, model_id, dim,
+                 content_hash, vector, created),
+            )
+            return int(cur.lastrowid)
+
+    def delete_vectors(
+        self,
+        kind: Optional[str] = None,
+        ref_id: Optional[int] = None,
+        model_id: Optional[str] = None,
+    ) -> int:
+        query = "DELETE FROM retrieval_vectors WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (
+            ("kind", kind), ("ref_id", ref_id), ("model_id", model_id),
+        ):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            cur = con.execute(query, params)
+            return int(cur.rowcount)
+
+    def fetch_vector_rows(
+        self,
+        kind: Optional[str] = None,
+        scope: Optional[str] = None,
+        model_id: Optional[str] = None,
+        ref_ids: Optional[list[int]] = None,
+        limit: Optional[int] = None,
+    ) -> list[tuple[str, int, str, str, str, int, str, bytes, float]]:
+        if ref_ids is not None and not ref_ids:
+            return []
+        query = (
+            "SELECT kind, ref_id, scope, session_id, model_id, dim,"
+            " content_hash, vector, created_at FROM retrieval_vectors"
+            " WHERE 1=1"
+        )
+        params: list[Any] = []
+        for column, value in (
+            ("kind", kind), ("scope", scope), ("model_id", model_id),
+        ):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
+        if ref_ids is not None:
+            query += " AND ref_id IN (%s)" % ",".join("?" for _ in ref_ids)
+            params.extend(int(value) for value in ref_ids)
+        query += " ORDER BY vector_id ASC"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as con:
+            return con.execute(query, params).fetchall()
+
+    def count_vectors(
+        self,
+        kind: Optional[str] = None,
+        model_id: Optional[str] = None,
+    ) -> int:
+        query = "SELECT count(*) FROM retrieval_vectors WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (("kind", kind), ("model_id", model_id)):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
+        with self._connect() as con:
+            return int(con.execute(query, params).fetchone()[0])
+
+    def set_index_meta(self, key: str, value: str) -> None:
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT INTO retrieval_index_meta(key, value) VALUES (?, ?)"
+                " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
+
+    def get_index_meta(self, key: str) -> Optional[str]:
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT value FROM retrieval_index_meta WHERE key = ?", (key,)
+            ).fetchone()
+        return str(row[0]) if row is not None else None
+
 
     def fetch_digests(
         self, session_id: str, limit: int = 5

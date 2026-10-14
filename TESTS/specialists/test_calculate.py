@@ -4,7 +4,7 @@ sys.path.insert(0, "C:\\PRIMORA PROJECT")
 from PRIMORA.prime import Prime
 from PRIMORA.prime.providers import Provider
 from PRIMORA.prime.contract import PrimeRequest, PrimeResult, RequestStatus
-from PRIMORA.prime.router import Router, CAPABILITY_MAP
+from PRIMORA.prime.capability import CapabilityRegistry
 from PRIMORA.prime.execution import Execution
 from PRIMORA.specialists import Specialist, CalculateSpecialist
 from typing import Any
@@ -22,7 +22,7 @@ class MockProvider(Provider):
 def test_specialist_interface():
     assert issubclass(CalculateSpecialist, Specialist)
     assert CalculateSpecialist.name == "calculate"
-    assert "calculate" in CAPABILITY_MAP
+    assert CapabilityRegistry().has("calculate")
 
 
 def test_calculate_basic_arithmetic():
@@ -81,14 +81,9 @@ def test_calculate_rejects_syntax_errors():
     assert result.status == RequestStatus.FAILURE
 
 
-def test_router_maps_calculate():
-    router = Router()
-    assert router.route(PrimeRequest(action="calculate", payload={})) == "calculate"
-
-
 def test_execution_dispatches_to_specialist():
     provider = MockProvider()
-    execution = Execution(provider)
+    execution = Execution(provider, CapabilityRegistry())
     result = execution.execute("calculate", {"expression": "6 * 7"})
     assert result.status == RequestStatus.SUCCESS
     assert result.output == {"result": 42}
@@ -97,7 +92,7 @@ def test_execution_dispatches_to_specialist():
 
 def test_execution_falls_back_to_provider():
     provider = MockProvider()
-    execution = Execution(provider)
+    execution = Execution(provider, CapabilityRegistry())
     result = execution.execute("chat", {"messages": []})
     assert result.status == RequestStatus.SUCCESS
     assert result.output == {"via": "provider"}
@@ -130,7 +125,6 @@ if __name__ == "__main__":
     test_calculate_division_by_zero()
     test_calculate_rejects_code()
     test_calculate_rejects_syntax_errors()
-    test_router_maps_calculate()
     test_execution_dispatches_to_specialist()
     test_execution_falls_back_to_provider()
     test_end_to_end_calculate()

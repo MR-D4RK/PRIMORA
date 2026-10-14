@@ -1,0 +1,508 @@
+{
+  "counts": {
+    "train": 967,
+    "validation": 180,
+    "holdout": 120
+  },
+  "total": 1267,
+  "identity": {
+    "unique_ids": 1267,
+    "duplicate_ids": 0,
+    "invalid_categories": [],
+    "split_mismatches": 0,
+    "valid_splits": true
+  },
+  "seed_coverage": {
+    "seeds_approved": 278,
+    "seeds_covered": 277,
+    "missing_seeds": [
+      "C15-R02"
+    ],
+    "anchors_correctly_absent": [
+      "C15-R02"
+    ],
+    "unknown_seed_ids": []
+  },
+  "exact_duplicate_prompts": {
+    "groups": 0,
+    "examples": 0
+  },
+  "duplicate_final_targets": {
+    "groups": 250,
+    "max_repeat": 35
+  },
+  "duplicate_prompt_target_pairs": {
+    "groups": 0
+  },
+  "near_duplicate_prompts": {
+    "threshold": 0.9,
+    "distinct_prompts": 1147,
+    "pairs": 4,
+    "examples": [
+      {
+        "a": "amir pull up the survey results from last year she recalls last year s",
+        "b": "sorry brain s gone amir pull up the survey results from last year she ",
+        "ratio": 0.908
+      },
+      {
+        "a": "amir pull up the survey results from last year she recalls last year s",
+        "b": "sorry to ask again amir pull up the survey results from last year she ",
+        "ratio": 0.908
+      },
+      {
+        "a": "bit exhausted amir before we go any further can you double check wheth",
+        "b": "straight question amir before we go any further can you double check w",
+        "ratio": 0.922
+      },
+      {
+        "a": "no need to dig if not what did we decide about the budget",
+        "b": "no need to dig if not what did we decide about the tuesday slot",
+        "ratio": 0.9
+      }
+    ]
+  },
+  "template_concentration": {
+    "distinct_target_shapes": 229,
+    "largest_shape_share": 0.007,
+    "limit": 0.25,
+    "over_limit": []
+  },
+  "opening_concentration": {
+    "distinct_openings": 248,
+    "most_common": [
+      [
+        "not sure it matter",
+        69
+      ],
+      [
+        "knocked off early ",
+        56
+      ],
+      [
+        "only if you alread",
+        51
+      ],
+      [
+        "sorry brain s gone",
+        49
+      ],
+      [
+        "quick one before i",
+        49
+      ]
+    ]
+  },
+  "contradictions": {
+    "seeds_teaching_multiple_capabilities": 0,
+    "examples": []
+  },
+  "tool_representation": {
+    "tool_turns": 546,
+    "success": 532,
+    "failure": 14,
+    "records_with_tool_turns": 393,
+    "findings": [],
+    "finding_count": 0
+  },
+  "payload_sanity": {
+    "requests_checked": 784,
+    "finding_count": 0,
+    "findings": []
+  },
+  "masking": {
+    "masked_seeds": [
+      "C15-R01",
+      "C15-R02",
+      "C15-R11",
+      "C15-R12",
+      "C15-R13",
+      "C15-R15",
+      "C15-R24"
+    ],
+    "examples_checked": 1147,
+    "problems": [],
+    "problem_count": 0
+  },
+  "system_context": {
+    "distinct_fingerprints": 1,
+    "fingerprint": "bafa84d4e39f18a0a1d693d924bf9776",
+    "distinct_refs": [
+      "aurora.system.v1@bafa84d4e39f18a0"
+    ],
+    "all_present": true
+  },
+  "schema": {
+    "missing_required_fields": 0,
+    "schema_versions": [
+      "aurora.train.v2"
+    ],
+    "generator_versions": [
+      "aurora-brain-v0.1-seedgen-1"
+    ]
+  },
+  "split_discipline": {
+    "seeds_straddling_splits": []
+  },
+  "by_category": {
+    "C1": {
+      "train": 64,
+      "validation": 21,
+      "holdout": 12
+    },
+    "C2": {
+      "train": 90,
+      "validation": 13
+    },
+    "C3": {
+      "train": 83,
+      "validation": 18,
+      "holdout": 13
+    },
+    "C4": {
+      "train": 104,
+      "validation": 9,
+      "holdout": 14
+    },
+    "C5": {
+      "train": 74,
+      "validation": 18,
+      "holdout": 6
+    },
+    "C6": {
+      "train": 58,
+      "validation": 10,
+      "holdout": 10
+    },
+    "C7": {
+      "train": 71,
+      "validation": 8,
+      "holdout": 5
+    },
+    "C8": {
+      "train": 98,
+      "validation": 9,
+      "holdout": 4
+    },
+    "C9": {
+      "train": 75,
+      "validation": 6,
+      "holdout": 4
+    },
+    "C10": {
+      "train": 81,
+      "validation": 15,
+      "holdout": 6
+    },
+    "C11": {
+      "train": 32,
+      "validation": 12,
+      "holdout": 6
+    },
+    "C12": {
+      "train": 44,
+      "validation": 15,
+      "holdout": 7
+    },
+    "C13": {
+      "train": 17,
+      "validation": 4,
+      "holdout": 15
+    },
+    "C14": {
+      "train": 30,
+      "validation": 9,
+      "holdout": 9
+    },
+    "C15": {
+      "train": 46,
+      "validation": 13,
+      "holdout": 9
+    }
+  },
+  "by_seed": {
+    "C1-A01": 3,
+    "C1-A02": 3,
+    "C1-A03": 7,
+    "C1-A04": 3,
+    "C1-A05": 8,
+    "C1-A06": 3,
+    "C1-A07": 3,
+    "C1-A08": 3,
+    "C1-A09": 7,
+    "C1-A10": 3,
+    "C1-A11": 3,
+    "C1-A12": 8,
+    "C1-A13": 7,
+    "C1-A14": 3,
+    "C1-A15": 3,
+    "C1-A16": 8,
+    "C1-A17": 3,
+    "C1-A18": 8,
+    "C1-A19": 8,
+    "C1-A20": 3,
+    "C10-N01": 3,
+    "C10-N02": 8,
+    "C10-N03": 3,
+    "C10-N04": 3,
+    "C10-N05": 2,
+    "C10-N06": 3,
+    "C10-N07": 3,
+    "C10-N08": 3,
+    "C10-N09": 8,
+    "C10-N10": 8,
+    "C10-N11": 8,
+    "C10-N12": 8,
+    "C10-N13": 8,
+    "C10-N14": 7,
+    "C10-N15": 8,
+    "C10-N16": 8,
+    "C10-N17": 8,
+    "C10-N18": 3,
+    "C11-I01": 3,
+    "C11-I02": 3,
+    "C11-I03": 8,
+    "C11-I04": 3,
+    "C11-I05": 3,
+    "C11-I06": 8,
+    "C11-I07": 8,
+    "C11-I08": 3,
+    "C11-I09": 3,
+    "C11-I10": 8,
+    "C12-P01": 7,
+    "C12-P02": 3,
+    "C12-P03": 3,
+    "C12-P04": 3,
+    "C12-P05": 3,
+    "C12-P06": 7,
+    "C12-P07": 3,
+    "C12-P08": 3,
+    "C12-P09": 3,
+    "C12-P10": 7,
+    "C12-P11": 8,
+    "C12-P12": 8,
+    "C12-P13": 7,
+    "C12-P14": 1,
+    "C13-A01": 1,
+    "C13-A02": 3,
+    "C13-A03": 5,
+    "C13-A04": 3,
+    "C13-A05": 3,
+    "C13-A06": 1,
+    "C13-A07": 3,
+    "C13-A08": 3,
+    "C13-A09": 3,
+    "C13-A10": 5,
+    "C13-A11": 3,
+    "C13-A12": 3,
+    "C14-R01": 3,
+    "C14-R02": 3,
+    "C14-R03": 3,
+    "C14-R04": 3,
+    "C14-R05": 5,
+    "C14-R06": 2,
+    "C14-R07": 2,
+    "C14-R08": 3,
+    "C14-R09": 3,
+    "C14-R10": 4,
+    "C14-R11": 3,
+    "C14-R12": 7,
+    "C14-R13": 6,
+    "C14-R14": 1,
+    "C15-R01": 6,
+    "C15-R03": 6,
+    "C15-R04": 3,
+    "C15-R05": 4,
+    "C15-R06": 1,
+    "C15-R07": 6,
+    "C15-R08": 1,
+    "C15-R09": 1,
+    "C15-R10": 3,
+    "C15-R11": 1,
+    "C15-R12": 5,
+    "C15-R13": 2,
+    "C15-R14": 3,
+    "C15-R15": 2,
+    "C15-R16": 1,
+    "C15-R17": 3,
+    "C15-R18": 3,
+    "C15-R19": 1,
+    "C15-R20": 8,
+    "C15-R21": 1,
+    "C15-R22": 3,
+    "C15-R23": 1,
+    "C15-R24": 3,
+    "C2-D01": 2,
+    "C2-D02": 7,
+    "C2-D03": 6,
+    "C2-D04": 7,
+    "C2-D05": 3,
+    "C2-D06": 8,
+    "C2-D07": 6,
+    "C2-D08": 7,
+    "C2-D09": 2,
+    "C2-D10": 8,
+    "C2-D11": 7,
+    "C2-D12": 6,
+    "C2-D13": 8,
+    "C2-D14": 3,
+    "C2-D15": 5,
+    "C2-D16": 7,
+    "C2-D17": 3,
+    "C2-D18": 8,
+    "C3-P01": 3,
+    "C3-P02": 6,
+    "C3-P03": 3,
+    "C3-P04": 3,
+    "C3-P05": 8,
+    "C3-P06": 8,
+    "C3-P07": 8,
+    "C3-P08": 3,
+    "C3-P09": 3,
+    "C3-P10": 7,
+    "C3-P11": 3,
+    "C3-P12": 8,
+    "C3-P13": 6,
+    "C3-P14": 8,
+    "C3-P15": 8,
+    "C3-P16": 8,
+    "C3-P17": 8,
+    "C3-P18": 3,
+    "C3-P19": 3,
+    "C3-P20": 3,
+    "C3-P21": 3,
+    "C3-P22": 1,
+    "C4-M01": 7,
+    "C4-M02": 2,
+    "C4-M03": 7,
+    "C4-M04": 3,
+    "C4-M05": 2,
+    "C4-M06": 5,
+    "C4-M07": 3,
+    "C4-M08": 7,
+    "C4-M09": 3,
+    "C4-M10": 8,
+    "C4-M11": 8,
+    "C4-M12": 2,
+    "C4-M13": 3,
+    "C4-M14": 8,
+    "C4-M15": 1,
+    "C4-M16": 2,
+    "C4-M17": 7,
+    "C4-M18": 2,
+    "C4-M19": 3,
+    "C4-M20": 7,
+    "C4-M21": 2,
+    "C4-M22": 5,
+    "C4-M23": 7,
+    "C4-M24": 2,
+    "C4-M26": 7,
+    "C4-M27": 1,
+    "C4-M28": 1,
+    "C4-M29": 6,
+    "C4-M30": 4,
+    "C4-M31": 2,
+    "C5-A01": 2,
+    "C5-A02": 3,
+    "C5-A03": 6,
+    "C5-A04": 2,
+    "C5-A05": 3,
+    "C5-A06": 3,
+    "C5-A07": 5,
+    "C5-A08": 5,
+    "C5-A09": 8,
+    "C5-A10": 8,
+    "C5-A11": 8,
+    "C5-A12": 3,
+    "C5-A13": 5,
+    "C5-A14": 6,
+    "C5-A15": 8,
+    "C5-A16": 2,
+    "C5-A17": 3,
+    "C5-A18": 8,
+    "C5-A19": 7,
+    "C5-A20": 3,
+    "C6-X01": 3,
+    "C6-X02": 7,
+    "C6-X03": 3,
+    "C6-X04": 2,
+    "C6-X05": 7,
+    "C6-X06": 7,
+    "C6-X07": 4,
+    "C6-X08": 2,
+    "C6-X09": 2,
+    "C6-X10": 6,
+    "C6-X11": 8,
+    "C6-X12": 2,
+    "C6-X13": 6,
+    "C6-X14": 2,
+    "C6-X15": 2,
+    "C6-X16": 5,
+    "C6-X17": 8,
+    "C6-X18": 2,
+    "C7-M01": 8,
+    "C7-M02": 7,
+    "C7-M03": 8,
+    "C7-M04": 2,
+    "C7-M05": 8,
+    "C7-M06": 7,
+    "C7-M07": 2,
+    "C7-M08": 8,
+    "C7-M09": 2,
+    "C7-M10": 2,
+    "C7-M11": 6,
+    "C7-M12": 1,
+    "C7-M13": 7,
+    "C7-M14": 2,
+    "C7-M15": 8,
+    "C7-M16": 2,
+    "C7-M17": 2,
+    "C7-M18": 2,
+    "C8-G01": 7,
+    "C8-G02": 2,
+    "C8-G03": 8,
+    "C8-G04": 2,
+    "C8-G05": 8,
+    "C8-G06": 5,
+    "C8-G07": 7,
+    "C8-G08": 2,
+    "C8-G09": 2,
+    "C8-G10": 3,
+    "C8-G11": 2,
+    "C8-G12": 8,
+    "C8-G13": 1,
+    "C8-G14": 3,
+    "C8-G15": 2,
+    "C8-G16": 7,
+    "C8-G17": 3,
+    "C8-G18": 6,
+    "C8-G19": 6,
+    "C8-G20": 8,
+    "C8-G21": 2,
+    "C8-G22": 7,
+    "C8-G23": 8,
+    "C8-G24": 2,
+    "C9-U01": 8,
+    "C9-U02": 8,
+    "C9-U03": 8,
+    "C9-U04": 2,
+    "C9-U05": 2,
+    "C9-U06": 8,
+    "C9-U07": 2,
+    "C9-U08": 8,
+    "C9-U09": 8,
+    "C9-U10": 6,
+    "C9-U11": 7,
+    "C9-U12": 6,
+    "C9-U13": 2,
+    "C9-U14": 7,
+    "C9-U15": 2,
+    "C9-U16": 1
+  },
+  "targets": {
+    "train": 1400,
+    "validation": 180,
+    "holdout": 120,
+    "train_max": 1600,
+    "seed_budget": 278
+  }
+}

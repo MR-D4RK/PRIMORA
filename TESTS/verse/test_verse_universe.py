@@ -62,12 +62,25 @@ def test_universe_component_files_exist():
 def test_universe_loads_with_layers():
     engine, universe = _load_universe()
     try:
-        for child in ("starfield", "ribbons", "strands",
-                      "presenceItem", "auraLight"):
+        for child in ("starfield", "ribbons",
+                      "auraLight"):
             assert universe.findChild(object, child) is not None, child
         assert universe.property("active") is True
         energy = universe.property("energy")
         assert 0.4 <= energy <= 0.9
+    finally:
+        engine.deleteLater()
+        _pump_until(lambda: True, 0.5)
+
+
+def test_legacy_prototype_layers_removed():
+    # Old M3 scaffolding (thin strand arcs, central presence orb) must not
+    # be instantiated: the veil is the only aurora visual.
+    engine, universe = _load_universe()
+    try:
+        assert universe.findChild(object, "strands") is None
+        assert universe.findChild(object, "presenceItem") is None
+        assert universe.findChild(object, "presence") is None
     finally:
         engine.deleteLater()
         _pump_until(lambda: True, 0.5)

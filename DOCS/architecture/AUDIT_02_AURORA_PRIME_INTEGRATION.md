@@ -1,5 +1,13 @@
 # PRIMORA Architecture Audit — Aurora ↔ Prime Integration
 
+> **HISTORICAL — 2026-09-16. Superseded.** Kept as a record of the original
+> integration trace. Two parts of it are obsolete as of Stage 2E (Oct 2026):
+> the `Router.route` pass-through was removed (Prime.handle is the single
+> validation path; Orchestrator dispatches straight to Execution), and the
+> capability system described here has since grown to seven registered
+> capabilities with specialists. For current behavior see
+> `DOCS/01_architecture/` and `DOCS/02_audits/PRIMORA_FULL_AUDIT.md`.
+
 **Date**: 2026-09-16  
 **Scope**: End-to-end trace `Aurora → Prime → Orchestrator → Router → Execution → Provider → result → Aurora`
 

@@ -1,0 +1,155 @@
+{
+  "version": 1,
+  "name": "primora-retrieval-benchmark-v1",
+  "description": "Controlled gold-set corpus for the CURRENT lexical retrieval system. Ground truth is declared here by corpus key; it is never inferred from the system's own ranking.",
+  "scenes": {
+    "household": "Amir's personal life: car, apartment, errands, purchases.",
+    "work": "A separate conversation about the company: budget, CFO, office."
+  },
+  "sessions": {
+    "personal": [
+      {"key": "porsche", "role": "user", "text": "I prefer the blue Porsche."},
+      {"key": "reno", "role": "user", "text": "We decided to postpone the apartment renovation."},
+      {"key": "brakes", "role": "user", "text": "The mechanic replaced the brake pads in March."},
+      {"key": "berlin", "role": "user", "text": "The company moved its office to Berlin."},
+      {"key": "fox", "role": "user", "text": "We decided the emblem is a stylised fox."},
+      {"key": "car_design", "role": "user", "text": "The car design is a matte charcoal three-door."},
+      {"key": "ferrari", "role": "user", "text": "The Ferrari F50 has a naturally aspirated V12 engine."},
+      {"key": "kyoto", "role": "user", "text": "We travelled to Kyoto last spring."},
+      {"key": "rent", "role": "user", "text": "The apartment rent is 1200 euros per month."},
+      {"key": "daily", "role": "user", "text": "The blue hatchback in the garage is what I drive to work."},
+      {"key": "grocery", "role": "user", "text": "Milk, eggs, and coffee are on the shopping list."},
+      {"key": "gym", "role": "user", "text": "I go running on Tuesday and Thursday mornings."},
+      {"key": "meera", "role": "user", "text": "Meera's laptop has a cracked hinge."},
+      {"key": "wifi", "role": "user", "text": "The wifi password is TUXEDO-77."},
+      {"key": "vault", "role": "user", "text": "The vault code is BLUE-FALCON-7."},
+      {"key": "breaker", "role": "user", "text": "Don't rekey the north breaker without the landlord."},
+      {"key": "lunch", "role": "user", "text": "unrelated small talk about lunch"},
+      {"key": "fill_1", "role": "user", "text": "Small talk about the weather this morning."},
+      {"key": "fill_2", "role": "user", "text": "We had coffee near the station after work."},
+      {"key": "fill_3", "role": "user", "text": "The neighbour's dog barks at the postman."},
+      {"key": "fill_4", "role": "user", "text": "I still need to call the dentist eventually."},
+      {"key": "fill_5", "role": "user", "text": "Traffic was bad on the ring road again."},
+      {"key": "fill_6", "role": "user", "text": "The bookshelf is finally full of paperbacks."},
+      {"key": "fill_7", "role": "user", "text": "We talked about holidays in the south."},
+      {"key": "fill_8", "role": "user", "text": "The washing machine makes a clicking sound."},
+      {"key": "fill_9", "role": "user", "text": "Lunch in the office canteen was overpriced."},
+      {"key": "fill_10", "role": "user", "text": "My bicycle chain needs oiling."},
+      {"key": "fill_11", "role": "user", "text": "The landlord replied about the deposit."},
+      {"key": "fill_12", "role": "user", "text": "We are thinking about a trip in spring."},
+      {"key": "fill_13", "role": "user", "text": "The printer in the hallway is jammed."},
+      {"key": "fill_14", "role": "user", "text": "I bought a new kettle yesterday."}
+    ],
+    "work": [
+      {"key": "w_budget", "role": "user", "text": "The quarterly budget was cut by twelve percent."},
+      {"key": "w_cfo", "role": "user", "text": "Our CFO is called Marta."},
+      {"key": "w_desks", "role": "user", "text": "The Berlin office has forty desks."},
+      {"key": "w_filler", "role": "user", "text": "The sprint demo went better than expected."}
+    ]
+  },
+  "states": [
+    {
+      "key": "reno_old_state", "session": "personal", "scope": "personal",
+      "concept": "apartment renovation decision", "value": "postpone it",
+      "status": "superseded", "memory_type": "DECISION",
+      "valid_from": 100, "valid_until": 200, "timestamp": 100,
+      "source_keys": ["reno"]
+    },
+    {
+      "key": "reno_new_state", "session": "personal", "scope": "personal",
+      "concept": "apartment renovation decision", "value": "cancel it",
+      "status": "current", "memory_type": "DECISION",
+      "valid_from": 200, "valid_until": null, "timestamp": 200,
+      "source_keys": ["reno"]
+    },
+    {
+      "key": "fox_old_state", "session": "personal", "scope": "personal",
+      "concept": "emblem decision", "value": "a stylised fox",
+      "status": "superseded", "memory_type": "DECISION",
+      "valid_from": 100, "valid_until": 200, "timestamp": 100,
+      "source_keys": ["fox"]
+    },
+    {
+      "key": "fox_new_state", "session": "personal", "scope": "personal",
+      "concept": "emblem decision", "value": "a stylised monogram",
+      "status": "current", "memory_type": "DECISION",
+      "valid_from": 200, "valid_until": null, "timestamp": 200,
+      "source_keys": ["fox"]
+    }
+  ],
+  "entities": [
+    {"key": "brake_assembly", "display_name": "Brake Assembly", "entity_type": "COMPONENT", "source_keys": ["brakes"]},
+    {"key": "porsche_maint", "display_name": "Porsche Maintenance", "entity_type": "PROJECT", "source_keys": ["brakes"]},
+    {"key": "emblem_redesign", "display_name": "Emblem Redesign", "entity_type": "PROJECT", "source_keys": ["fox"]},
+    {"key": "berlin_move", "display_name": "Berlin Office Move", "entity_type": "PROJECT", "source_keys": ["berlin"]},
+    {"key": "reno_project", "display_name": "Apartment Renovation", "entity_type": "PROJECT", "source_keys": ["reno"]}
+  ],
+  "aliases": [
+    {"entity_key": "berlin_move", "alias_text": "Office Move", "source_keys": ["berlin"]}
+  ],
+  "relationships": [
+    {"type": "part_of", "subject": "brake_assembly", "object": "porsche_maint", "source_keys": ["brakes"]},
+    {"type": "part_of", "subject": "emblem_redesign", "object": "porsche_maint", "source_keys": ["fox"]},
+    {"type": "concerns", "subject_state": "reno_new_state", "object": "reno_project", "source_keys": ["reno"]},
+    {"type": "concerns", "subject_state": "fox_new_state", "object": "emblem_redesign", "source_keys": ["fox"]}
+  ],
+  "distractor_keys": ["lunch", "fill_1", "fill_2", "fill_3", "fill_4", "fill_5", "fill_6", "fill_7", "fill_8", "fill_9", "fill_10", "fill_11", "fill_12", "fill_13", "fill_14"],
+  "queries": [
+    {"id": "A01", "category": "exact", "match": "exact", "session": "personal", "text": "What color Porsche do I prefer?", "gold": ["porsche"], "note": "shares decisive content words with the memory"},
+    {"id": "A02", "category": "exact", "match": "exact", "session": "personal", "text": "What did we decide about the apartment renovation?", "gold": ["reno"]},
+    {"id": "A03", "category": "exact", "match": "exact", "session": "personal", "text": "What did the mechanic replace in March?", "gold": ["brakes"]},
+    {"id": "A04", "category": "exact", "match": "exact", "session": "personal", "text": "Where did the company move its office?", "gold": ["berlin"]},
+    {"id": "A05", "category": "exact", "match": "exact", "session": "personal", "text": "What did we decide the emblem is?", "gold": ["fox"]},
+    {"id": "A06", "category": "exact", "match": "exact", "session": "personal", "text": "What is the monthly rent of the apartment?", "gold": ["rent"]},
+
+    {"id": "B01", "category": "paraphrase", "match": "paraphrase", "session": "personal", "text": "Which shade of Porsche do I like?", "gold": ["porsche"], "note": "blue->shade, prefer->like"},
+    {"id": "B02", "category": "paraphrase", "match": "paraphrase", "session": "personal", "text": "Why did we defer the apartment refurbishment?", "gold": ["reno"], "note": "postpone->defer, renovation->refurbishment"},
+    {"id": "B03", "category": "paraphrase", "match": "paraphrase", "session": "personal", "text": "What servicing did the car get in spring?", "gold": ["brakes"], "note": "March->spring, mechanic/replaced->servicing"},
+    {"id": "B04", "category": "paraphrase", "match": "paraphrase", "session": "personal", "text": "Where is the firm's headquarters now?", "gold": ["berlin"], "note": "company/moved its office->firm/headquarters"},
+    {"id": "B05", "category": "paraphrase", "match": "paraphrase", "session": "personal", "text": "What badge did we choose for the car?", "gold": ["fox"], "note": "emblem->badge, decided->choose"},
+    {"id": "B06", "category": "paraphrase", "match": "paraphrase", "session": "personal", "text": "How much is the flat's rent each month?", "gold": ["rent"], "note": "apartment->flat"},
+
+    {"id": "C01", "category": "indirect", "match": "indirect", "session": "personal", "text": "which one do i use every morning", "gold": ["daily"], "note": "no content word shared with the memory"},
+    {"id": "C02", "category": "indirect", "match": "indirect", "session": "personal", "text": "what did we settle on", "gold": ["fox"]},
+    {"id": "C03", "category": "indirect", "match": "indirect", "session": "personal", "text": "where did they end up", "gold": ["berlin"]},
+    {"id": "C04", "category": "indirect", "match": "indirect", "session": "personal", "text": "which one is my favourite", "gold": ["porsche"]},
+    {"id": "C05", "category": "indirect", "match": "indirect", "session": "personal", "text": "where did we go last year", "gold": ["kyoto"]},
+
+    {"id": "D01", "category": "entity", "match": "entity", "session": "personal", "text": "What do I currently know about the Berlin Office Move?", "gold": ["berlin"], "note": "resolvable M5 entity; current system has no entity channel"},
+    {"id": "D02", "category": "entity", "match": "entity", "session": "personal", "text": "What do I currently know about the Apartment Renovation?", "gold": ["reno"]},
+    {"id": "D03", "category": "entity", "match": "entity", "session": "personal", "text": "Tell me about the Emblem Redesign.", "gold": ["fox"]},
+    {"id": "D04", "category": "entity", "match": "entity", "session": "personal", "text": "What do we know about the Office Move?", "gold": ["berlin"], "note": "confirmed alias of Berlin Office Move"},
+
+    {"id": "E01", "category": "relationship", "match": "relationship", "session": "personal", "text": "What is the Brake Assembly part of?", "gold": ["brakes"], "note": "answerable only via a stored part_of edge"},
+    {"id": "E02", "category": "relationship", "match": "relationship", "session": "personal", "text": "Which project contains the Brake Assembly?", "gold": ["brakes"], "note": "requires the derived contains inverse"},
+    {"id": "E03", "category": "relationship", "match": "relationship", "session": "personal", "text": "What belongs to the Porsche Maintenance project?", "gold": ["brakes"]},
+    {"id": "E04", "category": "relationship", "match": "relationship", "session": "personal", "text": "What concerns the Emblem Redesign?", "gold": ["fox"]},
+
+    {"id": "F01", "category": "temporal", "match": "temporal", "session": "personal", "text": "What did we originally decide about the apartment?", "gold": ["reno"], "note": "history marker; evidence is a superseded state"},
+    {"id": "F02", "category": "temporal", "match": "temporal", "session": "personal", "text": "What was the old plan for the apartment renovation?", "gold": ["reno"]},
+    {"id": "F03", "category": "temporal", "match": "temporal", "session": "personal", "text": "What changed on the car in March?", "gold": ["brakes"]},
+    {"id": "F04", "category": "temporal", "match": "temporal", "session": "personal", "text": "What was the emblem before the monogram?", "gold": ["fox"]},
+
+    {"id": "G01", "category": "no_match", "match": "none", "session": "personal", "text": "What is the airspeed velocity of an unladen swallow?", "gold": [], "related_keys": [], "note": "no corpus message shares a distinctive term"},
+    {"id": "G02", "category": "no_match", "match": "none", "session": "personal", "text": "Recommend a good recipe for baklava.", "gold": [], "related_keys": []},
+    {"id": "G03", "category": "no_match", "match": "none", "session": "personal", "text": "Who won the football world cup in 1994?", "gold": [], "related_keys": []},
+    {"id": "G04", "category": "no_match", "match": "none", "session": "personal", "text": "How do I change a bicycle tyre?", "gold": [], "related_keys": ["fill_10"], "note": "fill_10 mentions a bicycle but does not answer how to change a tyre; declared so the adjacency is explicit, not a silent no-match"},
+    {"id": "G05", "category": "exact", "match": "exact", "session": "personal", "text": "What is my dentist called?", "gold": ["fill_4"], "related_keys": [], "note": "CORRECTED in M6: this was labelled no_match, but the corpus does contain a dentist memory (fill_4). fill_4 does not actually name the dentist, so this is a deliberately weak-answer case: a good system must surface the only dentist-related memory rather than claim there is nothing"},
+    {"id": "G06", "category": "no_match", "match": "none", "session": "personal", "text": "Tell me a joke about penguins.", "gold": [], "related_keys": []},
+
+    {"id": "H01", "category": "cross_session", "match": "exact", "session": "personal", "text": "What happened to the quarterly budget?", "gold": ["w_budget"]},
+    {"id": "H02", "category": "cross_session", "match": "exact", "session": "personal", "text": "Who is our CFO?", "gold": ["w_cfo"]},
+    {"id": "H03", "category": "cross_session", "match": "exact", "session": "personal", "text": "How many desks does the Berlin office have?", "gold": ["w_desks"]},
+    {"id": "H04", "category": "cross_session", "match": "exact", "session": "personal", "text": "In our other conversations, who is our CFO?", "gold": ["w_cfo"], "note": "explicit cross-session phrasing"},
+
+    {"id": "I01", "category": "false_positive_control", "match": "exact", "session": "personal", "text": "what did we decide about the car design?", "gold": ["car_design"], "expect_distractor": "lunch", "note": "controlled equivalent of the M6 audit false positive: the 'lunch' distractor matches the near-stopword 'about' and is newer than the gold"},
+    {"id": "I02", "category": "false_positive_control", "match": "exact", "session": "personal", "text": "what did we agree about the car?", "gold": ["car_design"], "expect_distractor": "lunch"},
+    {"id": "I03", "category": "false_positive_control", "match": "none", "session": "personal", "text": "what is completely unrelated to this project?", "gold": [], "expect_distractor": "lunch", "related_keys": ["lunch"], "note": "the lunch distractor shares the near-stopword 'unrelated'; declared so the adjacency is explicit"},
+
+    {"id": "J01", "category": "punctuation", "match": "exact", "session": "personal", "text": "what's the wifi password (TUXEDO-77)?", "gold": ["wifi"]},
+    {"id": "J02", "category": "punctuation", "match": "exact", "session": "personal", "text": "don't ask me about the north breaker!", "gold": ["breaker"]},
+    {"id": "J03", "category": "punctuation", "match": "exact", "session": "personal", "text": "whose laptop has the cracked hinge?", "gold": ["meera"]},
+    {"id": "J04", "category": "punctuation", "match": "exact", "session": "personal", "text": "the vault code -- BLUE-FALCON-7 -- what is it??", "gold": ["vault"]},
+    {"id": "J05", "category": "punctuation", "match": "exact", "session": "personal", "text": "don't forget Meera's laptop hinge", "gold": ["meera"]}
+  ]
+}

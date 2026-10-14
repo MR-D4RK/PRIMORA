@@ -1,0 +1,81 @@
+{
+  "label": "pre-v0.4 behavioral baseline",
+  "rule": "Pre-v0.4 behavioral baseline: untrained Aurora scored on the 180-record validation split with the dataset's own static gates (validate_dataset_v4.score_reply). No training, no config/model changes, holdout untouched.",
+  "records": 180,
+  "overall": {
+    "pass": 68,
+    "fail": 112,
+    "pass_rate_percent": 37.8
+  },
+  "per_category": {
+    "A": {
+      "n": 24,
+      "pass": 11,
+      "pass_rate_percent": 45.8
+    },
+    "B": {
+      "n": 36,
+      "pass": 18,
+      "pass_rate_percent": 50.0
+    },
+    "C": {
+      "n": 24,
+      "pass": 8,
+      "pass_rate_percent": 33.3
+    },
+    "D": {
+      "n": 24,
+      "pass": 3,
+      "pass_rate_percent": 12.5
+    },
+    "E": {
+      "n": 24,
+      "pass": 11,
+      "pass_rate_percent": 45.8
+    },
+    "F": {
+      "n": 24,
+      "pass": 10,
+      "pass_rate_percent": 41.7
+    },
+    "G": {
+      "n": 24,
+      "pass": 7,
+      "pass_rate_percent": 29.2
+    }
+  },
+  "per_difficulty": {
+    "1": {
+      "n": 54,
+      "pass": 30,
+      "pass_rate_percent": 55.6
+    },
+    "2": {
+      "n": 36,
+      "pass": 12,
+      "pass_rate_percent": 33.3
+    },
+    "3": {
+      "n": 48,
+      "pass": 15,
+      "pass_rate_percent": 31.2
+    },
+    "4": {
+      "n": 42,
+      "pass": 11,
+      "pass_rate_percent": 26.2
+    }
+  },
+  "failed_checks": {
+    "must": 144,
+    "unsourced": 12,
+    "must_not": 11,
+    "idk": 7,
+    "certainty": 1,
+    "repetition": 1
+  },
+  "history_fallbacks": 0,
+  "errors": 0,
+  "elapsed_seconds": 643.8,
+  "results_jsonl": "C:\\PRIMORA PROJECT\\TESTS\\training\\data\\v4\\real_model_results.jsonl"
+}

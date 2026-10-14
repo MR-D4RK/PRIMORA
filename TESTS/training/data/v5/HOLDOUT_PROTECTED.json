@@ -1,0 +1,10 @@
+{
+  "split": "holdout",
+  "count": 180,
+  "status": "protected - evaluation only",
+  "rule": "Not used during generation, tuning or wording decisions. Read only when the holdout is actually being scored.",
+  "generator_version": "aurora-brain-v0.5-merge-1",
+  "schema_version": "aurora.train.v2",
+  "system_ref": "aurora.system.v1@d7717dbbf79ce888",
+  "note": "Holdout content is byte-identical to v4's holdout apart from the refreshed system metadata fields."
+}
