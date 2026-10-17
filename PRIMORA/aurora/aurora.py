@@ -22,6 +22,7 @@ from PRIMORA.aurora.configuration import (
 )
 from PRIMORA.aurora.identity import IDENTITY_HEADER, build_identity_instruction
 from PRIMORA.aurora.loop import CognitiveLoop, CapabilityExecutor
+from PRIMORA.aurora import request_shape
 
 
 _PRIME_REQUEST_PATTERN = re.compile(r"<prime_request>(.*?)</prime_request>", re.DOTALL)
@@ -139,37 +140,50 @@ def extract_prime_request(text: str) -> Optional[PrimeRequest]:
     if not isinstance(text, str):
         return None
     matches = _PRIME_REQUEST_PATTERN.findall(text)
-    if len(matches) != 1:
+    if matches:
+        # A wrapper block is the documented format. Exactly one of them,
+        # and only one: several blocks are ambiguous about which request
+        # was being made, so none runs.
+        if len(matches) != 1:
+            return None
+        body = matches[0].strip()
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, ValueError):
+            # A local model most often damages the JSON it was already
+            # building rather than inventing a different one, so repairing
+            # syntax rescues the request. Anything still unparseable after
+            # repair was never a request, and the loop reports it as such.
+            repaired = _repair_json_object(matches[0])
+            if repaired is None:
+                return None
+            try:
+                data = json.loads(repaired, strict=False)
+            except (json.JSONDecodeError, ValueError):
+                return None
+        return request_shape.request_from_data(data)
+
+    # No wrapper. A model trained for tool calling emits the request
+    # object itself, and that is a request it really made: the whole reply
+    # is the object the wrapper would have contained. It is not the raw
+    # JSON string being echoed back, and it is not recognised because it
+    # happens to be JSON - it is recognised because it is one whole
+    # object with a valid action and payload, so it runs through the same
+    # authorized path as a wrapped request and Prime still authorizes
+    # every action and payload it carries.
+    #
+    # Strictly parsed: no repair here, because a bare object that does not
+    # parse is evidence of nothing more than braces, and the loop's safe
+    # recovery handles it. Only a whole-reply object qualifies, so JSON
+    # quoted inside an answer never executes.
+    bare = request_shape.bare_request_text(text)
+    if bare is None:
         return None
     try:
-        data = json.loads(matches[0].strip())
+        data = json.loads(bare, strict=False)
     except (json.JSONDecodeError, ValueError):
-        # A local model most often damages the JSON it was already
-        # building rather than inventing a different one, so repairing
-        # syntax rescues the request. Anything still unparseable after
-        # repair was never a request, and the loop reports it as such.
-        repaired = _repair_json_object(matches[0])
-        if repaired is None:
-            return None
-        try:
-            data = json.loads(repaired, strict=False)
-        except (json.JSONDecodeError, ValueError):
-            return None
-    if not isinstance(data, dict):
         return None
-    action = data.get("action")
-    if not isinstance(action, str) or not action:
-        return None
-    payload = data.get("payload")
-    if not isinstance(payload, dict):
-        return None
-    context = data.get("context")
-    if context is not None and not isinstance(context, dict):
-        return None
-    metadata = data.get("metadata")
-    if metadata is not None and not isinstance(metadata, dict):
-        return None
-    return PrimeRequest(action=action, payload=payload, context=context, metadata=metadata)
+    return request_shape.request_from_data(data)
 
 
 class Aurora:

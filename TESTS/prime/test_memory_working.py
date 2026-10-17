@@ -62,8 +62,8 @@ def test_active_shows_current_only():
     assert isinstance(view, ActiveMemory)
     by_concept = {(i.scope, i.concept): i for i in view.items
                   if i.kind == "state"}
-    assert by_concept[("wm-a", "favorite color")].value == "green"
-    assert by_concept[("wm-a", "decision for visual")].value == "visual"
+    assert by_concept[("global", "favorite color")].value == "green"
+    assert by_concept[("global", "decision for visual")].value == "visual"
     assert all(i.status == "current" for i in view.items
                if i.kind == "state")
     assert all(i.authority == "user" for i in view.items
@@ -214,14 +214,17 @@ def test_select_active_into_working():
     for item in picked[:2]:
         wm.adopt_active(item)
     texts = " ".join(m["content"] for m in wm.to_messages())
-    assert "favorite color = green" in texts
+    assert "The user's favorite color is green." in texts
 
 
 def test_select_active_empty_query():
     mgr = ContextManager(db_path=_db())
     _seed(mgr)
     assert mgr.select_active_memory("wm-a", "") == []
-    assert mgr.select_active_memory("nobody", "color") == []
+    # A session with no facts of its own and no stored personal facts
+    # anywhere selects nothing.
+    fresh = ContextManager(db_path=_db())
+    assert fresh.select_active_memory("nobody", "color") == []
 
 
 # Raw -> Working ------------------------------------------------------------------------
@@ -289,7 +292,8 @@ def test_build_with_working_single_view():
                     budget=_budget(), working=wm)
     texts = [m["content"] for m in res.view.messages]
     assert any("working task" in c for c in texts)
-    assert any("preference for blue = blue" in c for c in texts)
+    assert any("The user's preference for blue is blue." in c
+               for c in texts)
     assert texts[-1] == "What is my color?"
     # working content frames the request exactly once
     assert sum("working task" in c for c in texts) == 1

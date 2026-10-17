@@ -14,6 +14,8 @@ import time
 from dataclasses import dataclass, replace as dataclass_replace
 from typing import Any, Optional
 
+from . import slots as slots_mod
+
 # Memory types for deterministic M1 formation.
 FACT = "FACT"
 PREFERENCE = "PREFERENCE"
@@ -179,6 +181,12 @@ class StateCandidate:
     # slot may adopt the single tracked fact of that type; a re-assertion
     # ("I prefer light mode") may not — type match alone is not a target.
     explicit_slot: bool = False
+    # Non-empty when the slot registry routed this candidate to a named
+    # personal-fact slot (favorite color, likes, instruction, ...). The
+    # concept is already resolved, so apply must not substring-match it
+    # onto other tracked concepts, and the scope comes from the registry
+    # (personal facts are global).
+    slot: str = ""
 
 
 def normalize_concept(raw: str) -> str:
@@ -239,12 +247,15 @@ def _correction_target(store: Any, scope: str, mtype: str,
 def _is_user_named(concept: str) -> bool:
     """True when the concept words were the user's own topic ("favorite
     color"), not a synthesised type slot ("preference",
-    "preference for pizza")."""
+    "preference for pizza") or a registry-keyed slot concept
+    ("likes for pizza", "instruction for be concise")."""
     if concept in _TYPE_WORDS:
         return False
     for word in _TYPE_WORDS:
         if concept.startswith(word + " for "):
             return False
+    if " for " in concept and slots_mod.is_slot_concept(concept):
+        return False
     return True
 
 
@@ -263,6 +274,11 @@ def _parse_establishment(text: str) -> Optional[tuple[str, str]]:
     concept = normalize_concept(match.group(1))
     value = normalize_value(match.group(2))
     if not concept or not value or len(concept.split()) > 6:
+        return None
+    if concept == "name":
+        # The generic establisher no longer produces a bare "name"
+        # concept: "my name is X" routes through the first-name slot,
+        # and nothing may collide with it.
         return None
     return concept, value
 
@@ -411,6 +427,26 @@ def _extract_extended(work: str, scope: str) -> list[StateCandidate]:
     return []
 
 
+def _extract_slots(text: str, include_notes: bool = False
+                   ) -> list[StateCandidate]:
+    """Route one statement through the slot registry, if it names a slot.
+
+    Slot-routed candidates always carry the registry's scope: personal
+    facts (names, favorites, likes, rules, ...) are global, so they are
+    visible from every session. Revocations arrive with an empty concept;
+    apply resolves them against the protected rule entries.
+    """
+    routed = slots_mod.route_statement(text, include_fallback=include_notes)
+    out: list[StateCandidate] = []
+    for item in routed:
+        out.append(StateCandidate(
+            concept=item["concept"], value=item["value"],
+            kind=item["kind"], scope=item["scope"], mtype=item["mtype"],
+            slot=item["slot"],
+        ))
+    return out
+
+
 def extract_candidates(text: str, role: str) -> list[StateCandidate]:
     """Extract state candidates from user-authored text only."""
     if role != "user" or not isinstance(text, str):
@@ -448,7 +484,12 @@ def extract_candidates(text: str, role: str) -> list[StateCandidate]:
             if not head:
                 return []
 
-    cands = _extract_legacy(head, scope)
+    # Slot phrasings first: a statement that names a personal-fact slot
+    # ("my first name is X", "I love pizza", "always Y") lands there
+    # instead of the generic legacy patterns.
+    cands = _extract_slots(head)
+    if not cands:
+        cands = _extract_legacy(head, scope)
     if not cands:
         cands = _extract_extended(head, scope)
     if not cands and corrected:
@@ -457,13 +498,21 @@ def extract_candidates(text: str, role: str) -> list[StateCandidate]:
         val = normalize_value(head)
         if val and len(val.split()) <= 12:
             cands = [StateCandidate("", val, "correct", scope)]
+    if not cands and not corrected:
+        # Meaningful personal statements that fit no slot and no legacy
+        # pattern ("I'm allergic to penicillin") become capped, deduped
+        # notes instead of being dropped.
+        cands = _extract_slots(head, include_notes=True)
     if corrected:
         # An explicit correction prefix marks a re-asserted statement as a
         # correction of the tracked fact, so "Actually, I prefer green."
         # updates the single tracked concept of that type instead of
-        # establishing an additional one.
+        # establishing an additional one. A re-asserted protected rule is
+        # exempt: an ordinary statement may never re-target a rule.
         cands = [
-            dataclass_replace(c, kind="correct") if c.kind == "establish"
+            dataclass_replace(c, kind="correct")
+            if (c.kind == "establish"
+                and not slots_mod.is_protected_concept(c.concept))
             else c
             for c in cands
         ]
@@ -476,7 +525,9 @@ def extract_candidates(text: str, role: str) -> list[StateCandidate]:
         match = _HEDGE_PREFIX_RE.match(head)
         if match and match.group(1).strip():
             stripped_head = match.group(1).strip()
-            inner = _extract_legacy(stripped_head, scope)
+            inner = _extract_slots(stripped_head, include_notes=True)
+            if not inner:
+                inner = _extract_legacy(stripped_head, scope)
             if not inner:
                 inner = _extract_extended(stripped_head, scope)
             if inner:
@@ -747,9 +798,33 @@ def _apply_confirmed(store: Any, session_id: str, scope: str,
         if resolve and cand.mtype != RATIONALE and not concept.startswith(
                 "rationale for "):
             concept = resolve_concept(known, concept)
+        if (cand.kind in ("correct", "invalidate")
+                and slots_mod.is_protected_concept(concept)
+                and getattr(cand, "slot", "") != "rules revoke"):
+            # Ordinary corrections never retire a standing rule; only an
+            # explicit revocation ("stop doing X", "forget that rule")
+            # may. Hold the statement visible instead of overwriting.
+            diagnostics.append(f"rule_protected: {concept}")
+            diagnostics.extend(_record_pending(
+                store, session_id, scope, message_id,
+                dataclass_replace(cand, concept=concept,
+                                  mtype=mtype or UNCERTAIN, confidence=0.3),
+                reason="protected rule; only an explicit revocation"
+                       " may retire it"))
+            return diagnostics
         currents = store.fetch_states(
             scope=scope, concept=concept, status="current"
         )
+        if not currents and scope != "global":
+            # A correction may name a fact that lives in the global scope
+            # ("Actually, green." onto a global favorite color); adopt the
+            # fact's own scope so the successor supersedes in place
+            # instead of forking a session duplicate.
+            in_global = store.fetch_states(
+                scope="global", concept=concept, status="current")
+            if in_global:
+                scope = "global"
+                currents = in_global
     except Exception as e:
         return [f"state_failed: state read failed: {e}"]
     if cand.kind == "invalidate":
@@ -871,6 +946,11 @@ def confirm_pending(store: Any, session_id: str,
         authority=row.authority or "user",
     )
     concept = row.proposed_concept
+    if slots_mod.is_slot_concept(concept):
+        # Slot-routed personal facts are global wherever they are
+        # confirmed from: a learned "favorite movie" candidate and the
+        # user's own "my favorite movie is X" are one memory, not two.
+        scope = "global"
     mtype = row.proposed_type
     slot_resolved = False
     if concept in _TYPE_WORDS:
@@ -881,6 +961,10 @@ def confirm_pending(store: Any, session_id: str,
         mtype = _TYPE_BY_WORD.get(concept, mtype)
         concept, mtype, _hold = _apply_type_word_concept(
             store, scope, cand, concept, mtype, allow_pending=False)
+        slot_resolved = True
+    elif slots_mod.is_slot_concept(concept):
+        # A held slot statement ("I think my favorite color is blue")
+        # confirms onto its own slot, never substring-matched elsewhere.
         slot_resolved = True
     diagnostics = _apply_confirmed(
         store, session_id, scope, row.source_ids[0], cand, concept, mtype,
@@ -894,6 +978,113 @@ def confirm_pending(store: Any, session_id: str,
     return diagnostics + [f"candidate_confirmed: {row.proposed_concept}"]
 
 
+def _notes_full(store: Any, scope: str) -> bool:
+    """True when the append-only notes slot has reached its cap."""
+    cap = slots_mod.notes_cap()
+    try:
+        rows = store.fetch_states(scope=scope, status="current")
+    except Exception:
+        return False
+    return sum(1 for s in rows
+               if s.concept.startswith("notes for ")) >= cap
+
+
+def _apply_rule_revocation(
+    store: Any, session_id: str, scope: str, message_id: int, cand,
+) -> list[str]:
+    """Retire protected rules, but only via an explicit revocation.
+
+    "stop doing X" targets the single rule whose words match X; "forget
+    that rule" targets the single tracked rule. Zero or several matches
+    are held pending with a reason, never guessed.
+    """
+    try:
+        pool = _inherit_pool(store, scope)
+    except Exception:
+        pool = []
+    rules = sorted({s.concept for s in pool
+                    if slots_mod.is_protected_concept(s.concept)})
+    concept: Optional[str] = None
+    if cand.value:
+        words = _content_words(cand.value)
+        targets = [c for c in rules
+                   if words & (_content_words(c))]
+        if len(targets) == 1:
+            concept = targets[0]
+        elif len(targets) > 1:
+            return _record_pending(
+                store, session_id, scope, message_id,
+                dataclass_replace(cand, concept="", mtype=UNCERTAIN,
+                                  confidence=0.3),
+                reason="ambiguous rule revocation; candidates: %s"
+                       % (", ".join(targets),))
+        else:
+            return _record_pending(
+                store, session_id, scope, message_id,
+                dataclass_replace(cand, concept="", mtype=UNCERTAIN,
+                                  confidence=0.3),
+                reason="no tracked rule matches the revocation")
+    elif len(rules) == 1:
+        concept = rules[0]
+    elif len(rules) > 1:
+        return _record_pending(
+            store, session_id, scope, message_id,
+            dataclass_replace(cand, concept="", mtype=UNCERTAIN,
+                              confidence=0.3),
+            reason="ambiguous rule revocation; candidates: %s"
+                   % (", ".join(rules),))
+    else:
+        return _record_pending(
+            store, session_id, scope, message_id,
+            dataclass_replace(cand, concept="", mtype=UNCERTAIN,
+                              confidence=0.3),
+            reason="no tracked rule to revoke")
+    revoke = dataclass_replace(cand, concept=concept, kind="invalidate")
+    return _apply_confirmed(
+        store, session_id, scope, message_id, revoke, concept, INSTRUCTION,
+        resolve=False)
+
+
+def _apply_slot_retire(
+    store: Any, session_id: str, scope: str, message_id: int, cand,
+) -> list[str]:
+    """Retire a slot fact, but only when the negation names the value
+    actually stored: "I don't live in Karaj" retires home location if
+    and only if the current value is Karaj. A mismatch is held pending
+    with a reason, never guessed."""
+    diagnostics: list[str] = []
+    concept = cand.concept
+    try:
+        currents = store.fetch_states(
+            scope=scope, concept=concept, status="current")
+    except Exception as e:
+        return [f"state_failed: state read failed: {e}"]
+    match = [c for c in currents
+             if (c.value or "").lower() == (cand.value or "").lower()]
+    if not match:
+        stored = currents[0].value if currents else None
+        return _record_pending(
+            store, session_id, scope, message_id,
+            dataclass_replace(cand, kind="establish", mtype=UNCERTAIN,
+                              confidence=0.3),
+            reason="retirement names %r but stored %s is %r" % (
+                cand.value, concept, stored))
+    transition = (cand.transition_time if cand.transition_time is not None
+                  else time.time())
+    try:
+        store.supersede_states(
+            [c.state_id for c in match],
+            valid_until=cand.valid_until, transition_time=transition)
+    except Exception as e:
+        return [f"state_failed: state write failed: {e}"]
+    diagnostics.append(f"state_invalidated: {concept}")
+    diagnostics.extend(_supersede_related(
+        store, scope, concept, valid_until=cand.valid_until,
+        transition_time=transition,
+        predecessor_state_ids=[c.state_id for c in match]))
+    return diagnostics
+
+
 def apply_user_candidates(
     store: Any,
     session_id: str,
@@ -904,6 +1095,33 @@ def apply_user_candidates(
     diagnostics: list[str] = []
     for cand in candidates:
         scope = _scope_key(cand.scope, session_id)
+        if getattr(cand, "slot", "") == "rules revoke":
+            diagnostics.extend(_apply_rule_revocation(
+                store, session_id, scope, message_id, cand))
+            continue
+        if getattr(cand, "slot", ""):
+            # Slot-routed personal fact: the registry already named the
+            # concept and the global scope, so no substring resolution.
+            if not cand.auto_confirm:
+                # Hedged slot statement ("I think my favorite color is
+                # blue"): a pending candidate until confirmed, same as
+                # every other hedged statement.
+                diagnostics.extend(
+                    _record_pending(store, session_id, scope, message_id,
+                                    cand))
+                continue
+            if cand.kind == "retire_slot":
+                diagnostics.extend(_apply_slot_retire(
+                    store, session_id, scope, message_id, cand))
+                continue
+            if cand.slot == "notes" and _notes_full(store, scope):
+                diagnostics.append(
+                    "notes_full: capacity reached; statement not stored")
+                continue
+            diagnostics.extend(_apply_confirmed(
+                store, session_id, scope, message_id, cand,
+                cand.concept, cand.mtype, resolve=False))
+            continue
         if not cand.auto_confirm:
             diagnostics.extend(
                 _record_pending(store, session_id, scope, message_id, cand))
@@ -989,14 +1207,22 @@ def check_assistant_conflict(
         return diagnostics
     concept, value = parsed
     try:
-        known = _tracked_concepts(store.fetch_states(scope=session_id))
+        # Personal facts live in the global scope; an assistant claim
+        # contradicting one is a conflict just the same.
+        known = _tracked_concepts(_inherit_pool(store, session_id))
         concept = resolve_concept(known, concept)
         currents = store.fetch_states(
             scope=session_id, concept=concept, status="current"
         )
+        if not currents:
+            currents = store.fetch_states(
+                scope="global", concept=concept, status="current")
         existing_unresolved = store.fetch_states(
             scope=session_id, concept=concept, status="unresolved"
         )
+        if not existing_unresolved:
+            existing_unresolved = store.fetch_states(
+                scope="global", concept=concept, status="unresolved")
     except Exception as e:
         return [f"state_failed: state read failed: {e}"]
     if not currents:

@@ -320,7 +320,7 @@ class TestMemorySeeding:
             token_counter=lambda m: sum(len(x["content"].split()) + 2 for x in m),
         ).view
         injected = " ".join(m["content"] for m in view.messages)
-        assert "favorite color = blue" in injected
+        assert "The user's favorite color is blue." in injected
 
     def test_historical_memory_marks_the_superseded_row(self, tmp_path):
         db = str(tmp_path / "c.db")

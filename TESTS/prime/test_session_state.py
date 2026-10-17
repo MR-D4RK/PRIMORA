@@ -160,29 +160,48 @@ def test_current_state_preferred():
     assert "was: Blue Lantern" not in texts
 
 
-# 12. historical query returns superseded value ------------------------------------------------------------------
+# 12. historical query never resurrects the superseded value -------------------
 def test_historical_query_returns_superseded():
+    # The superseded row stays intact in the store, but the rendered
+    # state lines never carry it back; only the current value is shown.
     mgr = ContextManager(db_path=_db())
     mgr.reconcile([{"role": "user", "content": "The test phrase is Blue Lantern."}], "s")
     mgr.reconcile([{"role": "user", "content": "The new test phrase is Violet Aurora."}], "s")
     view = mgr.build([{"role": "user", "content": "What was the previous test phrase?"}],
                      "s", token_counter=_counter,
                      max_new_tokens=5, budget=_budget()).view
-    texts = " ".join(m["content"] for m in view.messages)
-    assert "Blue Lantern" in texts
-    assert "superseded" in texts
+    state_lines = [m["content"] for m in view.messages
+                   if m.get("role") == "system"
+                   and not m["content"].startswith("[session ")]
+    assert any("The user's test phrase is Violet Aurora." in line
+               for line in state_lines)
+    assert not any("Blue Lantern" in line for line in state_lines)
+    old = mgr._get_store().fetch_states(status="superseded")
+    assert [s.value for s in old] == ["Blue Lantern"]
 
 
 # 13. state provenance ---------------------------------------------------------------------
 def test_state_provenance():
+    # State lines are plain sentences now, but the stored row still
+    # points at the exact message that produced it.
     mgr = ContextManager(db_path=_db())
     mgr.reconcile([{"role": "user", "content": "The test phrase is Blue Lantern."}], "s")
     view = mgr.build([{"role": "user", "content": "What is the current test phrase?"}],
                      "s", token_counter=_counter,
                      max_new_tokens=5, budget=_budget()).view
-    state_lines = [m["content"] for m in view.messages if m["content"].startswith("[state ")]
-    assert state_lines
-    assert all("src:" in line for line in state_lines)
+    state_lines = [m["content"] for m in view.messages
+                   if m.get("role") == "system"
+                   and not m["content"].startswith("[session ")]
+    assert any("The user's test phrase is Blue Lantern." in line
+               for line in state_lines), state_lines
+    row = mgr._get_store().fetch_states(
+        scope="s", concept="test phrase", status="current")[0]
+    assert row.source_ids
+    (src,) = row.source_ids
+    stored = [m for m in mgr._get_store().fetch_range("s", 0)
+              if m.message_id == src]
+    assert len(stored) == 1
+    assert stored[0].content == "The test phrase is Blue Lantern."
 
 
 # 14. state failure fallback -------------------------------------------------------------------

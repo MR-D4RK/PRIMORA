@@ -18,6 +18,7 @@ from . import queries as queries_mod
 from . import relationships as relationships_mod
 from . import scoring as scoring_mod
 from . import semantic as semantic_mod
+from . import slots as slots_mod
 from . import state as state_mod
 from .digest import build_extractive_digest, maybe_compact
 from .models import (
@@ -1144,10 +1145,7 @@ class ContextManager:
         ]
         currents, _ = _newest_per_scope_concept(currents)
         for st in sorted(currents, key=lambda s: (s.scope, s.concept)):
-            content = (
-                f"[state current src:{','.join(str(i) for i in st.source_ids)}] "
-                f"{st.concept} = {st.value}"
-            )
+            content = slots_mod.render_sentence(st.concept, st.value)
             items.append(ActiveMemoryItem(
                 kind="state", memory_type=st.memory_type or "",
                 concept=st.concept, value=st.value, content=content,
@@ -1256,9 +1254,13 @@ class ContextManager:
                 diagnostics.append(f"state_failed: promote failed: {e}")
             return ids, diagnostics
         for cand in candidates:
+            # Slot-routed personal facts promote with the candidate's own
+            # global scope; marker-based scope applies to everything else.
+            cand_scope_key = (
+                "global" if cand.scope == "global" else session_id)
             try:
                 existing = store.fetch_candidates(
-                    scope=scope_key, status="pending")
+                    scope=cand_scope_key, status="pending")
                 if any(r.proposed_concept == cand.concept
                        and r.proposed_value == cand.value
                        and r.source_ids == list(source_ids or [])
@@ -1268,7 +1270,7 @@ class ContextManager:
                 # fact. Genuinely structureless promotions stay UNCERTAIN
                 # via the branch above, never here.
                 cid = store.create_candidate(
-                    session_id, scope_key, list(source_ids or []),
+                    session_id, cand_scope_key, list(source_ids or []),
                     proposed_type=cand.mtype or "FACT",
                     proposed_concept=cand.concept,
                     proposed_value=cand.value,
@@ -2388,7 +2390,6 @@ class ContextManager:
         evaluation_time = time.time()
         query_text = current.get("content", "") if current else ""
         query_terms = scoring_mod.build_query(query_text)
-        wants_history = self._wants_history(query_text)
 
         # Session scope only: another session's current value must never
         # answer for this session. Cross-session questions are handled
@@ -2432,6 +2433,14 @@ class ContextManager:
             ranked.append((overlap, st))
         ranked.sort(key=lambda r: (-r[0], -r[1].state_id, r[1].concept))
         reserve_limit = min(cfg.input_ceiling, cfg.input_target)
+        # Facts render as plain sentences under one heading, never as a
+        # machine format. The heading carries the usage guidance and is
+        # admitted on the ceiling (it is fixed cost); the facts keep the
+        # existing reserve/overlap admission rules unchanged.
+        heading = slots_mod.block_heading()
+        heading_msg = {"role": "system", "content": heading}
+        heading_fp = f"system\x00{heading}"
+        heading_added = False
         for overlap, st in ranked:
             if total >= cfg.input_ceiling:
                 break
@@ -2443,10 +2452,7 @@ class ContextManager:
                 continue
             if total >= limit:
                 continue
-            content = (
-                f"[state current src:{','.join(str(i) for i in st.source_ids)}] "
-                f"{st.concept} = {st.value}"
-            )
+            content = slots_mod.render_sentence(st.concept, st.value)
             msg = {"role": "system", "content": content}
             fp = f"system\x00{content}"
             if fp in selected_fps:
@@ -2454,6 +2460,15 @@ class ContextManager:
             cost = self._safe_count(counter, [msg], diagnostics)
             if total + cost > limit:
                 continue
+            if not heading_added and heading_fp not in selected_fps:
+                heading_cost = self._safe_count(
+                    counter, [heading_msg], diagnostics)
+                if total + heading_cost + cost <= cfg.input_ceiling:
+                    selected.append(heading_msg)
+                    selected_fps.add(heading_fp)
+                    selected_texts.append(heading)
+                    total += heading_cost
+                heading_added = True
             selected.append(msg)
             selected_fps.add(fp)
             selected_texts.append(content)
@@ -2474,8 +2489,8 @@ class ContextManager:
             if overlap <= 0 or total >= cfg.input_ceiling:
                 continue
             content = (
-                f"[state unresolved src:{','.join(str(i) for i in st.source_ids)}] "
-                f"{st.concept}: {st.value} (conflicting, not established)"
+                f"Possible conflict (not established): {st.concept}"
+                f" may be {st.value}."
             )
             msg = {"role": "system", "content": content}
             fp = f"system\x00{content}"
@@ -2488,42 +2503,6 @@ class ContextManager:
             selected_fps.add(fp)
             selected_texts.append(content)
             total += cost
-
-        # Superseded values surface only on explicit historical queries.
-        if wants_history:
-            try:
-                old_states = (
-                    store.fetch_states(scope=session_id, status="superseded")
-                    + store.fetch_states(scope="global", status="superseded")
-                )
-            except Exception:
-                old_states = []
-            ranked_old = []
-            for st in old_states:
-                overlap = scoring_mod.relevance(
-                    scoring_mod.tokenize(f"{st.concept} {st.value}"), query_terms
-                )
-                if overlap > 0:
-                    ranked_old.append((overlap, st.concept, st))
-            ranked_old.sort(key=lambda r: (-r[0], r[1]))
-            for _, _, st in ranked_old[:3]:
-                if total >= cfg.input_ceiling:
-                    break
-                content = (
-                    f"[state previous src:{','.join(str(i) for i in st.source_ids)}] "
-                    f"{st.concept} was: {st.value} (superseded)"
-                )
-                msg = {"role": "system", "content": content}
-                fp = f"system\x00{content}"
-                if fp in selected_fps:
-                    continue
-                cost = self._safe_count(counter, [msg], diagnostics)
-                if total + cost > cfg.input_ceiling:
-                    continue
-                selected.append(msg)
-                selected_fps.add(fp)
-                selected_texts.append(content)
-                total += cost
         return total
 
     def _add_digests(

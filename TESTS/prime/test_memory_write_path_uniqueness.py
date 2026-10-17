@@ -73,8 +73,10 @@ def _prime(jev=None):
 
 
 def _current(manager, session="s", concept=FAVOURITE):
+    # Slot-routed personal facts live in the global scope; the dedup
+    # invariant holds there regardless of which session wrote first.
     return manager._get_store().fetch_states(
-        scope=session, concept=concept, status="current")
+        concept=concept, status="current")
 
 
 def _learn(prime, text, provenance="user", **kw):
@@ -167,14 +169,19 @@ class TestSessionBoundary:
         assert prime.mind.current_session_id == "real-session"
 
     def test_distinct_sessions_are_scoped_not_merged(self):
-        """Different sessions are genuinely different memories, not dupes."""
+        """Different sessions are genuinely different memories, not dupes.
+
+        Uses a free-form concept: personal-fact slots are global by
+        design, so the session-scoped boundary is proven on a concept
+        the registry does not own.
+        """
         mgr = ContextManager(db_path=_db("d.db"))
-        _say(mgr, f"my {FAVOURITE} is {DUNE}", session="one")
-        _say(mgr, f"my {FAVOURITE} is {DUNE}", session="two")
+        _say(mgr, "My deploy key is BLUE-7", session="one")
+        _say(mgr, "My deploy key is BLUE-7", session="two")
         store = mgr._get_store()
-        assert len(store.fetch_states(scope="one", concept=FAVOURITE,
+        assert len(store.fetch_states(scope="one", concept="deploy key",
                                       status="current")) == 1
-        assert len(store.fetch_states(scope="two", concept=FAVOURITE,
+        assert len(store.fetch_states(scope="two", concept="deploy key",
                                       status="current")) == 1
 
     def test_current_session_id_falls_back_to_default(self):
@@ -209,7 +216,7 @@ class TestExistingSemanticsPreserved:
         current = _current(mgr)
         assert len(current) == 1
         assert current[0].value == "Arrival"
-        assert len(store.fetch_states(scope="s", concept=FAVOURITE)) == 2, \
+        assert len(store.fetch_states(concept=FAVOURITE)) == 2, \
             "the superseded value must be kept as history"
 
     def test_a_conflicting_learn_supersedes_rather_than_duplicating(self):
@@ -221,7 +228,7 @@ class TestExistingSemanticsPreserved:
         store = prime._context._get_store()
         current = _current(prime._context)
         assert len(current) == 1 and current[0].value == "Arrival"
-        assert len(store.fetch_states(scope="s", concept=FAVOURITE)) == 2
+        assert len(store.fetch_states(concept=FAVOURITE)) == 2
 
     def test_authority_is_preserved_through_dedup(self):
         mgr = ContextManager(db_path=_db("f.db"))

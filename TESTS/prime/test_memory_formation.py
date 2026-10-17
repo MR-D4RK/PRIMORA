@@ -62,7 +62,7 @@ def test_decision_confirmed():
     mgr = ContextManager(db_path=_db())
     hist = []
     _say(mgr, hist, "s", "We decided to keep the current visual.")
-    rows = _currents(mgr, "s", "decision for keep the current visual")
+    rows = _currents(mgr, "global", "decision for keep the current visual")
     assert len(rows) == 1
     assert rows[0].value == "keep the current visual"
     assert rows[0].memory_type == "DECISION"
@@ -73,7 +73,7 @@ def test_instruction_confirmed():
     mgr = ContextManager(db_path=_db())
     hist = []
     _say(mgr, hist, "s", "From now on, keep the visual frozen.")
-    rows = _currents(mgr, "s", "instruction for keep the visual frozen")
+    rows = _currents(mgr, "global", "instruction for keep the visual frozen")
     assert len(rows) == 1
     assert rows[0].value == "keep the visual frozen"
     assert rows[0].memory_type == "INSTRUCTION"
@@ -93,9 +93,9 @@ def test_rationale_linked():
     hist = []
     _say(mgr, hist, "s",
          "We kept the visual because it finally feels like Aurora.")
-    dec = _currents(mgr, "s", "decision for visual")
+    dec = _currents(mgr, "global", "decision for visual")
     assert len(dec) == 1 and dec[0].value == "visual"
-    rat = _currents(mgr, "s", "rationale for decision for visual")
+    rat = _currents(mgr, "global", "rationale for decision for visual")
     assert len(rat) == 1
     assert rat[0].value == "it finally feels like Aurora"
     assert rat[0].memory_type == "RATIONALE"
@@ -107,7 +107,7 @@ def test_rationale_linked():
     mgr.build(hist2, "s", token_counter=_counter,
               max_new_tokens=5, budget=_budget())
     old_rat = mgr._get_store().fetch_states(
-        scope="s", concept="rationale for decision for visual",
+        scope="global", concept="rationale for decision for visual",
         status="superseded")
     assert len(old_rat) == 1
 
@@ -132,7 +132,7 @@ def test_bare_correction_unique_concept():
     hist = []
     _say(mgr, hist, "s", "My favorite color is blue.")
     _say(mgr, hist, "s", "Actually, green.")
-    rows = _currents(mgr, "s", "favorite color")
+    rows = _currents(mgr, "global", "favorite color")
     assert len(rows) == 1
     assert rows[0].value == "green"
 
@@ -143,7 +143,7 @@ def test_bare_correction_ambiguous_stays_pending():
     _say(mgr, hist, "s", "My favorite color is blue.")
     _say(mgr, hist, "s", "The theme is dark.")
     _say(mgr, hist, "s", "Actually, green.")
-    rows = _currents(mgr, "s", "favorite color")
+    rows = _currents(mgr, "global", "favorite color")
     assert len(rows) == 1 and rows[0].value == "blue"
     pend = mgr._get_store().fetch_candidates(status="pending")
     assert any(p.proposed_value == "green" for p in pend)
@@ -154,11 +154,11 @@ def test_changed_decision_inherits_concept():
     hist = []
     _say(mgr, hist, "s", "We decided to keep the current visual.")
     _say(mgr, hist, "s", "We changed the decision to the new layout.")
-    rows = _currents(mgr, "s", "decision for keep the current visual")
+    rows = _currents(mgr, "global", "decision for keep the current visual")
     assert len(rows) == 1
     assert rows[0].value == "the new layout"
     old = mgr._get_store().fetch_states(
-        scope="s", concept="decision for keep the current visual",
+        scope="global", concept="decision for keep the current visual",
         status="superseded")
     assert [s.value for s in old] == ["keep the current visual"]
 

@@ -124,7 +124,8 @@ class TestPluralFolding:
 
         res = _say(mgr, hist, sid, "what about my fav car")
         joined = _joined(res.view)
-        assert "preference = zr1x the most in cars" in joined, joined
+        assert "The user's preference is zr1x the most in cars." in joined, \
+            joined
 
 
 # 2. Zero-overlap retention ----------------------------------------------------
@@ -146,7 +147,8 @@ class TestZeroOverlapRetention:
             "share no term with the stored fact"
         )
         joined = _joined(res.view)
-        assert "[state current" in joined, joined
+        assert "The user's preference is zr1x the most in cars." in joined, \
+            joined
         assert "zr1x the most in cars" in joined, joined
 
     def test_an_unrelated_global_fact_still_has_to_overlap(self):
@@ -178,7 +180,7 @@ class TestZeroOverlapRetention:
 
         res = _say(mgr, hist, sid, "what is my favorite color")
         joined = _joined(res.view)
-        assert "favorite color = yello" in joined, joined
+        assert "The user's favorite color is yello." in joined, joined
 
     def test_another_session_never_answers_for_this_one(self):
         """The retention rule must not reopen the session-scope hole."""
@@ -193,7 +195,7 @@ class TestZeroOverlapRetention:
                         max_new_tokens=5, budget=_budget())
         joined = _joined(res.view)
         assert "zr1x the most in cars" not in joined, joined
-        assert "favorite color = blue" not in joined, joined
+        assert "The user's favorite color is blue." not in joined, joined
 
 
 # 3. The state reserve ---------------------------------------------------------
@@ -224,7 +226,8 @@ class TestStateReserveKeepsHistory:
                                        output_reserve=5, total_budget=95,
                                        state_reserve=15))
         joined = _joined(res.view)
-        assert "[state current" in joined, joined
+        assert "The user's preference is zr1x the most in cars." in joined, \
+            joined
         assert "zr1x the most in cars" in joined, joined
         # ...and the conversation must still be there. The reserve buys the
         # fact its room; it must not do so by evicting the turn.

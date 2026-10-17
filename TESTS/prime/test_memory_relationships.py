@@ -691,11 +691,11 @@ def test_explains_bridge_is_canonical_and_preserves_m1_state():
     ], "s")
     assert not any(item.startswith("state_failed") for item in diagnostics)
     rationale = store.fetch_states(
-        scope="s", concept="rationale for decision for visual",
+        scope="global", concept="rationale for decision for visual",
         status="current"
     )[0]
     decision = store.fetch_states(
-        scope="s", concept="decision for visual", status="current"
+        scope="global", concept="decision for visual", status="current"
     )[0]
     assert rationale.memory_type == "RATIONALE"
     assert decision.memory_type == "DECISION"
@@ -723,10 +723,10 @@ def test_explains_relationship_supersedes_with_old_rationale():
     ]
     manager.reconcile(list(history), "s")
     old_decision_id = store.fetch_states(
-        scope="s", concept="decision for visual", status="current"
+        scope="global", concept="decision for visual", status="current"
     )[0].state_id
     old_rationale_id = store.fetch_states(
-        scope="s", concept="rationale for decision for visual",
+        scope="global", concept="rationale for decision for visual",
         status="current"
     )[0].state_id
     old_relationship = store.fetch_relationships(
@@ -739,15 +739,15 @@ def test_explains_relationship_supersedes_with_old_rationale():
     })
     manager.reconcile(list(history), "s")
     new_decision = store.fetch_states(
-        scope="s", concept="decision for visual", status="current"
+        scope="global", concept="decision for visual", status="current"
     )[0]
     old_rationale = [
-        item for item in store.fetch_states(scope="s")
+        item for item in store.fetch_states(scope="global")
         if item.state_id == old_rationale_id
     ][0]
     superseded = store.fetch_relationship(old_relationship.relationship_id)
     old_decision = [
-        item for item in store.fetch_states(scope="s")
+        item for item in store.fetch_states(scope="global")
         if item.state_id == old_decision_id
     ][0]
     assert old_decision.status == "superseded"

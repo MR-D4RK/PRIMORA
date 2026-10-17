@@ -1,11 +1,14 @@
-"""Fact-collision regressions: unrelated type-word statements never share
-one newest-wins slot.
+"""Fact-collision regressions: unrelated statements never share one
+newest-wins slot.
 
-Each extracted fact gets its own topic-bearing concept ("I love pizza" ->
-"preference for pizza"), the way Mem0 keys facts by content and Letta keeps
-labelled distinct slots. Explicit corrections still supersede the single
-tracked concept of that type; ambiguous corrections are held pending;
-history stays retrievable but is never presented as current.
+Slot-routed personal facts land in their own registry concept ("I love
+pizza" -> "likes for pizza"; "my first name is Amir" -> "first name")
+and live in the global scope; un-routed type-word statements keep their
+topic-bearing session concepts ("I prefer dark mode" -> "preference for
+dark mode"), the way Mem0 keys facts by content and Letta keeps labelled
+distinct slots. Explicit corrections still supersede the single tracked
+concept of that type; ambiguous corrections are held pending; history
+stays retrievable but is never presented as current.
 
 Conventions follow the repo: stdlib only, temp SQLite files, injected
 word-based token counter, no live model.
@@ -46,16 +49,16 @@ def _say(mgr, hist, sid, text, budget=None):
                      budget=budget or _budget())
 
 
-def _currents(mgr, scope, concept=None):
+def _currents(mgr, scope=None, concept=None):
     return mgr._get_store().fetch_states(
         scope=scope, concept=concept, status="current")
 
 
-def _facts(mgr, scope):
+def _facts(mgr, scope=None):
     return sorted((s.concept, s.value) for s in _currents(mgr, scope))
 
 
-def _superseded(mgr, scope, concept=None):
+def _superseded(mgr, scope=None, concept=None):
     return mgr._get_store().fetch_states(
         scope=scope, concept=concept, status="superseded")
 
@@ -66,9 +69,9 @@ def test_unrelated_preferences_both_survive():
     hist = []
     _say(mgr, hist, "s", "I love pizza.")
     _say(mgr, hist, "s", "I prefer dark mode.")
-    assert _facts(mgr, "s") == [
+    assert _facts(mgr) == [
+        ("likes for pizza", "loves pizza"),
         ("preference for dark mode", "dark mode"),
-        ("preference for pizza", "pizza"),
     ]
 
 
@@ -78,7 +81,7 @@ def test_topic_facts_both_survive():
     hist = []
     _say(mgr, hist, "s", "My favorite car is a Tesla.")
     _say(mgr, hist, "s", "My favorite color is blue.")
-    assert _facts(mgr, "s") == [
+    assert _facts(mgr) == [
         ("favorite car", "a Tesla"),
         ("favorite color", "blue"),
     ]
@@ -90,11 +93,12 @@ def test_multiple_instructions_both_survive():
     hist = []
     _say(mgr, hist, "s", "Always confirm before deploying.")
     _say(mgr, hist, "s", "Never store API keys.")
-    facts = _facts(mgr, "s")
+    facts = _facts(mgr)
     assert ("instruction for confirm before deploying",
             "confirm before deploying") in facts
+    # "API" keeps the user's own casing: the registry preserves it.
     assert ("instruction for never store api keys",
-            "never store API keys") in facts
+            "never store API keys".replace("api", "API")) in facts
     assert len(facts) == 2
 
 
@@ -105,11 +109,11 @@ def test_topic_correction_updates_only_its_fact():
     _say(mgr, hist, "s", "My favorite car is a Tesla.")
     _say(mgr, hist, "s", "I prefer dark themes.")
     _say(mgr, hist, "s", "Actually, my favorite car is a Corvette C8.")
-    assert _facts(mgr, "s") == [
+    assert _facts(mgr) == [
         ("favorite car", "a Corvette C8"),
         ("preference for dark themes", "dark themes"),
     ]
-    old = _superseded(mgr, "s", "favorite car")
+    old = _superseded(mgr, concept="favorite car")
     assert [(s.concept, s.value) for s in old] == [("favorite car", "a Tesla")]
 
 
@@ -120,9 +124,9 @@ def test_type_word_correction_targets_shared_topic():
     _say(mgr, hist, "s", "I love pizza.")
     _say(mgr, hist, "s", "I prefer dark mode.")
     _say(mgr, hist, "s", "Actually, I prefer light mode.")
-    assert _facts(mgr, "s") == [
+    assert _facts(mgr) == [
+        ("likes for pizza", "loves pizza"),
         ("preference for dark mode", "light mode"),
-        ("preference for pizza", "pizza"),
     ]
     old = _superseded(mgr, "s", "preference for dark mode")
     assert [(s.concept, s.value) for s in old] == [
@@ -163,8 +167,8 @@ def test_history_retrievable_but_not_current():
     res = _say(mgr, hist, "s", "What is my preference?",
                budget=_budget(input_target=30, input_ceiling=60))
     joined = "\n".join(m["content"] for m in res.view.messages)
-    assert "preference for dark mode = light mode" in joined
-    assert "preference for dark mode = dark mode" not in joined
+    assert "The user's preference for dark mode is light mode." in joined
+    assert "The user's preference for dark mode is dark mode." not in joined
     assert "was: dark mode" not in joined
 
 
@@ -180,11 +184,11 @@ def test_correction_without_shared_topic_is_additive():
         hist = []
         for text in statements:
             _say(mgr, hist, "s", text)
-        assert _facts(mgr, "s") == [
+        assert _facts(mgr) == [
+            ("likes for pizza", "loves pizza"),
             ("preference for dark mode", "dark mode"),
-            ("preference for pizza", "pizza"),
         ]
-        assert _superseded(mgr, "s") == []
+        assert _superseded(mgr) == []
 
 
 def test_correction_with_shared_topic_supersedes():
@@ -218,11 +222,11 @@ def test_no_cue_correction_keeps_both():
         hist = []
         for text in statements:
             _say(mgr, hist, "s", text)
-        assert _facts(mgr, "s") == [
-            ("preference for pizza", "pizza"),
-            ("preference for tacos", "tacos"),
+        assert _facts(mgr) == [
+            ("likes for pizza", "loves pizza"),
+            ("likes for tacos", "loves tacos"),
         ]
-        assert _superseded(mgr, "s") == []
+        assert _superseded(mgr) == []
 
 
 def test_bare_correction_held_when_no_referent():
@@ -232,8 +236,8 @@ def test_bare_correction_held_when_no_referent():
     hist = []
     _say(mgr, hist, "s", "I love pizza.")
     res = _say(mgr, hist, "s", "Actually, sage.")
-    assert _facts(mgr, "s") == [("preference for pizza", "pizza")]
-    assert _superseded(mgr, "s") == []
+    assert _facts(mgr) == [("likes for pizza", "loves pizza")]
+    assert _superseded(mgr) == []
     pend = mgr._get_store().fetch_candidates(status="pending")
     assert any(p.proposed_value == "sage" for p in pend)
     assert any("candidate_pending_reason" in d for d in res.view.diagnostics)
@@ -246,11 +250,11 @@ def test_i_said_prefix_stores_own_fact():
     hist = []
     _say(mgr, hist, "s", "I love pizza.")
     _say(mgr, hist, "s", "I said I love durian.")
-    assert _facts(mgr, "s") == [
-        ("preference for durian", "durian"),
-        ("preference for pizza", "pizza"),
+    assert _facts(mgr) == [
+        ("likes for durian", "loves durian"),
+        ("likes for pizza", "loves pizza"),
     ]
-    assert _superseded(mgr, "s") == []
+    assert _superseded(mgr) == []
 
 
 def test_typed_bare_correction_needs_topic_share():
@@ -260,8 +264,8 @@ def test_typed_bare_correction_needs_topic_share():
     hist = []
     _say(mgr, hist, "s", "I love pizza.")
     res = _say(mgr, hist, "s", "Actually, prefer sage.")
-    assert _facts(mgr, "s") == [("preference for pizza", "pizza")]
-    assert _superseded(mgr, "s") == []
+    assert _facts(mgr) == [("likes for pizza", "loves pizza")]
+    assert _superseded(mgr) == []
     pend = mgr._get_store().fetch_candidates(status="pending")
     assert any(p.proposed_value == "prefer sage" for p in pend)
     assert any("candidate_pending_reason" in d for d in res.view.diagnostics)
@@ -285,7 +289,7 @@ def test_from_now_on_directives_are_additive():
     hist = []
     _say(mgr, hist, "s", "From now on, keep the visual frozen.")
     _say(mgr, hist, "s", "From now on, always use UTC timestamps.")
-    assert len(_facts(mgr, "s")) == 2
+    assert len(_facts(mgr)) == 2
 
 
 # Guard: hedged type-word pendings never confirm onto an unrelated fact ------
@@ -299,9 +303,9 @@ def test_hedged_pending_confirms_as_own_fact():
     diags = state_mod.confirm_pending(
         mgr._get_store(), "s", pend[0].candidate_id)
     assert any("candidate_confirmed" in d for d in diags), diags
-    assert _facts(mgr, "s") == [
+    assert _facts(mgr) == [
+        ("likes for pizza", "loves pizza"),
         ("preference for blue", "blue"),
-        ("preference for pizza", "pizza"),
     ]
 
 

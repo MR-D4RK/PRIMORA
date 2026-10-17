@@ -430,9 +430,9 @@ def test_temporal_validity_is_unchanged_live():
     # The current turn is appended at seq 0 and conflicts, so both historical
     # messages are in the store; the expired state must not become a state line.
     state_lines = [
-        m["content"] for m in view.messages if m["content"].startswith(
-            "[state current"
-        )
+        m["content"] for m in view.messages
+        if m.get("role") == "system"
+        and not m["content"].startswith("[session ")
     ]
     assert state_lines
     assert not [line for line in state_lines if "expired" in line]

@@ -293,7 +293,7 @@ class TestActiveMemoryAccess:
             token_counter=_counter, max_new_tokens=64, budget=_budget(),
         )
         assert ctx.active_memory is not None
-        assert "favorite color = blue" in " ".join(
+        assert "The user's favorite color is blue." in " ".join(
             m["content"] for m in ctx.messages)
 
     def test_active_memory_can_be_excluded_from_the_summary(self):

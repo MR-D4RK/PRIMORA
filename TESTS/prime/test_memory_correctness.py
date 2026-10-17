@@ -57,20 +57,26 @@ def test_normal_retrieval_returns_only_current():
     res = _say(mgr, hist, "mem-a", "What is my favorite color?")
     texts = _texts(res.view)
     joined = "\n".join(c for _, c in texts)
-    assert "favorite color = green" in joined
+    assert "favorite color is green" in joined
     assert "blue" not in joined.replace("green", "GREEN-OK"), joined
     assert any("retrieval_suppressed_superseded" in d
                for d in res.view.diagnostics)
 
 
 # B. Historical query ----------------------------------------------------------
-def test_history_query_marks_superseded():
+def test_history_query_does_not_resurrect_superseded():
+    # A history question may not drag superseded values back into state
+    # lines; the current fact is what the model sees, and the superseded
+    # rows stay intact in the store for provenance.
     mgr, hist = _setup_colors()
     res = _say(mgr, hist, "mem-a", "What was my previous favorite color?")
-    joined = "\n".join(c for _, c in _texts(res.view))
-    assert "blue" in joined, joined
-    assert "superseded" in joined or "previous" in joined, joined
-    assert "favorite color = green" in joined
+    state_joined = "\n".join(c for r, c in _texts(res.view) if r == "system")
+    assert "The user's favorite color is green." in state_joined
+    assert "blue" not in state_joined, state_joined
+    assert "red" not in state_joined, state_joined
+    old = mgr._get_store().fetch_states(
+        concept="favorite color", status="superseded")
+    assert sorted(s.value for s in old) == ["blue", "red"]
 
 
 # C. Multiple corrections ------------------------------------------------------
@@ -78,25 +84,30 @@ def test_multiple_corrections_single_current():
     mgr, hist = _setup_colors()
     store = mgr._get_store()
     currents = store.fetch_states(
-        scope="mem-a", concept="favorite color", status="current")
+        scope="global", concept="favorite color", status="current")
     assert len(currents) == 1
     assert currents[0].value == "green"
     res = _say(mgr, hist, "mem-a", "What is my favorite color?")
     joined = "\n".join(c for _, c in _texts(res.view))
-    assert "favorite color = green" in joined
+    state_joined = "\n".join(c for r, c in _texts(res.view) if r == "system")
+    assert "The user's favorite color is green." in state_joined
     # Blue fell out of the recent window AND is suppressed from retrieval.
     assert "blue" not in joined.replace("green", "GREEN-OK"), joined
     # Red remains visible only as a plain chronological turn, never as an
     # active state line; the mechanism demonstrably engaged.
-    assert "favorite color = red" not in joined, joined
+    assert "The user's favorite color is red." not in state_joined, joined
     assert any("retrieval_suppressed_superseded" in d
                for d in res.view.diagnostics)
     res2 = _say(mgr, hist, "mem-a",
                 "List my previous favorite colors, old ones included.")
-    joined2 = "\n".join(c for _, c in _texts(res2.view))
-    for color in ("blue", "red", "green"):
-        assert color in joined2, joined2
-    assert "superseded" in joined2 or "previous" in joined2, joined2
+    state_joined2 = "\n".join(c for r, c in _texts(res2.view) if r == "system")
+    # Even on an explicit history question the superseded values never
+    # return as state lines; they remain intact in the store.
+    assert "The user's favorite color is green." in state_joined2
+    assert "blue" not in state_joined2, state_joined2
+    assert "red" not in state_joined2, state_joined2
+    old = store.fetch_states(concept="favorite color", status="superseded")
+    assert sorted(s.value for s in old) == ["blue", "red"]
 
 
 # D. Cross-session scope --------------------------------------------------------
@@ -114,7 +125,7 @@ def test_global_scope_invariant():
     assert currents[0].value == "green"
     res = _say(mgr, hist, "mem-d", "What is my favorite color?")
     joined = "\n".join(c for _, c in _texts(res.view))
-    assert "favorite color = green" in joined
+    assert "favorite color is green" in joined
     assert "blue" not in joined.replace("green", "GREEN-OK"), joined
 
 
@@ -127,7 +138,7 @@ def test_only_one_current_per_concept():
     _say(mgr, hist, "mem-e", "My favorite color is green.")
     store = mgr._get_store()
     currents = store.fetch_states(
-        scope="mem-e", concept="favorite color", status="current")
+        scope="global", concept="favorite color", status="current")
     assert len(currents) == 1
     assert currents[0].value == "green"
     assert currents[0].supersedes_id is not None
@@ -144,13 +155,13 @@ def test_irrelevant_old_memory_not_promoted():
     res = _say(mgr, hist, "mem-f", "What is my favorite color?",
                budget=_budget(input_target=30, input_ceiling=45))
     joined = "\n".join(c for _, c in _texts(res.view))
-    assert "favorite color = green" in joined
+    assert "favorite color is green" in joined
     assert "warehouse" not in joined, joined
 
 
 if __name__ == "__main__":
     test_normal_retrieval_returns_only_current()
-    test_history_query_marks_superseded()
+    test_history_query_does_not_resurrect_superseded()
     test_multiple_corrections_single_current()
     test_global_scope_invariant()
     test_only_one_current_per_concept()

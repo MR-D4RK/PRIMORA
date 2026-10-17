@@ -89,9 +89,12 @@ def test_current_session_wins():
                         "sess-b", token_counter=_counter,
                         max_new_tokens=5, budget=_budget()).view
     state_lines = [m["content"] for m in mgr2_view.messages
-                   if m["content"].startswith("[state current")]
-    assert any("BYLAW" in line for line in state_lines)
-    assert not any("OLDSKOOL" in line for line in state_lines)
+                   if m.get("role") == "system"
+                   and not m["content"].startswith("[session ")]
+    assert any("The user's test phrase is BYLAW." in line
+               for line in state_lines)
+    assert not any("The user's test phrase is OLDSKOOL." in line
+                   for line in state_lines)
 
 
 # 5. cross-session query returns distinct scoped values ------------------------------

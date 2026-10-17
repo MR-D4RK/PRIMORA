@@ -79,6 +79,7 @@ from typing import Any, Callable, Optional
 from PRIMORA.aurora.brain import Brain, BrainResult
 from PRIMORA.aurora.claims import unsupported_claim_error
 from PRIMORA.aurora.citations import dangling_citation_error
+from PRIMORA.aurora import request_shape
 from PRIMORA.prime.context import BudgetConfig, ContextTooLargeError
 from PRIMORA.prime.context.mind import Mind
 
@@ -531,6 +532,15 @@ class CognitiveLoop:
         # can silently swallow it, and so a genuine citation problem is
         # never mistaken for either.
         citation_granted = False
+        # Fourth, and deliberately last so it cannot pre-empt the
+        # corrections above: a JSON reply that names a capability request
+        # but does not parse as one is a protocol failure, not an answer.
+        # A wrapper-less request object now executes through the normal
+        # path, so a JSON reply that still parses as nothing is Aurora
+        # asking for something and nothing having run - which must never
+        # reach the user as though it were an answer, or a recall that
+        # succeeded.
+        protocol_granted = False
 
         for cycle in range(self.max_cycles):
             if time.perf_counter() - started > self.deadline_s:
@@ -688,6 +698,43 @@ class CognitiveLoop:
                         {"role": "tool", "content": json.dumps({
                             "status": "failure", "output": None,
                             "error": dangling,
+                        })},
+                    ]
+                    continue
+                # A reply shaped like a capability request that could not
+                # be run. Emitting nothing was what let raw JSON reach
+                # the user as an answer: the trace said "finished", no
+                # capability ran, and the JSON string looked like a recall
+                # that had. Correct it the same way a rejected capability
+                # is corrected - one tool turn naming what was wrong, and
+                # no second attempt - so she can say so honestly instead.
+                if request_shape.is_request_attempt(content):
+                    if protocol_granted:
+                        # The correction was given and the same shape came
+                        # back. Stop rather than print it as an answer.
+                        segment.requested = False
+                        trace.stop_reason = "protocol_error"
+                        return BrainResult.failure(
+                            "Aurora emitted a capability request that could "
+                            "not be executed, then did not answer after "
+                            "being told it did not run.",
+                            self._brain.get_model_name())
+                    protocol_granted = True
+                    messages = messages + [
+                        {"role": "assistant", "content": content},
+                        {"role": "tool", "content": json.dumps({
+                            "status": "failure", "output": None,
+                            "error": (
+                                "not_a_request: this was a JSON object "
+                                "naming a capability request, so it was not "
+                                "executed and nothing was answered. A "
+                                "request must be exactly one request block "
+                                "containing one JSON object, or the same "
+                                "object alone as your whole reply, with a "
+                                "registered action and a payload object. "
+                                "Nothing ran. Emit one request, or answer "
+                                "the question directly."
+                            ),
                         })},
                     ]
                     continue
