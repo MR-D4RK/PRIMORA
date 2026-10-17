@@ -2,6 +2,15 @@
 
 > Moved from the project root to `DOCS/02_audits/` in Stage 2E (2026-10-14).
 
+> **Addendum (2026-10-17, post-recovery):** the launcher pair this audit
+> described as canonical (`launch-aurora-llamacpp.ps1` +
+> `launch_aurora_llamacpp.py`) has been retired. Its server lifecycle now
+> lives in `PRIMORA/model_server.py`, owned by the single application entry
+> point: `python -m PRIMORA.main` (GUI + Verse) and `python -m PRIMORA.main
+> --cli` (terminal only). Real live checks run through
+> `TESTS/live_smoke.py` (manual harness, isolated memory). Everything below
+> is the audit as originally written and is kept as a historical record.
+
 Status: **inventory only**. Nothing was modified, deleted, or moved to produce this
 report. The production DB (`PRIMORA/data/context/aurora_context.db`), its backup,
 and all model/data files are untouched (production digest verified unchanged by the

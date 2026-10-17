@@ -4,6 +4,14 @@
 
 > Moved from the project root to `DOCS/02_audits/` in Stage 2E (2026-10-14).
 
+> **Addendum (2026-10-17, post-recovery):** `python -m PRIMORA.main` is now
+> the single official entry point (GUI + Verse; `--cli` = terminal only) and
+> owns the llama-server lifecycle via `PRIMORA/model_server.py`. The
+> launcher pair this audit calls the "canonical live path"
+> (`launch-aurora-llamacpp.ps1` + `launch_aurora_llamacpp.py`) has been
+> retired; live verification uses `TESTS/live_smoke.py`. The audit text
+> below is kept unchanged as a point-in-time record.
+
 All claims below were verified in this session against the live workspace (source
 reads, read-only SQLite inspection via `mode=ro`, one safe pytest run). Where a
 prior document (`CLEANUP_INVENTORY.md`, `MEMORY_AUDIT.md`, agent reports)

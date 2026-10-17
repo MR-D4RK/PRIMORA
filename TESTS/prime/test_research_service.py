@@ -541,6 +541,8 @@ def _run_main(monkeypatch, argv, env, probe_outcomes, runner=None,
     values = {
         "PRIMORA_AURORA_MODEL_PATH": model_dir,
         "PRIMORA_AURORA_ADAPTER_PATH": adapter_dir,
+        # No test may ever spawn a real llama-server.
+        "PRIMORA_MODEL_SERVER": "off",
         **env,
     }
     managed = (
@@ -557,6 +559,14 @@ def _run_main(monkeypatch, argv, env, probe_outcomes, runner=None,
         "PRIMORA_OPENAI_TIMEOUT",
         "PRIMORA_AURORA_MODEL_PATH",
         "PRIMORA_AURORA_ADAPTER_PATH",
+        # Entry-point defaults applied by PRIMORA.main's
+        # configure_runtime_defaults(); managed so they never leak into
+        # later tests.
+        "PRIMORA_AURORA_BACKEND",
+        "PRIMORA_MODEL_SERVER",
+        "PRIMORA_MODEL_SERVER_KEEP",
+        "PRIMORA_LLAMACPP_SERVER",
+        "PRIMORA_LLAMACPP_MODEL",
     )
     for key in managed:
         if key in values:

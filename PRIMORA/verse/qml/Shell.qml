@@ -32,11 +32,14 @@ Window {
         }
     }
 
-    // Alt+F4 / window close button -> same shutdown path
+    // Alt+F4 / window close button -> same shutdown path.
+    // The close itself is accepted: shutdown() owns the teardown (it is
+    // re-entrancy-safe for the nested window.close() it performs), and
+    // rejecting the event here would leave a window that never closes and
+    // an application that never quits.
     onClosing: {
         if (verseApp) {
             verseApp.shutdown()
-            close.accepted = false // we handle close ourselves
         }
     }
 

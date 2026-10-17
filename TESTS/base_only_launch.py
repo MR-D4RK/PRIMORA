@@ -28,6 +28,14 @@ os.environ["PRIMORA_AURORA_MODEL_PATH"] = str(
 # "" -> identity.resolve_identity() reports configured=False (identity.py:77),
 # so the system prompt says "you run on the base model alone".
 os.environ["PRIMORA_AURORA_ADAPTER_PATH"] = ""
+# Setdefault, so an explicit operator environment still wins.
+# This harness exists to load the HF base-model path (no LoRA), so the
+# entry point's openai default must not redirect the brain to llama-server.
+os.environ.setdefault("PRIMORA_AURORA_BACKEND", "transformers")
+# A test harness must never spawn a real llama-server; with the backend
+# pinned above, `auto` would not manage the server either - this makes the
+# intent explicit and covers operators who export an openai backend.
+os.environ.setdefault("PRIMORA_MODEL_SERVER", "off")
 os.environ.setdefault("PRIMORA_SESSION_ID", "base_only_test")  # PRIMORA/main.py:159
 # Required by --cli (PRIMORA/main.py:78); inert, construction does no I/O.
 os.environ.setdefault("PRIMORA_OLLAMA_MODEL", "qwen3-8b-16k:latest")

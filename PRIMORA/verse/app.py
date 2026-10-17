@@ -64,7 +64,15 @@ class _CloseEventFilter(QObject):
                 self._verse_app.shutdown()
                 return True
         elif event.type() == QEvent.Type.Close:
-            # Let our shutdown handle the close
+            if self._verse_app.state in (
+                VerseLifecycleState.CLOSING, VerseLifecycleState.CLOSED,
+            ):
+                # Re-entry from the window.close() inside shutdown(): let
+                # this event through so the window really closes (the
+                # teardown is already running; consuming it would leave a
+                # never-closed window and the application would not quit).
+                return False
+            # First close: run our teardown, then own the event.
             self._verse_app.shutdown()
             return True
         return super().eventFilter(watched, event)
@@ -204,8 +212,16 @@ class VerseApplication(QObject):
 
     @Slot()
     def shutdown(self) -> None:
-        """CLOSING -> close window -> CLOSED."""
-        if self._runtime.state is VerseLifecycleState.CLOSED:
+        """CLOSING -> close window -> CLOSED.
+
+        Re-entrancy-safe: ``window.close()`` inside this method re-enters
+        the close-event filter, which calls shutdown() again. A second
+        entry while CLOSING (or after CLOSED) is a no-op - the outer call
+        owns the teardown, and a repeated CLOSING transition would raise.
+        """
+        if self._runtime.state in (
+            VerseLifecycleState.CLOSING, VerseLifecycleState.CLOSED,
+        ):
             return
         self._dismissed = True
         self._runtime.transition_to(VerseLifecycleState.CLOSING)
