@@ -392,6 +392,18 @@ class Mind:
         """
         return self._mechanisms.reconcile(messages, session_id)
 
+    def preference_update_claim_error(self, text: str) -> Optional[str]:
+        """Correction when a reply claims a memory update that was not saved.
+
+        The mechanisms own the store and the state semantics; the loop
+        asks this question because it owns the answer path. None means the
+        claim is backed or no claim was made.
+        """
+        try:
+            return self._mechanisms.preference_update_claim_error(text)
+        except Exception:
+            return None
+
     # -- the unified context ---------------------------------------------
 
     def build(

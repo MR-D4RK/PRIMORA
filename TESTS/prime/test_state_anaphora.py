@@ -81,6 +81,32 @@ def test_void_and_question_replies_no_extraction():
     assert extract_candidates("thanks", "user", q) == []
 
 
+def test_greetings_are_not_answers():
+    q = "What is my favorite color?"
+    for text in (
+        "hi", "Hi!", "hello there", "Hey", "good morning", "what's up",
+    ):
+        assert extract_candidates(text, "user", q) == [], text
+
+
+def test_greeting_does_not_supersede_an_established_fact():
+    mgr = _mgr("greeting_guard.db")
+    mgr.reconcile([
+        {"role": "user", "content": "What is my favorite color?"},
+        {"role": "user", "content": "It's yellow."},
+    ], "default")
+    mgr.reconcile([
+        {"role": "user", "content": "what is my fav color?"},
+        {"role": "assistant", "content": "I don't have that stored."},
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello! How can I help?"},
+    ], "default")
+    rows = _states(mgr._get_store(), concept="favorite color")
+    current = [s for s in rows if s.status == "current"]
+    assert [s.value for s in current] == ["yellow"]
+    assert all(s.value != "hi" for s in rows)
+
+
 def test_instructions_and_lists_are_not_answers():
     q = "What is my favorite color?"
     # Regression: this exact message used to become the fact's value.
@@ -96,6 +122,61 @@ def test_first_person_statement_is_not_an_answer():
     assert extract_candidates(
         "I told you yesterday it's yellow", "user", "What is my favorite color?"
     ) == []
+
+
+def test_imperative_reply_is_not_an_answer():
+    q = "What are my fav cars?"
+    assert extract_candidates("compare there engine", "user", q) == []
+    assert extract_candidates("compare their engines", "user", q) == []
+
+
+def test_second_person_clause_is_not_an_answer():
+    q = "What about my fav music genres and songs?"
+    assert extract_candidates("you are useless", "user", q) == []
+
+
+def test_clause_correction_is_not_a_value():
+    assert extract_candidates(
+        "no your info are wrong its 2026 and its has not releaseed yet",
+        "user", None,
+    ) == []
+    assert extract_candidates(
+        "no i meant based that i have told you before", "user", None,
+    ) == []
+
+
+def test_clause_correction_does_not_overwrite_tracked_fact():
+    mgr = _mgr("clause_correction.db")
+    mgr.reconcile(
+        [{"role": "user", "content": "my fav soccer team is bayern munich"}],
+        "default")
+    mgr.reconcile(
+        [{"role": "user", "content": "what is the release date of GTA VI"}],
+        "default")
+    mgr.reconcile(
+        [{"role": "user",
+          "content": "no your info are wrong its 2026 and its has not "
+                     "releaseed yet"}],
+        "default")
+    rows = _states(mgr._get_store(), concept="favorite soccer team")
+    assert [(s.value, s.status) for s in rows] == [
+        ("bayern munich", "current")]
+
+
+def test_unrelated_replies_do_not_create_favorite_states():
+    mgr = _mgr("overreach.db")
+    mgr.reconcile([
+        {"role": "user", "content": "what are my fav cars"},
+        {"role": "assistant", "content": "Apollo IE and Corvette C8."},
+        {"role": "user", "content": "compare there engine"},
+        {"role": "user", "content": "what about my fav music genres and songs ?"},
+        {"role": "assistant", "content": "I don't have that stored."},
+        {"role": "user", "content": "you are useless"},
+    ], "default")
+    store = mgr._get_store()
+    assert _states(store, concept="favorite car") == []
+    assert _states(store, concept="favorite music genre and song") == []
+    assert _states(store, concept="favorite music genre") == []
 
 
 # 3. direct phrasing behaves exactly as before ----------------------------
@@ -234,6 +315,111 @@ def test_build_view_contains_fact_from_state():
     assert "The user's favorite color is yellow." in view
 
 
+# 8. preference change in the live failure shape ---------------------------
+# Production evidence: "i wanna change my fav color to something else" ->
+# assistant invitation -> "violet" left the stored value at yellow while
+# Aurora claimed the update succeeded. These pin the resolution path.
+def _seed_yellow(mgr):
+    mgr.reconcile([
+        {"role": "user", "content": "What is my favorite color?"},
+        {"role": "user", "content": "It's yellow."},
+    ], "default")
+
+
+def test_preference_change_after_invitation_persists():
+    mgr = _mgr("invitation.db")
+    _seed_yellow(mgr)
+    diags = mgr.reconcile([
+        {"role": "user", "content":
+            "i wanna change my fav color to something else"},
+        {"role": "assistant", "content":
+            "Your current favorite color is yellow. If you'd like to change "
+            "it, please let me know your new favorite color, and I'll update "
+            "it for you!"},
+        {"role": "user", "content": "violet"},
+    ], "default")
+    assert not [d for d in diags
+                if d.startswith(("state_failed", "store_unavailable"))]
+    rows = _states(mgr._get_store(), concept="favorite color")
+    current = [s for s in rows if s.status == "current"]
+    assert [(s.value, s.scope, s.authority) for s in current] == [
+        ("violet", "global", "user")]
+    assert any(s.value == "yellow" and s.status != "current" for s in rows)
+
+
+def test_preference_change_after_assistant_question_persists():
+    mgr = _mgr("assistant_q.db")
+    _seed_yellow(mgr)
+    mgr.reconcile([
+        {"role": "user", "content": "i want to change my favorite color"},
+        {"role": "assistant", "content":
+            "What would you like your new favorite color to be?"},
+        {"role": "user", "content": "violet"},
+    ], "default")
+    rows = _states(mgr._get_store(), concept="favorite color")
+    current = [s for s in rows if s.status == "current"]
+    assert [s.value for s in current] == ["violet"]
+
+
+def test_preference_change_survives_restart():
+    path = _db_path("restart.db")
+    mgr = ContextManager(db_path=path)
+    _seed_yellow(mgr)
+    mgr.reconcile([
+        {"role": "user", "content":
+            "i wanna change my fav color to something else"},
+        {"role": "assistant", "content":
+            "please let me know your new favorite color"},
+        {"role": "user", "content": "violet"},
+    ], "default")
+    # A fresh manager over the same file is the restart.
+    restarted = ContextManager(db_path=path)
+    rows = restarted._get_store().fetch_states(concept="favorite color")
+    current = [s for s in rows if s.status == "current"]
+    assert [s.value for s in current] == ["violet"]
+
+
+def test_change_intent_context_does_not_capture_void_or_unrelated():
+    for index, text in enumerate((
+        "hi", "thanks", "you are useless", "no your info are wrong",
+        "what is the weather",
+    )):
+        mgr = _mgr("intent_void_%d.db" % index)
+        _seed_yellow(mgr)
+        mgr.reconcile([
+            {"role": "user", "content":
+                "i wanna change my fav color to something else"},
+        ], "default")
+        mgr.reconcile([{"role": "user", "content": text}], "default")
+        rows = _states(mgr._get_store(), concept="favorite color")
+        current = [s for s in rows if s.status == "current"]
+        assert [s.value for s in current] == ["yellow"], text
+
+
+def test_yellow_significance_is_preserved_separately():
+    mgr = _mgr("yellow_special.db")
+    _seed_yellow(mgr)
+    mgr.reconcile([
+        {"role": "user", "content":
+            "i wanna change my fav color to something else"},
+        {"role": "assistant", "content":
+            "please let me know your new favorite color"},
+        {"role": "user", "content": "violet"},
+    ], "default")
+    mgr.reconcile([
+        {"role": "user", "content":
+            "but yellow has special place in my heart"},
+    ], "default")
+    store = mgr._get_store()
+    rows = _states(store, concept="favorite color")
+    current = [s for s in rows if s.status == "current"]
+    assert [s.value for s in current] == ["violet"]
+    marks = [s for s in _states(store)
+             if "special place in my heart" in (s.value or "").lower()]
+    assert marks, "the yellow-special statement was dropped"
+    assert "yellow" in marks[0].value.lower()
+
+
 if __name__ == "__main__":
     test_anaphora_with_slot_question_extracts()
     test_anaphora_forms_and_bare_value()
@@ -241,7 +427,15 @@ if __name__ == "__main__":
     test_without_context_no_extraction()
     test_unmappable_question_no_extraction()
     test_void_and_question_replies_no_extraction()
+    test_greetings_are_not_answers()
+    test_greeting_does_not_supersede_an_established_fact()
+    test_instructions_and_lists_are_not_answers()
     test_first_person_statement_is_not_an_answer()
+    test_imperative_reply_is_not_an_answer()
+    test_second_person_clause_is_not_an_answer()
+    test_clause_correction_is_not_a_value()
+    test_clause_correction_does_not_overwrite_tracked_fact()
+    test_unrelated_replies_do_not_create_favorite_states()
     test_direct_statement_unchanged_without_context()
     test_hedge_downgrades_expanded_candidate()
     test_question_slot_phrase_mapping()
@@ -253,4 +447,9 @@ if __name__ == "__main__":
     test_assistant_claim_never_overrides_user_state()
     test_reconcile_snapshot_twice_no_duplicate_state()
     test_build_view_contains_fact_from_state()
+    test_preference_change_after_invitation_persists()
+    test_preference_change_after_assistant_question_persists()
+    test_preference_change_survives_restart()
+    test_change_intent_context_does_not_capture_void_or_unrelated()
+    test_yellow_significance_is_preserved_separately()
     print("All state anaphora tests passed!")

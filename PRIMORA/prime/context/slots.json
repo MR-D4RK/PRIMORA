@@ -1,7 +1,7 @@
 {
   "version": 1,
   "notes_cap": 20,
-  "block_heading": "The user's facts (their own statements; use only when relevant, and if a fact is not here say you do not know it):",
+  "block_heading": "The user's facts (use only when relevant; override earlier claims/denials; if absent, say unknown):",
   "slots": [
     {
       "name": "first name",
@@ -199,7 +199,9 @@
       "render": "The user noted: {value}.",
       "phrasings": [
         {"pattern": "^i(?:'m| am| have|'ve| was) (?P<value>.+?)\\.?$",
-         "min_words": 2}
+         "min_words": 2},
+        {"pattern": "^(?:but\\s+)?(?P<value>.+?\\bhas\\s+(?:a\\s+)?special\\s+place\\s+in\\s+my\\s+heart)\\.?$",
+         "min_words": 3}
       ]
     }
   ],

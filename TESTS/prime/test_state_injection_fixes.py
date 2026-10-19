@@ -198,6 +198,65 @@ class TestZeroOverlapRetention:
         assert "The user's favorite color is blue." not in joined, joined
 
 
+class TestSelfKnowledgeRecall:
+    def test_a_broad_self_query_surfaces_a_zero_overlap_global_fact(self):
+        """'what do you know about me?' asks for the facts, so it gets them.
+
+        The retention rule is session-scope only by default, but a global
+        fact stores preferences from every session; without this the one
+        question that asks for all memory could never see any of it.
+        """
+        sid = "self-a"
+        mgr = ContextManager(db_path=_db())
+        hist = []
+        _say(mgr, hist, sid, "Just checking in.")
+        mgr._get_store().create_state(
+            sid, "global", "favorite color", "yellow", [1])
+
+        res = _say(mgr, hist, sid, "what do you know about me?")
+        query_terms = scoring_mod.build_query("what do you know about me?")
+        state_terms = scoring_mod.tokenize("favorite color yellow")
+        assert scoring_mod.relevance(state_terms, query_terms) == 0.0, (
+            "the fixture no longer discriminates: this query is supposed to "
+            "share no term with the stored fact"
+        )
+        joined = _joined(res.view)
+        assert "The user's favorite color is yellow." in joined, joined
+
+    def test_a_broad_preferences_query_surfaces_global_facts(self):
+        sid = "self-b"
+        mgr = ContextManager(db_path=_db())
+        hist = []
+        _say(mgr, hist, sid, "Just checking in.")
+        store = mgr._get_store()
+        store.create_state(
+            sid, "global", "favorite music genre", "synthwave", [1])
+        store.create_state(
+            sid, "global", "favorite car", "corvette c8", [1])
+
+        res = _say(
+            mgr, hist, sid, "what are my preferences?",
+            budget=_budget(input_target=90, input_ceiling=180,
+                           state_reserve=45),
+        )
+        joined = _joined(res.view)
+        assert "synthwave" in joined, joined
+        assert "corvette c8" in joined, joined
+
+    def test_a_lookalike_word_does_not_open_the_retention_rule(self):
+        """'about melbourne' is not 'about me'."""
+        sid = "self-c"
+        mgr = ContextManager(db_path=_db())
+        hist = []
+        _say(mgr, hist, sid, "Just checking in.")
+        mgr._get_store().create_state(
+            sid, "global", "favorite color", "yellow", [1])
+
+        res = _say(mgr, hist, sid, "what do you know about melbourne")
+        joined = _joined(res.view)
+        assert "The user's favorite color is yellow." not in joined, joined
+
+
 # 3. The state reserve ---------------------------------------------------------
 class TestStateReserveKeepsHistory:
     def test_the_history_fill_leaves_room_for_a_fact(self):

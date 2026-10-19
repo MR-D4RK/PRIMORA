@@ -211,6 +211,41 @@ def _payload_of(request: Any) -> tuple[Any, Any, Any]:
             getattr(request, "metadata", None))
 
 
+def _answer_result(
+    result: Optional[BrainResult], extract: Callable[[str], Any], model: str
+) -> Optional[BrainResult]:
+    """Return a generation result only when it is an answer.
+
+    A request block is an internal segment. When the loop stops because a
+    cycle or repeat bound is reached, the last generation is still that
+    request; returning it made the CLI print protocol markup as though it
+    were the reply (and as though the request had answered the question).
+    No request payload ever reaches the user: the bounded stop becomes an
+    honest failure instead.
+    """
+    if result is None:
+        return None
+    content = getattr(result, "content", "") or ""
+    if not content:
+        return result
+    try:
+        internal = extract(content) is not None
+    except Exception:
+        internal = False
+    if not internal:
+        internal = (
+            request_shape.is_request_attempt(content)
+            or "<prime_request>" in content
+        )
+    if not internal:
+        return result
+    return BrainResult.failure(
+        "Aurora emitted an internal capability request instead of an "
+        "answer; the request payload was withheld.",
+        model,
+    )
+
+
 @dataclass
 class Segment:
     """One generation within a cognitive session. Runtime only."""
@@ -506,6 +541,11 @@ class CognitiveLoop:
         # for the whole session. Never rebuilt per segment.
         messages = list(instructed)
         seen: dict[str, int] = {}
+        # Signatures that already ran successfully this turn. A repeat after
+        # success is redundant and is refused; a repeat after failure is a
+        # legitimate retry and still passes through ``seen``.
+        succeeded_signatures: set[str] = set()
+        repeat_granted = False
         result: Optional[BrainResult] = None
         # A rejected capability has to be given one more chance.
         #
@@ -542,6 +582,11 @@ class CognitiveLoop:
         # reach the user as though it were an answer, or a recall that
         # succeeded.
         protocol_granted = False
+        # Fifth, independent of capabilities: a claimed memory update is
+        # checked against what was actually stored. Persistence happens in
+        # the Mind and can silently refuse or fail, so the loop will not
+        # hand the user a success that was never written.
+        update_granted = False
 
         # Length of `messages` as of the last successful build. The
         # end-of-turn persist compares against it to see rows a correction
@@ -565,7 +610,8 @@ class CognitiveLoop:
             except ContextTooLargeError as exc:
                 trace.stop_reason = "context_too_large"
                 if result is not None:
-                    return result
+                    return _answer_result(
+                        result, extract, self._brain.get_model_name())
                 return BrainResult.failure(
                     str(exc), self._brain.get_model_name()
                 )
@@ -573,7 +619,8 @@ class CognitiveLoop:
                 # A broken segment must end the session, never retry.
                 trace.stop_reason = f"build_failed: {type(exc).__name__}"
                 if result is not None:
-                    return result
+                    return _answer_result(
+                        result, extract, self._brain.get_model_name())
                 return BrainResult.failure(
                     f"context_build_failed: {exc}",
                     self._brain.get_model_name(),
@@ -591,7 +638,8 @@ class CognitiveLoop:
             except Exception as exc:
                 trace.stop_reason = f"generate_failed: {type(exc).__name__}"
                 if result is not None:
-                    return result
+                    return _answer_result(
+                        result, extract, self._brain.get_model_name())
                 return BrainResult.failure(
                     f"generation_failed: {exc}", self._brain.get_model_name()
                 )
@@ -693,6 +741,38 @@ class CognitiveLoop:
                         })},
                     ]
                     continue
+                # A claimed memory update ("your favorite color has been
+                # updated to violet") is a claim about a write. The Mind
+                # owns the stored value and the loop owns the answer path,
+                # so the Mind is asked whether the claim is backed. One
+                # correction turn, then the claim is never printed as a
+                # success it was not.
+                update_error = None
+                verifier = getattr(
+                    self._mind, "preference_update_claim_error", None)
+                if verifier is not None:
+                    try:
+                        update_error = verifier(content)
+                    except Exception:
+                        update_error = None
+                if update_error is not None:
+                    if update_granted:
+                        segment.requested = False
+                        trace.stop_reason = "unbacked_memory_change"
+                        return BrainResult.failure(
+                            "Aurora claimed a memory update that was not "
+                            "saved, then repeated the claim after being "
+                            "corrected.",
+                            self._brain.get_model_name())
+                    update_granted = True
+                    messages = messages + [
+                        {"role": "assistant", "content": content},
+                        {"role": "tool", "content": json.dumps({
+                            "status": "failure", "output": None,
+                            "error": update_error,
+                        })},
+                    ]
+                    continue
                 # A citation that points at a source number no search in this
                 # process ever produced is corrected the same way: a tool
                 # turn naming the real numbers, and one chance to fix it.
@@ -769,6 +849,28 @@ class CognitiveLoop:
             signature = _request_signature(
                 getattr(request, "action", ""), payload, context_data, metadata
             )
+            # Re-running a request that already succeeded is redundant: the
+            # result is in the context and nothing new can come of it. Give
+            # the model one correction turn to answer from that result, then
+            # stop instead of executing again.
+            if signature in succeeded_signatures:
+                if repeat_granted:
+                    trace.stop_reason = "repeated_request"
+                    break
+                repeat_granted = True
+                messages = messages + [
+                    {"role": "assistant", "content": generated.content},
+                    {"role": "tool", "content": json.dumps({
+                        "status": "failure", "output": None,
+                        "error": (
+                            "repeated_request: this exact request already "
+                            "ran successfully this turn. Do not request it "
+                            "again; answer from the result you already "
+                            "have, or ask for something different."
+                        ),
+                    })},
+                ]
+                continue
             # A signature may be executed at most `self.max_repeats` times per
             # session. Once the allowance is spent, a further identical request
             # stops the loop rather than repeating forever.
@@ -793,6 +895,8 @@ class CognitiveLoop:
             # she has not acted on yet, which is the case that gets the extra
             # cycle.
             failure_pending = '"status": "failure"' in tool_content
+            if not failure_pending:
+                succeeded_signatures.add(signature)
             recovery_granted = False
 
             # Internal segments continue as context, never as separate
@@ -816,7 +920,7 @@ class CognitiveLoop:
                 "cognitive_loop_produced_no_segment",
                 self._brain.get_model_name(),
             )
-        return result
+        return _answer_result(result, extract, self._brain.get_model_name())
 
     def _persist_turn(
         self,

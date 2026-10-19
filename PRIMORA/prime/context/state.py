@@ -474,8 +474,16 @@ _SLOT_PHRASE_JUNK_RE = re.compile(
 _ANSWER_VOID = frozenset({
     "yes", "no", "yeah", "yep", "nope", "nah", "ok", "okay", "sure",
     "thanks", "thank you", "maybe", "idk", "dunno", "nothing", "none",
-    "not sure", "dont know", "don't know",
+    "not sure", "dont know", "don't know", "hi", "hello", "hey", "hiya",
+    "howdy", "yo", "sup", "greetings", "good morning", "good afternoon",
+    "good evening", "whats up", "what's up",
 })
+_GREETING_RE = re.compile(
+    r"^(?:hi|hello|hey|hiya|howdy|yo|sup|greetings|"
+    r"good\s+(?:morning|afternoon|evening)|what'?s\s+up)"
+    r"(?:\s+(?:there|again|aurora))?[!.,]*$",
+    re.IGNORECASE,
+)
 # A bare elliptical answer is a noun phrase, never a question or an
 # instruction aimed at the assistant ("List my previous favorite
 # colors." must not become a favorite-color value).
@@ -483,33 +491,123 @@ _BARE_VERB_RE = re.compile(
     r"^(?:what|when|where|why|who|whose|which|how|is|are|was|were|do|does|"
     r"did|can|could|would|should|will|please|list|tell|show|give|say|"
     r"describe|explain|remind|remember|name|check|find|search|look|read|"
-    r"repeat)\b",
+    r"repeat|compare|use|stop|wait|listen|try|make|go|come|keep|run|set|"
+    r"let|help|think|know|want|need)\b",
+    re.IGNORECASE,
+)
+# A noun-phrase value must not contain a finite clause ("your info are
+# wrong"), a second-person address ("you are useless"), or a first-person
+# statement ("i meant that").
+_CLAUSE_WORD_RE = re.compile(
+    r"\b(?:am|is|are|was|were|be|been|being|do|does|did|have|has|had|"
+    r"will|would|shall|should|can|could|may|might|must)\b",
+    re.IGNORECASE,
+)
+_SECOND_PERSON_RE = re.compile(
+    r"\b(?:you|your|yours|you're|youre)\b", re.IGNORECASE
+)
+# A change the user announces but has not yet valued: "i wanna change my fav
+# color to something else". The slot is named ("my fav color"); the value is
+# whatever the next elliptical turn supplies.
+_CHANGE_INTENT_RE = re.compile(
+    r"\b(?:change|update|set|switch|pick|choose)\s+(?:my|the)\s+"
+    r"([a-z][a-z'\-]*(?:\s+[a-z][a-z'\-]*){0,5}?)"
+    r"\s*(?=\s+(?:to|into|back|again)\b|[,.;!?]|$)",
+    re.IGNORECASE,
+)
+# The assistant side of the same exchange: a question or an invitation to
+# supply a value ("What would you like your new favorite color to be?",
+# "please let me know your new favorite color").
+_ASSISTANT_ASK_RE = re.compile(
+    r"\?\s*$|\b(?:let me know|tell me|remind me|what(?:'s| is)|which)\b",
+    re.IGNORECASE,
+)
+# Second-person slot reference in an assistant turn. Only "favorite X"
+# phrasings qualify, because the question is about a preference the user is
+# being invited to state, and the registry (not this regex) decides whether
+# the noun names a real slot.
+_SECOND_PERSON_SLOT_RE = re.compile(
+    r"\b(?:my|your)\s+(?:(?:new|current|latest)\s+)?"
+    r"((?:fav|favorite|favourite)\s+[a-z][a-z'\-]*)"
+    r"\s*(?=\s+(?:to|be|is|are|now|and|or)\b|[,.;!?]|$)",
     re.IGNORECASE,
 )
 
 
-def _question_slot_phrase(question) -> Optional[str]:
-    """The "my X" subject a prior question asked about, else None.
+def _plausible_answer_value(text: str, max_words: int) -> bool:
+    raw = (text or "").strip()
+    if not raw or len(raw.split()) > max_words:
+        return False
+    if _GREETING_RE.match(raw):
+        return False
+    if any(mark in raw for mark in (",", "?", ":")):
+        return False
+    if _CLAUSE_WORD_RE.search(raw):
+        return False
+    if _SECOND_PERSON_RE.search(raw):
+        return False
+    if re.match(r"^(?:i|we|my|our|me|us)\b", raw, re.IGNORECASE):
+        return False
+    if normalize_value(raw).lower() in _ANSWER_VOID:
+        return False
+    return True
 
-    Deterministic: only a question-like message whose trailing subject
-    reads "my <phrase>" maps ("what is my favorite color?" -> "favorite
-    color"). Anything else yields None, so no fact is invented.
-    """
-    if not isinstance(question, str):
-        return None
-    q = question.strip()
-    if not q or not _QUESTION_LIKE_RE.search(q):
-        return None
-    q = q.split("?", 1)[0].strip().lower()
-    match = _SLOT_PHRASE_RE.search(q)
-    if not match:
-        return None
-    phrase = match.group(1).strip()
+
+def _plausible_bare_answer(text: str, max_words: int) -> bool:
+    if not _plausible_answer_value(text, max_words):
+        return False
+    if _BARE_VERB_RE.match((text or "").strip()):
+        return False
+    return True
+
+
+def _clean_slot_phrase(phrase: str) -> Optional[str]:
+    """Validate one candidate slot phrase; the registry gates the rest."""
+    phrase = (phrase or "").strip().strip(" .,;:!?")
     if not phrase or len(phrase.split()) > 6:
         return None
     if _SLOT_PHRASE_JUNK_RE.search(phrase):
         return None
-    return phrase
+    return phrase.lower()
+
+
+def _question_slot_phrase(
+    question, allow_second_person: bool = False
+) -> Optional[str]:
+    """The "my X" subject a prior turn named, else None.
+
+    Deterministic. A question-like message maps through its trailing
+    subject ("what is my favorite color?" -> "favorite color"). A user
+    turn announcing a change maps through the slot it names ("i wanna
+    change my fav color to something else" -> "fav color"). With
+    ``allow_second_person``, an assistant question or invitation may name
+    the slot in the second person ("your new favorite color"). Anything
+    else yields None, so no fact is invented.
+    """
+    if not isinstance(question, str):
+        return None
+    q = question.strip()
+    if not q:
+        return None
+    question_like = _QUESTION_LIKE_RE.search(q) is not None
+    if not question_like:
+        if allow_second_person:
+            if not _ASSISTANT_ASK_RE.search(q):
+                return None
+        else:
+            match = _CHANGE_INTENT_RE.search(q)
+            return _clean_slot_phrase(match.group(1)) if match else None
+    q = q.split("?", 1)[0].strip().lower()
+    match = _SLOT_PHRASE_RE.search(q)
+    if match:
+        phrase = _clean_slot_phrase(match.group(1))
+        if phrase:
+            return phrase
+    if allow_second_person:
+        match = _SECOND_PERSON_SLOT_RE.search(question.strip())
+        if match:
+            return _clean_slot_phrase(match.group(1))
+    return None
 
 
 def _anaphora_value(text: str) -> str:
@@ -528,20 +626,14 @@ def _anaphora_value(text: str) -> str:
         value = normalize_value(match.group(1).strip())
     else:
         # Bare answers are short noun phrases: at most three words, no
-        # comma-separated lists, no questions, no instructions. Longer
-        # elliptical answers use the copular form ("It's X") instead.
-        if len(raw.split()) > 3:
-            return ""
-        if "," in raw or "?" in raw:
-            return ""
-        if _BARE_VERB_RE.match(raw):
-            return ""
-        if re.match(r"^(?:i|we|my|our|me|us)\b", raw, re.IGNORECASE):
-            return ""
-        if normalize_value(raw).lower() in _ANSWER_VOID:
+        # comma-separated lists, no questions, no instructions, and no
+        # finite clause ("compare there engine", "you are useless").
+        if not _plausible_bare_answer(raw, 3):
             return ""
         value = normalize_value(raw)
     if not value or len(value) > 60:
+        return ""
+    if _GREETING_RE.match(value):
         return ""
     if value.lower() in _ANSWER_VOID:
         return ""
@@ -549,15 +641,16 @@ def _anaphora_value(text: str) -> str:
 
 
 def _expand_with_context(
-    text: str, context_question: str
+    text: str, context_question: str, allow_second_person: bool = False
 ) -> list[StateCandidate]:
-    """Resolve an elliptical reply against the question it answers.
+    """Resolve an elliptical reply against the turn it answers.
 
     Synthesises the equivalent direct statement ("my favorite color is
     yellow") and routes it through the slot registry. No slot match means
     no candidate: never a note, never a guess.
     """
-    phrase = _question_slot_phrase(context_question)
+    phrase = _question_slot_phrase(
+        context_question, allow_second_person=allow_second_person)
     if not phrase:
         return []
     value = _anaphora_value(text)
@@ -567,15 +660,21 @@ def _expand_with_context(
 
 
 def extract_candidates(
-    text: str, role: str, context_question: Optional[str] = None
+    text: str,
+    role: str,
+    context_question: Optional[str] = None,
+    assistant_question: Optional[str] = None,
 ) -> list[StateCandidate]:
     """Extract state candidates from user-authored text only.
 
-    ``context_question`` is the user's immediately preceding question when
+    ``context_question`` is the user's own immediately preceding turn when
     this message answers it elliptically ("It's yellow." after "what is my
-    favorite color?"). It is consulted only as a last resort, only for
-    slot-mappable questions, and only through the slot registry — without
-    it extraction behaves exactly as before.
+    favorite color?", or "violet" after "i wanna change my fav color to
+    something else"). ``assistant_question`` is the assistant turn
+    immediately before this message, consulted only when the user context
+    resolved nothing and only when that turn asked for or invited the
+    value. Both are last resorts, mapped only through the slot registry —
+    without them extraction behaves exactly as before.
     """
     if role != "user" or not isinstance(text, str):
         return []
@@ -622,10 +721,12 @@ def extract_candidates(
         cands = _extract_extended(head, scope)
     if not cands and corrected:
         # Bare correction ("Actually, green."): a value with no parseable
-        # concept. Resolve by inheritance in apply, else hold pending.
-        val = normalize_value(head)
-        if val and len(val.split()) <= 12:
-            cands = [StateCandidate("", val, "correct", scope)]
+        # concept. Resolve by inheritance in apply, else hold pending. The
+        # remainder must still be a value, not an unrelated clause
+        # ("no your info are wrong") that would overwrite the tracked fact.
+        if _plausible_answer_value(head, 12):
+            cands = [StateCandidate(
+                "", normalize_value(head), "correct", scope)]
     if not cands and not corrected:
         # Meaningful personal statements that fit no slot and no legacy
         # pattern ("I'm allergic to penicillin") become capped, deduped
@@ -663,9 +764,16 @@ def extract_candidates(
                                           confidence=0.3) for c in inner]
         # Elliptical reply ("It's yellow.") resolved against the prior
         # question. The slot registry gates the result, so an unsupported
-        # pairing falls through to the ordinary empty outcome below.
+        # pairing falls through to the ordinary empty outcome below. The
+        # assistant turn is consulted only when the user's own turn named
+        # nothing, so "violet" after an invitation still lands in the slot
+        # the invitation asked about.
         if context_question:
             cands = _expand_with_context(stripped_head, context_question)
+        if not cands and assistant_question:
+            cands = _expand_with_context(
+                stripped_head, assistant_question,
+                allow_second_person=True)
         if not cands and _HEDGE_RE.search(work):
             trimmed = work[:200].strip()
             if trimmed:
@@ -1378,3 +1486,90 @@ def check_assistant_conflict(
     except Exception as e:
         diagnostics.append(f"state_failed: state write failed: {e}")
     return diagnostics
+
+
+# --- Update claims must match what was stored ----------------------------
+# "Your favorite color has been updated to violet!" is a claim about a
+# write, not about the world. Persistence happens in the Mind and can fail
+# or refuse an ambiguous value, so the loop checks the claim against the
+# stored current value before the reply reaches the user. The patterns are
+# deliberately narrow: only completed updates, never a future or
+# conditional statement ("I'll update it when you tell me").
+_UPDATE_CLAIM_PATTERNS = (
+    re.compile(
+        r"\b(?:i(?:'ve| have|'d)?\s+)?(?:updated|changed|set|saved|recorded"
+        r"|noted)\s+(?:your|the user'?s)\s+(?:new\s+)?"
+        r"((?:fav|favorite|favourite)\s+[a-z][a-z'\-]*)"
+        r"\s+to\s+([^.!?\n,]+)",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:your|the user'?s)\s+(?:new\s+)?"
+        r"((?:fav|favorite|favourite)\s+[a-z][a-z'\-]*)"
+        r"\s+(?:(?:has|have|was|were)\s+been\s+(?:updated|changed|set)"
+        r"\s+to|is\s+now|is\s+(?:updated|changed|set)\s+to)\s*"
+        r"([^.!?\n,]+)",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _favorite_concept(noun: str) -> Optional[str]:
+    """Canonical stored concept for a claimed "favorite X" update."""
+    words = (noun or "").lower().split()
+    if not words or words[0] not in ("fav", "favorite", "favourite"):
+        return None
+    rest = " ".join(words[1:]).strip()
+    if not rest:
+        return None
+    canonical = slots_mod.favorite_noun(rest)
+    if not canonical:
+        return None
+    return "favorite " + canonical
+
+
+def preference_update_claim_error(store: Any, text: str) -> Optional[str]:
+    """Correction when a completed update claim has no stored change.
+
+    Returns None for anything that is not a completed "favorite X" update
+    claim, for a claim that matches the stored current value, and when the
+    store cannot be read (the caller stays silent rather than risk a false
+    correction). When the claim is unbacked, the returned text tells the
+    model exactly what is stored so it can answer honestly.
+    """
+    if not isinstance(text, str) or not text:
+        return None
+    claimed = None
+    for pattern in _UPDATE_CLAIM_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            claimed = (match.group(1), match.group(2))
+            break
+    if claimed is None:
+        return None
+    concept = _favorite_concept(claimed[0])
+    if concept is None:
+        return None
+    value = normalize_value(claimed[1].strip())
+    if not value:
+        return None
+    try:
+        rows = store.fetch_states(scope="global", status="current")
+    except Exception:
+        return None
+    current = [s for s in rows if (s.concept or "") == concept]
+    if current and (current[0].value or "").strip().lower() == value.lower():
+        return None
+    if not current:
+        return (
+            "unbacked_memory_change: your reply says the user's %s was "
+            "updated to %r, but no such fact is stored and nothing was "
+            "saved. Do not claim it was saved; say you do not have it, or "
+            "ask the user to state it." % (concept, value)
+        )
+    return (
+        "unbacked_memory_change: your reply says the user's %s was updated "
+        "to %r, but the stored current value is %r. That change was not "
+        "saved. Do not claim it happened; use the stored value or ask the "
+        "user to restate the change." % (concept, value, current[0].value)
+    )

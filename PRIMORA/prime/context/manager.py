@@ -87,6 +87,33 @@ SESSION_HISTORY_MARKERS = (
     "prior name",
 )
 
+# A broad self-knowledge question ("what do you know about me?") has no
+# term to overlap a stored fact with, so the overlap gate alone can never
+# answer it. These markers open the session retention rule to global facts
+# for that question only; a slot-naming question ("what are my favorite
+# colors?") does not match and stays overlap-only.
+SELF_KNOWLEDGE_RE = re.compile(
+    r"\b(?:about me|about myself)\b"
+    r"|\bmy (?:preferences|favorites|favourites|likes|interests|profile|"
+    r"details)\b",
+    re.IGNORECASE,
+)
+
+_FAVORITE_QUERY_RE = re.compile(
+    r"\b(?:my\s+)?(?:fav|favorite|favourite)\s+"
+    r"([a-z][a-z'\-]*(?:\s+[a-z][a-z'\-]*){0,3})",
+    re.IGNORECASE,
+)
+_QUESTION_RE = re.compile(
+    r"\?\s*$|^\s*(?:what|whats|which|who|whose|where|when|why|how|"
+    r"do|did|can|could|would|tell|remind|recall|list)\b",
+    re.IGNORECASE,
+)
+_CATEGORY_END_RE = re.compile(
+    r"\b(?:is|are|was|were|do|does|did|i|you|we|they|and)\b",
+    re.IGNORECASE,
+)
+
 CROSS_SESSION_CAP = 3
 
 # Roles that carry internal control flow rather than conversation.
@@ -188,6 +215,7 @@ class ContextManager:
         shadow_retrieval: Optional[bool] = None,
         semantic_index=None,
         hybrid_retrieval: Optional[bool] = None,
+        include_foreign_history: bool = True,
     ):
         self._db_path = db_path
         self._budget = budget or BudgetConfig.from_env()
@@ -209,6 +237,11 @@ class ContextManager:
                 "PRIMORA_HYBRID_SHADOW", ""
             ).strip().lower() in ("1", "true", "yes", "on")
         self._shadow_retrieval = bool(shadow_retrieval)
+        # Isolation escape hatch for history-free harnesses. Stored facts and
+        # their sources still flow; only other sessions' verbatim conversation
+        # is withheld. The live runtime never turns this off, so the normal
+        # cross-session provenance tag is unchanged.
+        self._include_foreign_history = bool(include_foreign_history)
         self._semantic_index = semantic_index
         self._shadow_records: list[ShadowComparison] = []
         self._retrieval_traces: list[RetrievalTrace] = []
@@ -227,6 +260,18 @@ class ContextManager:
         admission path, which is retained verbatim.
         """
         self._hybrid_retrieval = bool(enabled)
+
+    @property
+    def include_foreign_history(self) -> bool:
+        return self._include_foreign_history
+
+    def set_include_foreign_history(self, enabled: bool) -> None:
+        """Withhold (or restore) other sessions' verbatim messages.
+
+        An explicit isolated-test switch, not a production toggle. Stored
+        states, their provenance, and this session's own turns are unaffected.
+        """
+        self._include_foreign_history = bool(enabled)
 
     @property
     def shadow_retrieval(self) -> bool:
@@ -480,7 +525,10 @@ class ContextManager:
             ordered.append(message)
 
         same = [m for m in ordered if m.session_id == session_id]
-        foreign = [m for m in ordered if m.session_id != session_id]
+        foreign = (
+            [m for m in ordered if m.session_id != session_id]
+            if self._include_foreign_history else []
+        )
         out: list[dict[str, Any]] = []
         for message, is_foreign in (
             [(m, False) for m in same]
@@ -1353,6 +1401,7 @@ class ContextManager:
         diagnostics.extend(session_diags)
         next_seq = 0
         prior_user: Optional[str] = None
+        prior_assistant: Optional[str] = None
         for pos, msg in enumerate(messages):
             role = str(msg.get("role", "user"))
             content = str(msg.get("content", ""))
@@ -1387,19 +1436,27 @@ class ContextManager:
                     # the same persisted message id, and is independently
                     # guarded so it can never suppress or alter M4.
                     # An elliptical user reply is resolved against the
-                    # question that preceded it (snapshot first, then the
-                    # store for legacy single-message callers).
+                    # turn that preceded it: the user's own question or
+                    # change announcement first, then the assistant's
+                    # question/invitation. Snapshot first, then the store
+                    # for legacy single-message callers.
                     context_question = None
+                    assistant_question = None
                     if role == "user":
                         context_question = prior_user
+                        assistant_question = prior_assistant
                         if context_question is None:
                             context_question = self._prior_user_text(
+                                store, session_id, message_id
+                            )
+                        if assistant_question is None:
+                            assistant_question = self._prior_assistant_text(
                                 store, session_id, message_id
                             )
                     diagnostics.extend(
                         self._extract_states(
                             store, session_id, message_id, role, content,
-                            context_question,
+                            context_question, assistant_question,
                         )
                     )
                     if role == "user":
@@ -1414,6 +1471,8 @@ class ContextManager:
                 break
             if role == "user":
                 prior_user = content
+            elif role == "assistant":
+                prior_assistant = content
         return diagnostics
 
     @staticmethod
@@ -1445,12 +1504,13 @@ class ContextManager:
         role: str,
         content: str,
         context_question: Optional[str] = None,
+        assistant_question: Optional[str] = None,
     ) -> list[str]:
         """Deterministic state extraction. Never invents on failure."""
         try:
             if role == "user":
                 candidates = state_mod.extract_candidates(
-                    content, role, context_question
+                    content, role, context_question, assistant_question
                 )
                 if not candidates:
                     return []
@@ -1483,6 +1543,39 @@ class ContextManager:
             if row.role == "user" and row.message_id != exclude_id:
                 return row.content
         return None
+
+    @staticmethod
+    def _prior_assistant_text(
+        store, session_id: str, exclude_id: int
+    ) -> Optional[str]:
+        """Most recent stored assistant message other than the current row.
+
+        The assistant's own question or invitation is legitimate context
+        for an elliptical reply ("violet" after "please let me know your
+        new favorite color"), and a legacy single-message caller has no
+        snapshot to read it from. Bounded and failure-silent.
+        """
+        try:
+            rows = store.fetch_latest(session_id, 8)
+        except Exception:
+            return None
+        for row in reversed(rows):
+            if row.role == "assistant" and row.message_id != exclude_id:
+                return row.content
+        return None
+
+    def preference_update_claim_error(self, text: str) -> Optional[str]:
+        """Store-backed check for a claimed preference update.
+
+        Returns a correction text when the reply says a "favorite X" was
+        updated but the stored current value does not match, and None when
+        the claim is backed or the store cannot be read. Never raises.
+        """
+        try:
+            store = self._get_store()
+        except Exception:
+            return None
+        return state_mod.preference_update_claim_error(store, text)
 
     # ------------------------------------------------------------------
     # Transcript reload
@@ -1689,6 +1782,7 @@ class ContextManager:
 
         raw_count = self._raw_count(session_id)
         degraded = False
+        fact_msgs: list[dict] = []
 
         # 5. Structured authority first: current session metadata, then
         # current scoped state. Both outrank free-form retrieval below.
@@ -1704,6 +1798,7 @@ class ContextManager:
             state_total = self._add_current_state(
                 session_id, current, selected, selected_fps,
                 selected_texts, counter, cfg, total, diagnostics,
+                facts_out=fact_msgs,
             )
             total = state_total
         except Exception as e:
@@ -1756,8 +1851,10 @@ class ContextManager:
             diagnostics.append(f"memory_failed: {e}")
 
         # 9. Reassembly: system instruction, then synthesized context
-        # (digests/memory, oldest first), then conversation in original
-        # chronological order with the current turn in its true position.
+        # (working memory, session info, retrieval adjuncts), then the
+        # conversation in original chronological order. Current facts are
+        # placed immediately before the current turn so they follow, and
+        # outrank, any older assistant claim or denial the same turn admits.
         history_pos = {id(m): i for i, m in enumerate(history)}
         convo = [m for m in selected if id(m) in history_pos]
         if current is not None and all(m is not current for m in convo):
@@ -1766,15 +1863,31 @@ class ContextManager:
         # NOTE: system_msg lives in `selected` (as the protected base) but
         # is prepended explicitly below, so it must be excluded here to
         # avoid emitting the system instruction twice.
+        fact_ids = {id(m) for m in fact_msgs}
         synth = [
             m for m in selected
             if id(m) not in history_pos
             and not (system_msg is not None and m is system_msg)
+            and id(m) not in fact_ids
         ]
+        before_current: list[dict] = []
+        after_current: list[dict] = []
+        seen_current = False
+        for m in convo:
+            if m is current:
+                seen_current = True
+                continue
+            if seen_current:
+                after_current.append(m)
+            else:
+                before_current.append(m)
         ordered = (
             ([system_msg] if system_msg is not None else [])
             + synth
-            + [m for m in convo if not (system_msg is not None and m is system_msg)]
+            + before_current
+            + fact_msgs
+            + ([current] if current is not None else [])
+            + after_current
         )
 
         allowed = max(
@@ -1953,6 +2066,8 @@ class ContextManager:
         diagnostics: list[str],
         history_requested: bool = False,
     ) -> list[tuple[float, str, int, StoredMessage, dict[str, float]]]:
+        if not self._include_foreign_history:
+            return []
         store = self._get_store()
         candidates: list[StoredMessage] = []
         seen_ids: set[int] = set()
@@ -2168,7 +2283,10 @@ class ContextManager:
             ordered.append(message)
 
         same = [m for m in ordered if m.session_id == session_id]
-        foreign = [m for m in ordered if m.session_id != session_id]
+        foreign = (
+            [m for m in ordered if m.session_id != session_id]
+            if self._include_foreign_history else []
+        )
         admitted: list[dict] = []
         limit = hybrid_mod.MAX_CANDIDATES
         emitted = 0
@@ -2256,6 +2374,8 @@ class ContextManager:
         diagnostics: list[str],
         cap: int = 3,
     ) -> tuple[list[dict], int]:
+        if not self._include_foreign_history:
+            return [], total
         admitted: list[dict] = []
         for _, _, _, hit, _breakdown in scored[:cap]:
             if total >= cfg.input_ceiling:
@@ -2312,6 +2432,10 @@ class ContextManager:
     def _wants_history(text: str) -> bool:
         lowered = (text or "").lower()
         return any(m in lowered for m in HISTORY_MARKERS)
+
+    @staticmethod
+    def _wants_self_knowledge(text: str) -> bool:
+        return bool(SELF_KNOWLEDGE_RE.search(text or ""))
 
     @staticmethod
     def _normalize_ident(text: str) -> str:
@@ -2503,6 +2627,77 @@ class ContextManager:
             diagnostics.append(f"state_failed: cross-session failed: {e}")
         return total
 
+    @staticmethod
+    def _favorite_category(text: str) -> Optional[str]:
+        q = (text or "").strip()
+        if not q or not _QUESTION_RE.search(q):
+            return None
+        match = _FAVORITE_QUERY_RE.search(q)
+        if not match:
+            return None
+        phrase = _CATEGORY_END_RE.split(match.group(1), 1)[0].strip()
+        if not phrase:
+            return None
+        category = slots_mod.favorite_noun(phrase)
+        if not category or len(category.split()) > 4:
+            return None
+        return category
+
+    @staticmethod
+    def _current_message_id(store, session_id: str, current: Optional[dict]):
+        if not current:
+            return None
+        content = current.get("content", "")
+        if not content:
+            return None
+        seq = current.get("seq")
+        try:
+            if isinstance(seq, int) and not isinstance(seq, bool):
+                for row in store.fetch_range(session_id, seq, seq):
+                    if row.role == "user" and row.content == content:
+                        return row.message_id
+            for row in reversed(store.fetch_latest(session_id, 4)):
+                if row.role == "user" and row.content == content:
+                    return row.message_id
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _state_context_matches(store, state, category: str,
+                               exclude_id: Optional[int] = None) -> bool:
+        terms = {
+            scoring_mod.singular(term)
+            for term in scoring_mod.tokenize(category)
+        }
+        if not terms:
+            return False
+        try:
+            sources = store.fetch_messages_by_ids(list(state.source_ids)[:2])
+        except Exception:
+            return False
+        for source in sources:
+            if source.role != "user":
+                continue
+            try:
+                window = store.fetch_range(
+                    source.session_id, max(0, source.seq - 3),
+                    source.seq + 3, limit=12,
+                )
+            except Exception:
+                window = [source]
+            found = {
+                scoring_mod.singular(term)
+                for message in window
+                if message.role == "user"
+                and message.message_id != exclude_id
+                and _QUESTION_RE.search(message.content)
+                for term in scoring_mod.tokenize(message.content)
+            }
+            if terms <= found:
+                return True
+        return False
+
     def _add_current_state(
         self,
         session_id: str,
@@ -2514,11 +2709,13 @@ class ContextManager:
         cfg: BudgetConfig,
         total: int,
         diagnostics: list[str],
+        facts_out: Optional[list[dict]] = None,
     ) -> int:
         store = self._get_store()
         evaluation_time = time.time()
         query_text = current.get("content", "") if current else ""
         query_terms = scoring_mod.build_query(query_text)
+        current_id = self._current_message_id(store, session_id, current)
 
         # Session scope only: another session's current value must never
         # answer for this session. Cross-session questions are handled
@@ -2551,9 +2748,19 @@ class ContextManager:
         # full ceiling whatever its scope - the question named it. A
         # non-overlapping one is admitted only inside the state reserve, so
         # it can never displace history or a fact the question named, and
-        # only from this session: an unrelated global must still earn its
-        # place by overlapping, so it cannot crowd a turn out of the
-        # session's own memory.
+        # only from this session or on a broad self-knowledge question: an
+        # unrelated global must still earn its place by overlapping, so it
+        # cannot crowd a turn out of the session's own memory.
+        wants_self_knowledge = self._wants_self_knowledge(query_text)
+        bridge_category = (
+            self._favorite_category(query_text) if query_text else None
+        )
+        if bridge_category and any(
+            state.concept == f"favorite {bridge_category}"
+            or state.concept.startswith(f"favorite {bridge_category} ")
+            for state in current_states
+        ):
+            bridge_category = None
         ranked = []
         for st in current_states:
             overlap = scoring_mod.relevance(
@@ -2561,6 +2768,14 @@ class ContextManager:
             )
             ranked.append((overlap, st))
         ranked.sort(key=lambda r: (-r[0], -r[1].state_id, r[1].concept))
+        bridge_ids: set[int] = set()
+        if bridge_category:
+            for overlap, st in ranked:
+                if overlap > 0 or not st.concept.startswith("likes for "):
+                    continue
+                if self._state_context_matches(
+                        store, st, bridge_category, current_id):
+                    bridge_ids.add(st.state_id)
         reserve_limit = min(cfg.input_ceiling, cfg.input_target)
         # Facts render as plain sentences under one heading, never as a
         # machine format. The heading carries the usage guidance and is
@@ -2570,38 +2785,73 @@ class ContextManager:
         heading_msg = {"role": "system", "content": heading}
         heading_fp = f"system\x00{heading}"
         heading_added = False
+
+        def _emit(content: str, limit: int) -> None:
+            nonlocal total, heading_added
+            msg = {"role": "system", "content": content}
+            fp = f"system\x00{content}"
+            if fp in selected_fps:
+                return
+            cost = self._safe_count(counter, [msg], diagnostics)
+            if total + cost > limit:
+                return
+            if not heading_added:
+                if heading_fp in selected_fps:
+                    heading_added = True
+                else:
+                    heading_cost = self._safe_count(
+                        counter, [heading_msg], diagnostics)
+                    if total + heading_cost + cost <= cfg.input_ceiling:
+                        selected.append(heading_msg)
+                        selected_fps.add(heading_fp)
+                        selected_texts.append(heading)
+                        total += heading_cost
+                        if facts_out is not None:
+                            facts_out.append(heading_msg)
+                    heading_added = True
+            selected.append(msg)
+            selected_fps.add(fp)
+            selected_texts.append(content)
+            total += cost
+            if facts_out is not None:
+                facts_out.append(msg)
+
         for overlap, st in ranked:
             if total >= cfg.input_ceiling:
                 break
+            if st.state_id in bridge_ids:
+                continue
             if overlap > 0:
                 limit = cfg.input_ceiling
-            elif st.scope == session_id:
+            elif st.scope == session_id or wants_self_knowledge:
                 limit = reserve_limit
             else:
                 continue
             if total >= limit:
                 continue
-            content = slots_mod.render_sentence(st.concept, st.value)
-            msg = {"role": "system", "content": content}
-            fp = f"system\x00{content}"
-            if fp in selected_fps:
+            _emit(slots_mod.render_sentence(st.concept, st.value), limit)
+
+        for _, st in ranked:
+            if total >= cfg.input_ceiling:
+                break
+            if st.state_id not in bridge_ids:
                 continue
-            cost = self._safe_count(counter, [msg], diagnostics)
-            if total + cost > limit:
+            try:
+                sources = store.fetch_messages_by_ids(
+                    list(st.source_ids)[:2])
+            except Exception:
                 continue
-            if not heading_added and heading_fp not in selected_fps:
-                heading_cost = self._safe_count(
-                    counter, [heading_msg], diagnostics)
-                if total + heading_cost + cost <= cfg.input_ceiling:
-                    selected.append(heading_msg)
-                    selected_fps.add(heading_fp)
-                    selected_texts.append(heading)
-                    total += heading_cost
-                heading_added = True
-            selected.append(msg)
-            selected_fps.add(fp)
-            selected_texts.append(content)
-            total += cost
+            for source in sources:
+                if source.role != "user" or not source.content:
+                    continue
+                text = re.sub(r"\s+", " ", source.content).strip()
+                if len(text) > 300:
+                    text = text[:297].rstrip() + "..."
+                content = (
+                    f'The user said about their favorite {bridge_category}: '
+                    f'"{text}".'
+                )
+                _emit(content, cfg.input_ceiling)
 
         # Unresolved conflicts stay visible when relevant, never as truth.
         try:
