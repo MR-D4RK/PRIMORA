@@ -46,6 +46,12 @@ def fingerprint(session_id: str, seq: int, role: str, content: str) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+# System-row marker written when a conversation is cleared. Reloads start
+# after the newest marker, so a clear persists across restarts without
+# ever deleting a raw row.
+CONVERSATION_CLEARED = "<conversation cleared>"
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -431,6 +437,49 @@ class ContextStore:
                 (session_id, limit),
             ).fetchall()
         return [StoredMessage(*r) for r in reversed(rows)]
+
+    def fetch_conversation(
+        self, session_id: str, limit: int = 30
+    ) -> list[StoredMessage]:
+        """Latest conversational turns in chronological (insertion) order.
+
+        Row id is the chronology: legacy rows share seq positions, so
+        seq-ordered fetches interleave them wrong. Protocol traffic (system
+        instructions, prime_request bodies) is not conversation and is
+        excluded server-side so ``limit`` counts real turns only.
+        Everything at or before the newest clear marker is excluded as
+        well.
+        """
+        if limit <= 0:
+            return []
+        with self._connect() as con:
+            marker = con.execute(
+                "SELECT id FROM messages"
+                " WHERE session_id = ? AND role = 'system' AND content = ?"
+                " ORDER BY id DESC LIMIT 1",
+                (session_id, CONVERSATION_CLEARED),
+            ).fetchone()
+            after_id = marker[0] if marker is not None else -1
+            rows = con.execute(
+                "SELECT id, session_id, seq, role, content, timestamp,"
+                " fingerprint, importance FROM messages"
+                " WHERE session_id = ? AND id > ?"
+                " AND role IN ('user', 'assistant')"
+                " AND content NOT LIKE ?"
+                " ORDER BY id DESC LIMIT ?",
+                (session_id, after_id, "%<prime_request>%", int(limit)),
+            ).fetchall()
+        return [StoredMessage(*r) for r in reversed(rows)]
+
+    def max_seq(self, session_id: str) -> int:
+        """Highest stored sequence in this session, or -1 when there is none."""
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT COALESCE(MAX(seq), -1) FROM messages"
+                " WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return int(row[0])
 
     @staticmethod
     def _fts_phrase(term: str) -> str:

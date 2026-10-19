@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 import json
 import os
 import re
@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 
 from PRIMORA.logutil import emit_block
+from PRIMORA.aurora import request_shape
 
 
 @dataclass(frozen=True)
@@ -33,6 +34,8 @@ class Brain(ABC):
         self,
         messages: list[dict[str, str]],
         max_output_tokens: Optional[int] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> BrainResult:
         pass
 
@@ -343,6 +346,8 @@ class AuroraBrain(Brain):
         self,
         messages: list[dict[str, str]],
         max_output_tokens: Optional[int] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> BrainResult:
         if not isinstance(messages, list) or not messages:
             return BrainResult.failure(
@@ -612,6 +617,8 @@ class OpenAIBrain(Brain):
         self,
         messages: list[dict[str, str]],
         max_output_tokens: Optional[int] = None,
+        on_delta: Optional[Callable[[str], None]] = None,
+        cancelled: Optional[Callable[[], bool]] = None,
     ) -> BrainResult:
         if not isinstance(messages, list) or not messages:
             return BrainResult.failure(
@@ -646,7 +653,7 @@ class OpenAIBrain(Brain):
         request_body: dict = {
             "model": self._model,
             "messages": messages,
-            "stream": False,
+            "stream": on_delta is not None,
             "max_tokens": generation_tokens,
             "temperature": self._config.temperature,
             "top_p": self._config.top_p,
@@ -675,7 +682,11 @@ class OpenAIBrain(Brain):
                         f"{resp.read().decode('utf-8')}",
                         self.get_model_name(),
                     )
-                response_data = json.loads(resp.read().decode("utf-8"))
+                if on_delta is None:
+                    response_data = json.loads(resp.read().decode("utf-8"))
+                else:
+                    return self._generate_streaming(
+                        resp, on_delta, cancelled)
 
         except urllib.error.HTTPError as e:
             return BrainResult.failure(
@@ -737,3 +748,109 @@ class OpenAIBrain(Brain):
             )
 
         return BrainResult.success(content, self.get_model_name())
+
+    def _generate_streaming(
+        self,
+        resp,
+        on_delta: Callable[[str], None],
+        cancelled: Optional[Callable[[], bool]] = None,
+    ) -> BrainResult:
+        """Read Server-Sent Events from a streaming response and forward
+        only user-facing content deltas to ``on_delta``.
+
+        Reasoning content is never forwarded. Incomplete internal-request
+        markup and incomplete thinking fences are withheld until they close
+        (or never, if the stream ends first) so raw internal structure
+        never reaches the user. The returned answer is cleaned with
+        ``_strip_thinking`` to match the non-streaming path.
+        """
+        buffer = ""
+        emitted_len = 0
+        try:
+            for event in self._iter_sse(resp):
+                if cancelled is not None and cancelled():
+                    break
+                if event is None:
+                    continue
+                data = event.get("data")
+                if data == "[DONE]":
+                    break
+                if not isinstance(data, str):
+                    continue
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    # Malformed event: skip it, keep the stream alive.
+                    continue
+                choices = chunk.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+                # reasoning_content is hidden: never forwarded to the UI.
+                content_delta = delta.get("content") or ""
+                if not content_delta:
+                    continue
+                buffer += content_delta
+                safe = request_shape.displayable_text(buffer)
+                new = safe[emitted_len:]
+                if new:
+                    emitted_len = len(safe)
+                    try:
+                        on_delta(new)
+                    except Exception:
+                        # A callback must never kill the stream.
+                        pass
+        finally:
+            resp.close()
+
+        content = self._strip_thinking(buffer)
+        if not content:
+            # Inspect the last event for a finish reason when available.
+            return BrainResult.failure(
+                "Model returned empty response (streaming)",
+                self.get_model_name(),
+            )
+        return BrainResult.success(content, self.get_model_name())
+
+    def _iter_sse(self, resp):
+        """Yield parsed SSE event dicts from the raw HTTP response lines.
+
+        Yields ``None`` for blank/comment separators is avoided; only
+        events with at least one field are yielded. The terminal
+        ``data: [DONE]`` is yielded as ``{"data": "[DONE]"}}``.
+        """
+        field_lines = []
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="replace")
+            if line.endswith("\n"):
+                line = line[:-1]
+            if line.endswith("\r"):
+                line = line[:-1]
+            if line == "":
+                if field_lines:
+                    yield self._parse_sse_fields(field_lines)
+                    field_lines = []
+                continue
+            if line.startswith(":"):
+                continue
+            field_lines.append(line)
+        if field_lines:
+            yield self._parse_sse_fields(field_lines)
+
+    @staticmethod
+    def _parse_sse_fields(lines):
+        fields = {}
+        data_chunks = []
+        for line in lines:
+            if ":" not in line:
+                continue
+            field, _, value = line.partition(":")
+            if value.startswith(" "):
+                value = value[1:]
+            if field == "data":
+                data_chunks.append(value)
+            else:
+                fields[field] = value
+        if data_chunks:
+            fields["data"] = "\n".join(data_chunks)
+        return fields or None

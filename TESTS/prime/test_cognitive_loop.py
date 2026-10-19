@@ -485,7 +485,8 @@ class TestMindAndWorkingMemory:
 
 
 # ======================================================================
-# 5. Persistence semantics unchanged
+# 5. Persistence semantics: same snapshot/sequence/fingerprint rules;
+#    the closing reply is additionally written before run() returns.
 # ======================================================================
 class TestPersistenceUnchanged:
     def test_segments_are_reconciled_with_the_same_snapshot_shape(self):
@@ -501,14 +502,18 @@ class TestPersistenceUnchanged:
         try:
             roles = [r[0] for r in con.execute(
                 "SELECT role FROM messages ORDER BY seq").fetchall()]
-            assert roles == ["user", "assistant", "tool"], (
-                "the pre-loop code persisted user, assistant, tool; "
+            # Internal segments keep the pre-loop snapshot shape (user,
+            # assistant, tool) in the same turn; the final reply joins the
+            # same snapshot at the end, sequenced after them.
+            assert roles == ["user", "assistant", "tool", "assistant"], (
+                "internal rows stay (user, assistant, tool) and the "
+                "closing answer lands after them; "
                 f"got {roles}"
             )
         finally:
             con.close()
 
-    def test_a_one_cycle_turn_persists_only_the_user_message(self):
+    def test_a_one_cycle_turn_persists_user_message_and_final_reply(self):
         manager = ContextManager(db_path=_db("persist1"))
         brain = ScriptedBrain("no capability needed")
         loop = CognitiveLoop(
@@ -518,8 +523,16 @@ class TestPersistenceUnchanged:
         loop.run([{"role": "user", "content": "hello"}], "s")
         con = sqlite3.connect(f"file:{manager._db_path}?mode=ro", uri=True)
         try:
-            assert con.execute(
-                "SELECT count(*) FROM messages").fetchone()[0] == 1
+            rows = con.execute(
+                "SELECT role, content FROM messages ORDER BY seq"
+            ).fetchall()
+            # Build reconciles the user turn; the end-of-turn persist
+            # writes the closing answer so an immediate exit after
+            # respond() cannot lose it. Two rows, ordered, no duplicates.
+            assert rows == [
+                ("user", "hello"),
+                ("assistant", "no capability needed"),
+            ]
         finally:
             con.close()
 

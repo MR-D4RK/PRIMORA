@@ -170,6 +170,13 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# Startup transcript restore: latest messages re-injected after a restart
+# (~15 exchanges) and the estimator budget they may occupy. Older history
+# stays stored and retrievable, just not injected into every request.
+TRANSCRIPT_RELOAD_LIMIT = 30
+TRANSCRIPT_TOKEN_BUDGET = 600
+
+
 class ContextManager:
     """Prime-owned context infrastructure."""
 
@@ -1327,9 +1334,14 @@ class ContextManager:
     ) -> list[str]:
         """Persist a conversation snapshot idempotently.
 
-        Sequence identity = position in the snapshot. Re-sending the same
-        snapshot is a no-op. Same position with different content is stored
-        as a separate row plus a diagnostic; nothing is overwritten.
+        Sequence identity = position in the snapshot, except where a row
+        carries its own ``seq``: restored transcripts re-persist with the
+        exact sequence they were stored under, so reloading a transcript
+        is a no-op. A row without ``seq`` continues past the highest
+        sequence seen so far, so a partly-restored snapshot can never
+        collide with the rows it was restored from. Same position with
+        different content is stored as a separate row plus a diagnostic;
+        nothing is overwritten.
         Returns diagnostics (empty on the happy path).
         """
         diagnostics: list[str] = []
@@ -1339,9 +1351,21 @@ class ContextManager:
             return [f"store_unavailable: {e}"]
         _, session_diags = self.ensure_session(session_id)
         diagnostics.extend(session_diags)
-        for seq, msg in enumerate(messages):
+        next_seq = 0
+        prior_user: Optional[str] = None
+        for pos, msg in enumerate(messages):
             role = str(msg.get("role", "user"))
             content = str(msg.get("content", ""))
+            raw_seq = msg.get("seq")
+            if (
+                isinstance(raw_seq, int)
+                and not isinstance(raw_seq, bool)
+                and raw_seq >= 0
+            ):
+                seq = raw_seq
+            else:
+                seq = max(pos, next_seq)
+            next_seq = max(next_seq, seq + 1)
             raw_timestamp = msg.get("timestamp")
             timestamp = None
             if (isinstance(raw_timestamp, (int, float))
@@ -1362,8 +1386,21 @@ class ContextManager:
                     # alias, and relationship formation runs after it, from
                     # the same persisted message id, and is independently
                     # guarded so it can never suppress or alter M4.
+                    # An elliptical user reply is resolved against the
+                    # question that preceded it (snapshot first, then the
+                    # store for legacy single-message callers).
+                    context_question = None
+                    if role == "user":
+                        context_question = prior_user
+                        if context_question is None:
+                            context_question = self._prior_user_text(
+                                store, session_id, message_id
+                            )
                     diagnostics.extend(
-                        self._extract_states(store, session_id, message_id, role, content)
+                        self._extract_states(
+                            store, session_id, message_id, role, content,
+                            context_question,
+                        )
                     )
                     if role == "user":
                         diagnostics.extend(
@@ -1375,6 +1412,8 @@ class ContextManager:
             except Exception as e:
                 diagnostics.append(f"store_unavailable: {e}")
                 break
+            if role == "user":
+                prior_user = content
         return diagnostics
 
     @staticmethod
@@ -1405,11 +1444,14 @@ class ContextManager:
         message_id: int,
         role: str,
         content: str,
+        context_question: Optional[str] = None,
     ) -> list[str]:
         """Deterministic state extraction. Never invents on failure."""
         try:
             if role == "user":
-                candidates = state_mod.extract_candidates(content, role)
+                candidates = state_mod.extract_candidates(
+                    content, role, context_question
+                )
                 if not candidates:
                     return []
                 return state_mod.apply_user_candidates(
@@ -1422,6 +1464,93 @@ class ContextManager:
         except Exception as e:
             return [f"state_failed: extraction failed: {e}"]
         return []
+
+    @staticmethod
+    def _prior_user_text(
+        store, session_id: str, exclude_id: int
+    ) -> Optional[str]:
+        """Most recent stored user message other than the one being processed.
+
+        Context for legacy callers that reconcile a single-message snapshot:
+        the question that triggered this turn still lives in the store.
+        Bounded and failure-silent.
+        """
+        try:
+            rows = store.fetch_latest(session_id, 8)
+        except Exception:
+            return None
+        for row in reversed(rows):
+            if row.role == "user" and row.message_id != exclude_id:
+                return row.content
+        return None
+
+    # ------------------------------------------------------------------
+    # Transcript reload
+    # ------------------------------------------------------------------
+    def load_transcript(
+        self,
+        session_id: str = DEFAULT_SESSION_ID,
+        limit: int = TRANSCRIPT_RELOAD_LIMIT,
+        token_budget: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Reload the latest conversational turns of one session.
+
+        Startup continuity for restarted entry points: bounded to ``limit``
+        messages and to a token budget so a few very long messages cannot
+        crowd the rest of the request out of context. Older history stays
+        stored and retrievable, just not injected. Chronological,
+        session-scoped, and failure-silent: any store problem returns an
+        empty transcript instead of blocking startup.
+        """
+        try:
+            rows = self._get_store().fetch_conversation(session_id, limit)
+        except Exception:
+            return []
+        entries: list[dict[str, Any]] = [
+            {"role": row.role, "content": row.content, "seq": row.seq}
+            for row in rows
+            if row.content
+        ]
+        if not entries:
+            return []
+        budget = (
+            token_budget
+            if token_budget is not None
+            else self._transcript_budget()
+        )
+        while len(entries) > 1:
+            total = sum(
+                estimate_tokens(str(entry.get("content", "")))
+                for entry in entries
+            )
+            if total <= budget:
+                break
+            entries.pop(0)
+        return entries
+
+    @staticmethod
+    def _transcript_budget() -> int:
+        try:
+            import os
+
+            raw = os.environ.get("PRIMORA_AURORA_TRANSCRIPT_BUDGET")
+            if raw:
+                return max(1, int(raw))
+        except (TypeError, ValueError):
+            pass
+        return TRANSCRIPT_TOKEN_BUDGET
+
+    def next_seq(self, session_id: str = DEFAULT_SESSION_ID) -> int:
+        """Sequence the next new row of this session must take.
+
+        Used where a caller must mint a row itself (the clear marker, or
+        post-clear messages): one past the true stored maximum, never a
+        guess from a bounded window.
+        """
+        try:
+            return self._get_store().max_seq(session_id) + 1
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # Build

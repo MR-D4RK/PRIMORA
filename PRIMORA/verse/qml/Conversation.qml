@@ -26,6 +26,21 @@ Item {
             // Auto-scroll to bottom
             listView.positionViewAtEnd()
         }
+        function onMessageUpdated(index, content, timestamp) {
+            // Update a single assistant bubble in place (streaming).
+            if (index >= 0 && index < messageModel.count) {
+                messageModel.set(index, {
+                    content: content,
+                    timestamp: timestamp
+                })
+                listView.positionViewAtEnd()
+            }
+        }
+        // Python-initiated clears (clear_conversation) reach the model
+        // through the existing signal, so both directions stay in sync.
+        function onConversationCleared() {
+            messageModel.clear()
+        }
     }
 
     // Compact centered stream: the conversation is an overlay inside the
@@ -38,6 +53,33 @@ Item {
             anchors.bottom: parent.bottom
             anchors.horizontalCenter: parent.horizontalCenter
             width: Math.min(parent.width * 0.62, 620)
+
+        // Conversation controls: Clear is user-visible, keyboard-focusable,
+        // and routes through the same clearConversation() path the QML side
+        // owns (model first, then the Python slot and its marker row).
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.bottomMargin: 2
+
+            Item { Layout.fillWidth: true }
+
+            Button {
+                id: clearButton
+                objectName: "clearConversationButton"
+                text: "Clear Conversation"
+                Layout.minimumHeight: 28
+                background: Rectangle {
+                    color: clearButton.hovered ? "#1a2636" : "#121a26"
+                    radius: 8
+                    border.color: clearButton.activeFocus ? "#33506e" : "#232f45"
+                    border.width: 1
+                }
+                font.family: "Segoe UI"
+                font.pixelSize: 11
+                palette.buttonText: "#8f9fb4"
+                onClicked: conversation.clearConversation()
+            }
+        }
 
         // Message history
         ListView {
@@ -149,7 +191,7 @@ Item {
                 Layout.preferredWidth: 64
                 Layout.minimumHeight: 40
                 text: "Send"
-                enabled: inputField.text.trim().length > 0
+                enabled: inputField.text.trim().length > 0 && !verseApp.isResponding
                 background: Rectangle {
                     color: enabled ? "#1f3a52" : "#121a26"
                     radius: 10
@@ -166,6 +208,7 @@ Item {
     }
 
     function sendMessage() {
+        if (verseApp && verseApp.isResponding) return
         var text = inputField.text.trim()
         if (text.length === 0) return
         if (verseApp) {
@@ -176,5 +219,8 @@ Item {
 
     function clearConversation() {
         messageModel.clear()
+        if (verseApp) {
+            verseApp.clear_conversation()
+        }
     }
 }

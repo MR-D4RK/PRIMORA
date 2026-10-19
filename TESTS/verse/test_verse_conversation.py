@@ -27,7 +27,7 @@ class InstantAurora:
         self.warmup_calls += 1
         return None
 
-    def respond(self, messages, session_id="default"):
+    def respond(self, messages, session_id="default", on_delta=None, cancelled=None):
         self.respond_calls += 1
         self.last_messages = messages
         self.last_session_id = session_id
@@ -40,6 +40,12 @@ class InstantAurora:
                 self.model = model
 
         if self._response_success:
+            if on_delta is not None:
+                content = self._response_content
+                for i in range(0, len(content), 3):
+                    if cancelled is not None and cancelled():
+                        break
+                    on_delta(content[i:i + 3])
             return Result(True, self._response_content, None)
         else:
             return Result(False, "", self._response_error or "Test error")
@@ -58,7 +64,7 @@ class BlockingAurora:
         self.warmup_calls += 1
         return None
 
-    def respond(self, messages, session_id="default"):
+    def respond(self, messages, session_id="default", on_delta=None, cancelled=None):
         self.respond_calls += 1
         if self._event:
             self._event.wait(30)
@@ -68,6 +74,12 @@ class BlockingAurora:
                 self.content = content
                 self.error = error
                 self.model = model
+        if on_delta is not None:
+            content = self._response_content
+            for i in range(0, len(content), 3):
+                if cancelled is not None and cancelled():
+                    break
+                on_delta(content[i:i + 3])
         return Result(True, self._response_content, None)
 
     def release(self):
@@ -112,10 +124,14 @@ def test_send_message_when_awake_appends_to_conversation():
         # Wait for response (and its queued delivery to the main thread)
         assert _pump_until(lambda: aurora.respond_calls == 1, 10.0)
 
-        # Check conversation has both messages
+        # Check conversation has both messages (user + assistant placeholder)
         assert _pump_until(lambda: len(app.conversation) == 2, 10.0)
         assert app.conversation[0].role == "user"
         assert app.conversation[0].content == "Hello Aurora"
+        # The assistant bubble is filled progressively; wait for the streamed
+        # content to land.
+        assert _pump_until(
+            lambda: app.conversation[1].content == "Hello from Aurora", 10.0)
         assert app.conversation[1].role == "assistant"
         assert app.conversation[1].content == "Hello from Aurora"
     finally:
@@ -159,7 +175,9 @@ def test_send_message_failure_shows_error():
         assert _pump_until(lambda: aurora.respond_calls == 1, 10.0)
 
         # Should have error message (wait for the worker's queued result)
-        assert _pump_until(lambda: len(app.conversation) == 2, 10.0)
+        assert _pump_until(
+            lambda: len(app.conversation) == 2
+            and "Model unavailable" in app.conversation[1].content, 10.0)
         assert app.conversation[1].role == "assistant"
         assert "Error" in app.conversation[1].content
         assert "Model unavailable" in app.conversation[1].content

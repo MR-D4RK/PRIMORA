@@ -447,8 +447,136 @@ def _extract_slots(text: str, include_notes: bool = False
     return out
 
 
-def extract_candidates(text: str, role: str) -> list[StateCandidate]:
-    """Extract state candidates from user-authored text only."""
+# --- Elliptical replies resolved against the prior question --------------
+# "It's yellow." names no slot by itself; the slot lives in the question
+# that preceded it. The equivalent direct statement is synthesised below
+# and routed through the slot registry, so an unsupported or ambiguous
+# pairing still yields nothing: the registry stays the only authority.
+_ANAPHORA_RE = re.compile(
+    r"^(?:it'?s|its|that'?s|thats|this is|they'?re|he'?s|she'?s)\s+(.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_QUESTION_LIKE_RE = re.compile(
+    r"\?\s*$"
+    r"|^(?:what|whats|which|who|whose|where|when|why|how|do you|did you|"
+    r"can you|could you|tell me|remember|remind me|any idea|any clue)\b",
+    re.IGNORECASE,
+)
+_SLOT_PHRASE_RE = re.compile(
+    r"\bmy\s+([a-z][a-z'\-]*(?:\s+[a-z][a-z'\-]*){0,5})\s*$",
+    re.IGNORECASE,
+)
+_SLOT_PHRASE_JUNK_RE = re.compile(
+    r"\b(?:is|are|what|what's|whats|who|whose|where|when|why|how|which|"
+    r"please|again|then|actually|really)\b",
+    re.IGNORECASE,
+)
+_ANSWER_VOID = frozenset({
+    "yes", "no", "yeah", "yep", "nope", "nah", "ok", "okay", "sure",
+    "thanks", "thank you", "maybe", "idk", "dunno", "nothing", "none",
+    "not sure", "dont know", "don't know",
+})
+# A bare elliptical answer is a noun phrase, never a question or an
+# instruction aimed at the assistant ("List my previous favorite
+# colors." must not become a favorite-color value).
+_BARE_VERB_RE = re.compile(
+    r"^(?:what|when|where|why|who|whose|which|how|is|are|was|were|do|does|"
+    r"did|can|could|would|should|will|please|list|tell|show|give|say|"
+    r"describe|explain|remind|remember|name|check|find|search|look|read|"
+    r"repeat)\b",
+    re.IGNORECASE,
+)
+
+
+def _question_slot_phrase(question) -> Optional[str]:
+    """The "my X" subject a prior question asked about, else None.
+
+    Deterministic: only a question-like message whose trailing subject
+    reads "my <phrase>" maps ("what is my favorite color?" -> "favorite
+    color"). Anything else yields None, so no fact is invented.
+    """
+    if not isinstance(question, str):
+        return None
+    q = question.strip()
+    if not q or not _QUESTION_LIKE_RE.search(q):
+        return None
+    q = q.split("?", 1)[0].strip().lower()
+    match = _SLOT_PHRASE_RE.search(q)
+    if not match:
+        return None
+    phrase = match.group(1).strip()
+    if not phrase or len(phrase.split()) > 6:
+        return None
+    if _SLOT_PHRASE_JUNK_RE.search(phrase):
+        return None
+    return phrase
+
+
+def _anaphora_value(text: str) -> str:
+    """Value an elliptical reply asserts, or "" when it states none.
+
+    Accepts copular anaphora ("It's yellow.", "That's yellow") and short
+    bare answers ("yellow.") that follow a slot-mapping question.
+    Questions, acknowledgements, and first-person statements are not
+    answers and yield "".
+    """
+    raw = (text or "").strip()
+    if not raw or raw.endswith("?"):
+        return ""
+    match = _ANAPHORA_RE.match(raw)
+    if match:
+        value = normalize_value(match.group(1).strip())
+    else:
+        # Bare answers are short noun phrases: at most three words, no
+        # comma-separated lists, no questions, no instructions. Longer
+        # elliptical answers use the copular form ("It's X") instead.
+        if len(raw.split()) > 3:
+            return ""
+        if "," in raw or "?" in raw:
+            return ""
+        if _BARE_VERB_RE.match(raw):
+            return ""
+        if re.match(r"^(?:i|we|my|our|me|us)\b", raw, re.IGNORECASE):
+            return ""
+        if normalize_value(raw).lower() in _ANSWER_VOID:
+            return ""
+        value = normalize_value(raw)
+    if not value or len(value) > 60:
+        return ""
+    if value.lower() in _ANSWER_VOID:
+        return ""
+    return value
+
+
+def _expand_with_context(
+    text: str, context_question: str
+) -> list[StateCandidate]:
+    """Resolve an elliptical reply against the question it answers.
+
+    Synthesises the equivalent direct statement ("my favorite color is
+    yellow") and routes it through the slot registry. No slot match means
+    no candidate: never a note, never a guess.
+    """
+    phrase = _question_slot_phrase(context_question)
+    if not phrase:
+        return []
+    value = _anaphora_value(text)
+    if not value:
+        return []
+    return _extract_slots(f"my {phrase} is {value}")
+
+
+def extract_candidates(
+    text: str, role: str, context_question: Optional[str] = None
+) -> list[StateCandidate]:
+    """Extract state candidates from user-authored text only.
+
+    ``context_question`` is the user's immediately preceding question when
+    this message answers it elliptically ("It's yellow." after "what is my
+    favorite color?"). It is consulted only as a last resort, only for
+    slot-mappable questions, and only through the slot registry — without
+    it extraction behaves exactly as before.
+    """
     if role != "user" or not isinstance(text, str):
         return []
     stripped = text.strip()
@@ -533,13 +661,19 @@ def extract_candidates(text: str, role: str) -> list[StateCandidate]:
             if inner:
                 return [dataclass_replace(c, auto_confirm=False,
                                           confidence=0.3) for c in inner]
-        if _HEDGE_RE.search(work):
+        # Elliptical reply ("It's yellow.") resolved against the prior
+        # question. The slot registry gates the result, so an unsupported
+        # pairing falls through to the ordinary empty outcome below.
+        if context_question:
+            cands = _expand_with_context(stripped_head, context_question)
+        if not cands and _HEDGE_RE.search(work):
             trimmed = work[:200].strip()
             if trimmed:
                 return [StateCandidate(
                     "", trimmed, "establish", scope, UNCERTAIN,
                     auto_confirm=False, confidence=0.3)]
-        return []
+        if not cands:
+            return []
 
     if rationale:
         cands = [dataclass_replace(c, rationale=rationale)

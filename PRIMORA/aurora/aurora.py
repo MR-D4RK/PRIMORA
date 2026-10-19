@@ -1,6 +1,6 @@
 import json
 import re
-from typing import Optional
+from typing import Callable, Optional
 from PRIMORA.prime.context import BudgetConfig
 from PRIMORA.prime.context.mind import CognitiveContext, Mind
 from PRIMORA.prime.contract import PrimeRequest, PrimeResult
@@ -359,13 +359,18 @@ class Aurora:
         self,
         messages: list[dict[str, str]],
         session_id: str = "default",
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> BrainResult:
         """One logical response, possibly cognated over several segments.
 
         The loop owns the segment structure; this method owns only the
-        instruction. The signature and return type are unchanged.
+        instruction. When ``on_delta`` is supplied, user-facing content
+        deltas are forwarded to it as they are generated (Verse streaming);
+        when omitted, the existing non-streaming behavior is preserved.
+        The signature and return type are unchanged for existing callers.
         """
-        return self._loop.run(self._with_instruction(messages), session_id)
+        return self._loop.run(
+            self._with_instruction(messages), session_id, on_delta=on_delta)
 
     def context_for(
         self,

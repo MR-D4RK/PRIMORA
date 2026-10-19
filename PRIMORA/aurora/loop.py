@@ -479,6 +479,7 @@ class CognitiveLoop:
         self,
         instructed: list[dict[str, str]],
         session_id: str = "default",
+        on_delta: Optional[Callable[[str], None]] = None,
     ) -> BrainResult:
         """Cognate until finished, then return one logical response.
 
@@ -542,6 +543,12 @@ class CognitiveLoop:
         # succeeded.
         protocol_granted = False
 
+        # Length of `messages` as of the last successful build. The
+        # end-of-turn persist compares against it to see rows a correction
+        # cycle appended after that build (their own build never ran when
+        # the loop stops on a deadline).
+        built_len = 0
+
         for cycle in range(self.max_cycles):
             if time.perf_counter() - started > self.deadline_s:
                 trace.stop_reason = "deadline"
@@ -568,14 +575,18 @@ class CognitiveLoop:
                 if result is not None:
                     return result
                 return BrainResult.failure(
-                    f"context_build_failed: {exc}", self._brain.get_model_name()
+                    f"context_build_failed: {exc}",
+                    self._brain.get_model_name(),
                 )
+
+            built_len = len(messages)
 
             seg_started = time.perf_counter()
             try:
                 generated = self._brain.generate(
                     context.messages,
                     max_output_tokens=context.allowed_output,
+                    on_delta=on_delta,
                 )
             except Exception as exc:
                 trace.stop_reason = f"generate_failed: {type(exc).__name__}"
@@ -795,6 +806,9 @@ class CognitiveLoop:
             trace.stop_reason = trace.stop_reason or "max_cycles"
 
         trace.total_s = time.perf_counter() - started
+        # The turn is over: write its closing state before returning so a
+        # caller that exits right after respond() cannot lose it.
+        self._persist_turn(messages, built_len, result, trace, session_id)
         if result is None:
             # Unreachable while max_cycles >= 1, kept so the return type is
             # total rather than Optional.
@@ -803,6 +817,52 @@ class CognitiveLoop:
                 self._brain.get_model_name(),
             )
         return result
+
+    def _persist_turn(
+        self,
+        messages: list[dict[str, str]],
+        built_len: int,
+        result: Optional[BrainResult],
+        trace: LoopTrace,
+        session_id: str,
+    ) -> None:
+        """Write the turn's closing state before ``run`` returns.
+
+        A finished answer joins the exact snapshot the last build already
+        reconciled, so every existing row stays a fingerprint no-op while
+        the reply gains its row immediately: the previous behaviour of
+        waiting for the *next* turn's payload lost the last reply whenever
+        the process exited first. Rows a correction cycle appended after
+        its own build (the deadline case) are written by the same call,
+        with the same snapshot shape ``build`` would have passed. Only
+        ``finished`` appends content; protocol- and failure-shaped stops
+        persist nothing they would not otherwise. Never raises:
+        persistence stays best-effort exactly like the build path.
+        """
+        payload = messages
+        if (
+            trace.stop_reason == "finished"
+            and result is not None
+            and getattr(result, "success", False)
+            and getattr(result, "content", None)
+        ):
+            content = str(result.content)
+            last = messages[-1] if messages else None
+            already_last = (
+                last is not None
+                and last.get("role") == "assistant"
+                and str(last.get("content", "")) == content
+            )
+            if not already_last:
+                payload = messages + [
+                    {"role": "assistant", "content": content}
+                ]
+        if payload is messages and len(messages) == built_len:
+            return
+        try:
+            self._mind.reconcile(payload, session_id)
+        except Exception:
+            pass
 
     def run_segments(
         self,

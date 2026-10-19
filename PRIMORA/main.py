@@ -272,7 +272,32 @@ def main():
         service.stop()
 
 
+def _restore_cli_history(aurora, session_id):
+    """Restored transcript for a restarted CLI thread.
+
+    Returns ``(history, next_seq)``. ``( [], None)`` when no context
+    loader exists (test stubs) or nothing is stored — the loop then
+    behaves exactly as before. ``next_seq`` is set whenever the store
+    holds rows, so new turns sequence past everything persisted.
+    """
+    try:
+        ctx = aurora._prime.context
+        rows = list(ctx.load_transcript(session_id) or [])
+        next_seq = int(ctx.next_seq(session_id))
+    except Exception:
+        return [], None
+    history = [
+        {"role": row["role"], "content": row["content"], "seq": row["seq"]}
+        for row in rows
+    ]
+    return history, (next_seq if next_seq > 0 else None)
+
+
 def run_cli(aurora):
+    session_id = os.environ.get("PRIMORA_SESSION_ID", "default")
+    history, next_seq = _restore_cli_history(aurora, session_id)
+    if history:
+        print(f"(restored {len(history)} earlier messages)")
     while True:
         try:
             user_input = input("You: ").strip()
@@ -288,13 +313,26 @@ def run_cli(aurora):
             break
 
         try:
+            # Full thread (restored + this session) so follow-ups connect;
+            # restored rows travel with their stored sequence.
+            entry = {"role": "user", "content": user_input}
+            if next_seq is not None:
+                entry["seq"] = next_seq
+                next_seq += 1
+            payload = history + [entry]
             result = aurora.respond(
-                [{"role": "user", "content": user_input}],
-                session_id=os.environ.get("PRIMORA_SESSION_ID", "default"),
+                payload,
+                session_id=session_id,
             )
+            history.append(entry)
 
             if result.success:
                 print(f"Aurora: {result.content}\n")
+                reply = {"role": "assistant", "content": result.content}
+                if next_seq is not None:
+                    reply["seq"] = next_seq
+                    next_seq += 1
+                history.append(reply)
             else:
                 print(f"ERROR: {result.error}\n")
 

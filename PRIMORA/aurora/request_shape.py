@@ -136,3 +136,64 @@ def is_request_attempt(text: Any) -> bool:
     # object naming a request key is an attempt; a stray brace is not.
     lowered = stripped.lower()
     return any('"%s"' % key in lowered for key in _REQUEST_KEYS)
+
+
+# Internal markers whose content is never part of Aurora's user-facing
+# answer. Kept here (rather than in the loop or the brain) so the streaming
+# path and the answer-cleaning path agree on what is internal.
+_THINK_FENCE_OPEN = "```think"
+_THINK_FENCE_CLOSE = "```"
+_PRIME_REQUEST_OPEN = "<prime_request>"
+_PRIME_REQUEST_CLOSE = "</prime_request>"
+
+
+def _find_earliest_open(buffer: str, pos: int):
+    """Return (index, marker) of the earliest internal-block opening at or
+    after ``pos``, or (-1, None) when none remains."""
+    best = -1
+    best_marker = None
+    for marker in (_THINK_FENCE_OPEN, _PRIME_REQUEST_OPEN):
+        idx = buffer.find(marker, pos)
+        if idx != -1 and (best == -1 or idx < best):
+            best = idx
+            best_marker = marker
+    return best, best_marker
+
+
+def displayable_text(buffer: str) -> str:
+    """Return the user-facing-safe portion of ``buffer``.
+
+    Complete internal blocks (thinking fences and ``<prime_request>``
+    blocks) are removed from the output. If an internal block opens but
+    never closes within ``buffer``, everything from its opening to the end
+    of ``buffer`` is withheld: it may be incomplete reasoning or an
+    incomplete internal request that must never reach the user.
+
+    Earlier prefixes of the output are always prefixes of later outputs as
+    ``buffer`` grows, which makes this safe for progressive delta emission
+    during streaming.
+    """
+    out = []
+    pos = 0
+    n = len(buffer)
+    while pos < n:
+        next_open, marker = _find_earliest_open(buffer, pos)
+        if next_open == -1:
+            out.append(buffer[pos:])
+            break
+        out.append(buffer[pos:next_open])
+        close = (
+            _THINK_FENCE_CLOSE if marker == _THINK_FENCE_OPEN
+            else _PRIME_REQUEST_CLOSE)
+        close_idx = buffer.find(close, next_open + len(marker))
+        if close_idx == -1:
+            # Unclosed internal block: withhold from the opening onward.
+            break
+        pos = close_idx + len(close)
+    return "".join(out)
+
+
+def displayable_len(buffer: str) -> int:
+    """Number of characters safe to display from ``buffer`` (see
+    :func:`displayable_text`)."""
+    return len(displayable_text(buffer))
