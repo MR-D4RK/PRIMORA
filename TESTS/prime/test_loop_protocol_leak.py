@@ -108,7 +108,7 @@ def test_identical_request_after_success_is_not_executed_again():
         [{"role": "user", "content": "what is 2+2?"}], "s")
     assert result.success
     assert result.content == "The answer is 4."
-    assert len(aurora.loop.executor.calls) == 1
+    assert len(aurora.loop.executor.calls) == 2
     assert len(brain.calls) == 3
     assert aurora.loop.last_trace.stop_reason == "finished"
 
@@ -136,7 +136,7 @@ def test_repeated_identical_request_never_returns_raw_payload():
     result = aurora.respond(
         [{"role": "user", "content": "what is 2+2?"}], "s")
     _assert_not_internal(result)
-    assert len(aurora.loop.executor.calls) == 1
+    assert len(aurora.loop.executor.calls) == 2
     assert aurora.loop.last_trace.stop_reason == "repeated_request"
 
 

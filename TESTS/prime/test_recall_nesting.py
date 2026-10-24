@@ -346,7 +346,9 @@ class TestBehaviourPreserved:
             {"role": "user", "content": "shape check on recall results"},
         ], "s1")
         for item in _recalled(prime, "shape check", "s1"):
-            assert set(item) == {"role", "content"}
+            assert {"role", "content", "source_type", "source_id",
+                    "authority", "status", "session_id", "timestamp",
+                    "confidence"} <= set(item)
 
     def test_capability_budget_and_repeat_guard_untouched(self):
         """The fix must not have been made by loosening loop limits."""

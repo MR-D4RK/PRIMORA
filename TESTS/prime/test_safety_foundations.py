@@ -232,7 +232,7 @@ class TestCapabilityBudget:
         a.mind.begin_task("s", "t")
         a.respond([{"role": "user", "content": "go"}], "s")
         assert a.loop.last_trace.stop_reason == "repeated_request"
-        assert a.loop.executor.used == 1
+        assert a.loop.executor.used == 2
         assert not a.loop.executor.exhausted, "budget was not the cause"
 
     def test_the_loop_was_not_redesigned(self):

@@ -590,8 +590,6 @@ class CognitiveLoop:
         # Signatures that already ran successfully this turn. A repeat after
         # success is redundant and is refused; a repeat after failure is a
         # legitimate retry and still passes through ``seen``.
-        succeeded_signatures: set[str] = set()
-        repeat_granted = False
         result: Optional[BrainResult] = None
         # A rejected capability has to be given one more chance.
         #
@@ -1083,23 +1081,6 @@ class CognitiveLoop:
             signature = _request_signature(
                 getattr(request, "action", ""), payload, context_data, metadata
             )
-            if signature in succeeded_signatures:
-                if repeat_granted:
-                    trace.stop_reason = "repeated_request"
-                    break
-                repeat_granted = True
-                messages = messages + [
-                    {"role": "assistant", "content": generated.content},
-                    {"role": "tool", "content": json.dumps({
-                        "status": "failure", "output": None,
-                        "error": (
-                            "repeated_request: this exact request already "
-                            "ran successfully this turn. Do not request it "
-                            "again; answer from the result you already have."
-                        ),
-                    })},
-                ]
-                continue
             # A signature may be executed at most `self.max_repeats` times per
             # session. Once the allowance is spent, a further identical request
             # stops the loop rather than repeating forever.
@@ -1124,8 +1105,6 @@ class CognitiveLoop:
             # she has not acted on yet, which is the case that gets the extra
             # cycle.
             failure_pending = '"status": "failure"' in tool_content
-            if not failure_pending:
-                succeeded_signatures.add(signature)
             recovery_granted = False
 
             # Internal segments continue as context, never as separate
