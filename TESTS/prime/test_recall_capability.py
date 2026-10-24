@@ -146,7 +146,9 @@ class TestCapabilityContract:
         prime = Prime(_Provider())
         spec = prime.registry.get("recall")
         assert spec.required_fields == ["query"]
-        assert set(spec.optional_fields) == {"limit", "session_id"}
+        assert set(spec.optional_fields) == {
+            "limit", "session_id", "result_count", "order", "temporal_scope"
+        }
         assert spec.payload_schema["required"] == ["query"]
 
     def test_aurora_is_told_it_exists(self):

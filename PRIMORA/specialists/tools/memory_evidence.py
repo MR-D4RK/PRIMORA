@@ -29,7 +29,9 @@ class MemoryEvidenceSpecialist(Specialist):
             return PrimeResult.failure("memory_evidence is not bound to Mind")
         if not isinstance(payload, dict):
             return PrimeResult.failure("Payload must be an object")
-        allowed = {"sources", "subject", "date_from", "date_to", "first_mention", "reasons"}
+        allowed = {"sources", "subject", "date_from", "date_to",
+                   "first_mention", "reasons", "result_count", "order",
+                   "temporal_scope"}
         if set(payload) - allowed:
             return PrimeResult.failure("Unexpected memory evidence fields")
         sources = payload.get("sources")
@@ -44,6 +46,19 @@ class MemoryEvidenceSpecialist(Specialist):
         for key in ("first_mention", "reasons"):
             if not isinstance(payload.get(key, False), bool):
                 return PrimeResult.failure(f"{key} must be boolean")
+        result_count = payload.get("result_count")
+        if (result_count is not None and
+                (isinstance(result_count, bool)
+                 or not isinstance(result_count, int)
+                 or not 1 <= result_count <= 30)):
+            return PrimeResult.failure("result_count must be between 1 and 30")
+        order = payload.get("order", "relevance")
+        if order not in ("relevance", "recent", "oldest"):
+            return PrimeResult.failure("order must be relevance, recent or oldest")
+        temporal_scope = payload.get("temporal_scope", "current")
+        if temporal_scope not in ("current", "historical", "recent"):
+            return PrimeResult.failure(
+                "temporal_scope must be current, historical or recent")
         start_text, end_text = payload.get("date_from"), payload.get("date_to")
         if (start_text is None) != (end_text is None):
             return PrimeResult.failure("Both date_from and date_to are required for a date window")
@@ -73,7 +88,9 @@ class MemoryEvidenceSpecialist(Specialist):
         plan = {
             "sources": list(dict.fromkeys(sources)), "subject": subject,
             "first_mention": payload.get("first_mention", False),
-            "reasons": payload.get("reasons", False), **bounds,
+            "reasons": payload.get("reasons", False),
+            "result_count": result_count, "order": order,
+            "temporal_scope": temporal_scope, **bounds,
         }
         try:
             evidence = self._mind.memory_query_evidence(plan)

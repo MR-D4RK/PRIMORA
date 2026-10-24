@@ -1905,6 +1905,19 @@ class ContextManager:
         subject = (plan.get("subject") or "").casefold().strip()
         days = plan.get("recent_days")
         first = plan.get("first_mention", False)
+        result_count = plan.get("result_count")
+        if (isinstance(result_count, bool)
+                or (result_count is not None and not isinstance(result_count, int))):
+            result_count = None
+        if result_count is not None:
+            result_count = max(1, min(30, result_count))
+        order = plan.get("order", "relevance")
+        if order not in ("relevance", "recent", "oldest"):
+            order = "relevance"
+        temporal_scope = plan.get("temporal_scope", "current")
+        if temporal_scope not in ("current", "historical", "recent"):
+            temporal_scope = "current"
+        historical_requested = first or temporal_scope == "historical"
         now = time.time()
         start = plan.get("from_utc")
         end = plan.get("to_utc")
@@ -1939,7 +1952,7 @@ class ContextManager:
                                                         "rationale for ")))
                 if "facts" not in sources and not preference:
                     continue
-                if not first and state.status != "current":
+                if not historical_requested and state.status != "current":
                     continue
                 if preference and state.concept.startswith("likes for "):
                     if not self._self_contained_like(
@@ -1983,8 +1996,11 @@ class ContextManager:
                         f"possible_followup_to_{msg.message_id}", "concepts": []})
         # Keep source-indexed facts visible even when the newest raw messages
         # are numerous; a recency-only cap would hide old favorites again.
-        structured = sorted(items.values(), key=lambda r: (r["timestamp"], r["id"]),
-                            reverse=not first)
+        reverse = order != "oldest" and not (first or order == "oldest")
+        structured = sorted(
+            items.values(), key=lambda r: (r["timestamp"], r["id"]),
+            reverse=reverse,
+        )
         structured_ids = set(items)
         # Structured memory is an index, not the whole person's history.
         # Retrieve bounded verbatim *user* messages from every session as
@@ -2017,30 +2033,37 @@ class ContextManager:
                         "from": f"possible_context_for_{msg.message_id}",
                         "concepts": [],
                     })
-        raw_only = sorted((r for key, r in items.items()
-                           if key not in structured_ids),
-                          key=lambda r: (r["timestamp"], r["id"]),
-                          reverse=not first)
+        raw_only = sorted(
+            (r for key, r in items.items() if key not in structured_ids),
+            key=lambda r: (r["timestamp"], r["id"]), reverse=reverse)
         # 60 sourced records + 30 raw-only candidates. Keep both channels in
         # the evidence window instead of letting one evict the other.
-        ordered = sorted(structured[:60] + raw_only[:30],
-                         key=lambda r: (r["timestamp"], r["id"]),
-                         reverse=not first)
+        ordered = sorted(
+            structured[:60] + raw_only[:30],
+            key=lambda r: (r["timestamp"], r["id"]), reverse=reverse)
         omitted_count = max(0, len(structured) - 60) + max(0, len(raw_only) - 30)
         # Cap output, disclose omissions; do not claim the answer is complete.
         limit = 90
         output = ["User-stated evidence (UTC timestamps are dates of statements, "
                   "not inferred real-world onset/event dates). "
                   "Only direct user-source records are included."]
-        for row in ordered[:limit]:
+        if result_count is not None:
+            output.append(
+                f"Requested results: {result_count}; order: {order}; "
+                f"temporal scope: {temporal_scope}.")
+        for row in ordered[:result_count or limit]:
             moment = datetime.fromtimestamp(row["timestamp"], timezone.utc)
             concepts = "; ".join(row["concepts"][:4])
             output.append(f'[message {row["id"]}, {moment:%Y-%m-%d %H:%M} UTC, '
                           f'{row["from"]}] {row["text"]!r}' +
                           (f' | stored: {concepts}' if concepts else ''))
-        if omitted_count:
-            output.append(f"Additional user-source candidates omitted: {omitted_count}. "
-                          "The full inventory was not included.")
+        omitted_for_request = max(
+            0, len(ordered) - (result_count or limit))
+        if omitted_count or omitted_for_request:
+            output.append(
+                f"Additional user-source candidates omitted: "
+                f"{max(omitted_count, omitted_for_request)}. "
+                "The full inventory was not included.")
         return "\n".join(output) if ordered else ""
 
     def verified_likes_history(self, question: str) -> Optional[str]:

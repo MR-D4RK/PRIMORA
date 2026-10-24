@@ -84,13 +84,19 @@ class CapabilityRegistry:
                         "date_from": {"type": "string"},
                         "date_to": {"type": "string"},
                         "first_mention": {"type": "boolean"},
-                        "reasons": {"type": "boolean"}
+                        "reasons": {"type": "boolean"},
+                        "result_count": {"type": "integer"},
+                        "order": {"type": "string",
+                                  "enum": ["relevance", "recent", "oldest"]},
+                        "temporal_scope": {"type": "string",
+                                           "enum": ["current", "historical", "recent"]}
                     },
                     "required": ["query"],
                     "additionalProperties": False
                 },
                 required_fields=["query"],
-                optional_fields=["limit", "session_id"]
+                optional_fields=["limit", "session_id", "result_count",
+                                 "order", "temporal_scope"]
             ),
             RecallSpecialist()
         )

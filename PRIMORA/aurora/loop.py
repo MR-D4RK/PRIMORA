@@ -649,7 +649,8 @@ class CognitiveLoop:
                     self._brain, user_text, prior_dialogue)
             except Exception:
                 plan = None  # Ordinary cognition if the live planner fails.
-        if isinstance(plan, memory_coordinator.MemoryPlan):
+        if (isinstance(plan, memory_coordinator.MemoryPlan)
+                and plan.operation == "recall"):
             if plan.clarify:
                 response = BrainResult.success(
                     "Which specific memory or experience do you mean?",

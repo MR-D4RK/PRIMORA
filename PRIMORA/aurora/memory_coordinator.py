@@ -23,27 +23,48 @@ class MemoryPlan:
     first_mention: bool = False
     reasons: bool = False
     clarify: bool = False
+    # ``recall`` is the only operation that may take the early, evidence-only
+    # path. Current disclosures, corrections, acknowledgements, and ordinary
+    # conversation return to the normal Aurora loop with this operation set to
+    # their semantic class.
+    operation: str = "recall"
+    result_count: Optional[int] = None
+    order: str = "relevance"
+    temporal_scope: str = "current"
 
     def as_dict(self) -> dict:
         return {
             "sources": list(self.sources), "subject": self.subject,
             "recent_days": self.recent_days, "first_mention": self.first_mention,
             "reasons": self.reasons, "clarify": self.clarify,
+            "operation": self.operation, "result_count": self.result_count,
+            "order": self.order, "temporal_scope": self.temporal_scope,
         }
 
 
-_SYSTEM = """You are Aurora interpreting a USER REQUEST, not answering it.
-Decide whether the user is asking for THEIR OWN remembered information.
-Understand meaning, ordinary typos, paraphrases, and immediate conversation
-references. Do NOT rely on keywords or claim you have retrieved any memory.
-Do not treat questions about public facts, factual research or general advice
-as autobiographical memory queries.
+_SYSTEM = """You are Aurora interpreting the LATEST USER MESSAGE, not answering it.
+First decide whether the latest message is a request to retrieve existing
+personal memory or a current conversational act. A disclosure, a correction,
+an acknowledgement/confirmation, a request to remember something, and ordinary
+conversation must not be routed into historical lookup merely because earlier
+dialogue mentions memory. Historical evidence never overrides explicit content
+in the latest user message.
+Understand meaning, ordinary typos, paraphrases, and immediate references. Do
+not rely on subject-specific keywords or claim that you retrieved anything.
+Do not treat public facts, research, or general advice as personal memory.
 Output ONLY one JSON object with EXACTLY these keys:
-{"intent":"memory", "sources":["preferences"],
+{"intent":"memory", "operation":"recall", "sources":["preferences"],
  "subject":null, "recent_days":null, "first_mention":false,
- "reasons":false, "clarify":false}
+ "reasons":false, "clarify":false, "result_count":null,
+ "order":"relevance", "temporal_scope":"current"}
 Set intent to "memory" or "other". For "other", use an empty sources list.
-Fill every field from the user's request; do not blindly copy example values.
+For a current act, keep intent="memory" only when useful memory context is
+needed, and set operation to one of current_turn, correction, confirmation,
+learn, or ordinary. These operations return to normal conversation; they are
+not historical answers. Use operation="recall" only for an explicit request
+about what the user previously said, stored preferences, past experiences, or
+historical facts.
+Fill every field from the latest request; do not blindly copy example values.
 - sources contains zero or more distinct values: preferences (likes, favorites,
   reasons), experiences (actions/events), facts (other personal user statements).
 - For memory intent, choose the useful sources, sometimes more than one.
@@ -55,6 +76,9 @@ Fill every field from the user's request; do not blindly copy example values.
   Do not invent a subject.
 - recent_days: integer 1..365 if the requested window is clear; interpret
   'recently' as 7 days, or null if there is no time restriction.
+- result_count: integer 1..30 when the user requests a number of results,
+  otherwise null. order is relevance, recent, or oldest. temporal_scope is
+  current, historical, or recent.
 - first_mention: true when the user asks when they told you/first mentioned it,
   NOT when the preference or event began in the real world.
 - reasons: true for questions asking why the user likes/does something.
@@ -89,6 +113,13 @@ def validate_plan(raw: object) -> Optional[MemoryPlan | str]:
     if (not isinstance(sources, list) or not sources or len(sources) > 3
             or any(not isinstance(s, str) or s not in allowed for s in sources)):
         return None
+    operation = raw.get("operation", "recall")
+    allowed_operations = {
+        "recall", "current_turn", "correction", "confirmation",
+        "learn", "ordinary",
+    }
+    if not isinstance(operation, str) or operation not in allowed_operations:
+        return None
     subject = raw.get("subject")
     if subject is not None and (not isinstance(subject, str)
                                 or not subject.strip() or len(subject) > 100):
@@ -100,9 +131,21 @@ def validate_plan(raw: object) -> Optional[MemoryPlan | str]:
     for key in ("first_mention", "reasons", "clarify"):
         if not isinstance(raw.get(key), bool):
             return None
+    result_count = raw.get("result_count")
+    if (result_count is not None and
+            (isinstance(result_count, bool) or not isinstance(result_count, int)
+             or not 1 <= result_count <= 30)):
+        return None
+    order = raw.get("order", "relevance")
+    if order not in ("relevance", "recent", "oldest"):
+        return None
+    temporal_scope = raw.get("temporal_scope", "current")
+    if temporal_scope not in ("current", "historical", "recent"):
+        return None
     return MemoryPlan(tuple(dict.fromkeys(sources)),
                       subject.strip() if subject else None, days,
-                      raw["first_mention"], raw["reasons"], raw["clarify"])
+                      raw["first_mention"], raw["reasons"], raw["clarify"],
+                      operation, result_count, order, temporal_scope)
 
 
 def interpret(brain: Brain, user_text: str, previous: tuple[dict[str, str], ...]):
