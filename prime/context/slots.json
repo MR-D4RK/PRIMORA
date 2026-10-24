@@ -1,0 +1,235 @@
+{
+  "version": 1,
+  "notes_cap": 20,
+  "block_heading": "The user's facts (user-stated only; use only when relevant; do not invent motives, emotions or reasons; override older claims; if absent, say unknown):",
+  "slots": [
+    {
+      "name": "first name",
+      "kind": "single",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user's first name is {value}.",
+      "phrasings": [
+        {"pattern": "^my first name is (?P<value>.+?)\\.?$"},
+        {"pattern": "^my name is (?P<value>.+?)\\.?$", "split_name": true},
+        {"pattern": "^call me (?P<value>.+?)\\.?$", "split_name": true},
+        {"pattern": "^i(?:'m| am) called (?P<value>.+?)\\.?$", "split_name": true}
+      ]
+    },
+    {
+      "name": "last name",
+      "kind": "single",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user's last name is {value}.",
+      "phrasings": [
+        {"pattern": "^my last name is (?P<value>.+?)\\.?$"}
+      ]
+    },
+    {
+      "name": "home location",
+      "kind": "single",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user's home location is {value}.",
+      "phrasings": [
+        {"pattern": "^my home location is (?P<value>.+?)\\.?$"},
+        {"pattern": "^i live in (?P<value>.+?)\\.?$"},
+        {"pattern": "^i(?:'m| am) living in (?P<value>.+?)\\.?$"},
+        {"pattern": "^i moved to (?P<value>.+?)\\.?$"}
+      ],
+      "retire_phrasings": [
+        {"pattern": "^i don'?t live in (?P<value>.+?)\\.?$"}
+      ]
+    },
+    {
+      "name": "timezone",
+      "kind": "single",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user's timezone is {value}.",
+      "phrasings": [
+        {"pattern": "^my timezone is (?P<value>.+?)\\.?$"}
+      ]
+    },
+    {
+      "name": "favorite color",
+      "kind": "single",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user's favorite color is {value}.",
+      "phrasings": [
+        {"pattern": "^my (?:fav|favorite|favourite) colou?r is (?P<value>.+?)\\.?$"},
+        {"pattern": "^(?!(?:what|which|who|whose|where|when|why|how|is|are|do|does|did|can|could|would)\\b)(?:actually[,!]?[ ]+)?(?P<value>[a-z][a-z0-9 '-]{0,48}?) is my (?:fav|favorite|favourite) colou?r(?: now)?\\.?$"}
+      ]
+    },
+    {
+      "name": "favorite car",
+      "kind": "single",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user's favorite car is {value}.",
+      "phrasings": [
+        {"pattern": "^my (?:fav|favorite|favourite) cars? is (?P<value>.+?)\\.?$"}
+      ]
+    },
+    {
+      "name": "languages",
+      "kind": "keyed",
+      "concept_slot": "languages",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user speaks {value}.",
+      "phrasings": [
+        {"pattern": "^i speak (?P<value>.+?)\\.?$"},
+        {"pattern": "^i can speak (?P<value>.+?)\\.?$"},
+        {"pattern": "^i(?:'m| am) fluent in (?P<value>.+?)\\.?$"}
+      ]
+    },
+    {
+      "name": "work or study",
+      "kind": "keyed",
+      "concept_slot": "work or study",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user {value}.",
+      "phrasings": [
+        {"pattern": "^i used to work as (?P<obj>.+?)\\.?$",
+         "key_group": "obj", "value_template": "worked as {obj} (former)"},
+        {"pattern": "^i no longer work as (?P<obj>.+?)\\.?$",
+         "key_group": "obj", "value_template": "worked as {obj} (former)"},
+        {"pattern": "^i work as (?P<obj>.+?)\\.?$",
+         "key_group": "obj", "value_template": "works as {obj}"},
+        {"pattern": "^i work at (?P<obj>.+?)\\.?$",
+         "key_group": "obj", "value_template": "works at {obj}"},
+        {"pattern": "^i study (?P<obj>.+?)\\.?$",
+         "key_group": "obj", "value_template": "studies {obj}"}
+      ]
+    },
+    {
+      "name": "goals",
+      "kind": "keyed",
+      "concept_slot": "goals",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "render": "The user has a goal: {value}.",
+      "phrasings": [
+        {"pattern": "^my goal is (?P<value>.+?)\\.?$",
+         "key_group": "value", "value_template": "{value} (active)"},
+        {"pattern": "^i finished my goal (?P<value>.+?)\\.?$",
+         "key_group": "value", "value_template": "{value} (done)"},
+        {"pattern": "^i dropped my goal (?P<value>.+?)\\.?$",
+         "key_group": "value", "value_template": "{value} (dropped)"},
+        {"pattern": "^my goal (?P<value>.+?) is (?P<status>done|dropped|finished)\\.?$",
+         "key_group": "value", "value_template": "{value} ({status})"}
+      ]
+    },
+    {
+      "name": "likes",
+      "kind": "keyed",
+      "concept_slot": "likes",
+      "mtype": "PREFERENCE",
+      "scope": "global",
+      "protected": false,
+      "render": "The user {value}.",
+      "phrasings": [
+        {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>purple) whether it(?:'s| is|s) bright or not\\.?$",
+         "key_group": "obj", "value_template": "loves {obj} in any shade"},
+        {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
+         "key_group": "obj", "value_template": "loves {obj}"},
+        {"pattern": "^i (?:really )?(?:hate|dislike) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
+         "key_group": "obj", "value_template": "hates {obj}"},
+        {"pattern": "^i (?:do not|don't) like (?P<obj>.+?)(?: anymore)?\\.?$",
+         "key_group": "obj", "value_template": "dislikes {obj}"},
+        {"pattern": "^(?:(?:yeah|yes)[,!]?\\s+)?(?:but\\s+)?(?P<obj>[a-z0-9][a-z0-9 '-]{0,60}?)\\s+is\\s+on\\s+another\\s+level\\s+for\\s+me(?:[,!]?\\s+(?:don'?t|do not)\\s+forget\\s+it)?[.!]?$",
+         "key_group": "obj", "value_template": "feels {obj} is on another level"}
+      ]
+    },
+    {
+      "name": "color feeling",
+      "kind": "keyed",
+      "concept_slot": "color feeling",
+      "mtype": "PREFERENCE",
+      "scope": "global",
+      "protected": false,
+      "render": "The user says {value}.",
+      "phrasings": [
+        {"pattern": "^(?P<obj>purple) feels? (?:quite )?like (?P<target>violet)(?: colou?r)? to me\\.?$",
+         "key_group": "obj", "value_template": "{obj} feels similar to {target} to them"}
+      ]
+    },
+    {
+      "name": "decision",
+      "kind": "keyed",
+      "concept_slot": "decision",
+      "mtype": "DECISION",
+      "scope": "global",
+      "protected": false,
+      "render": "The user decided: {value}.",
+      "phrasings": [
+        {"pattern": "^we (?:decided|chose|choose|have decided|have chosen|kept) (?:to |that |on )?(?P<value>.+?)\\.?$",
+         "transforms": ["strip_article"]},
+        {"pattern": "^we (?:are|were) keeping (?P<value>.+?)\\.?$",
+         "transforms": ["strip_article"], "value_template": "keeping {value}"},
+        {"pattern": "^we'?ve decided not to use (?P<value>.+?)\\.?$",
+         "value_template": "not use {value}"},
+        {"pattern": "^let'?s keep (?P<a>.+?) as (?P<b>.+?)\\.?$",
+         "value_template": "keep {a} as {b}"}
+      ]
+    },
+    {
+      "name": "instruction",
+      "kind": "keyed",
+      "concept_slot": "instruction",
+      "mtype": "INSTRUCTION",
+      "scope": "global",
+      "protected": true,
+      "render": "The user's rule: {value}.",
+      "phrasings": [
+        {"pattern": "^always (?P<value>.+?)\\.?$"},
+        {"pattern": "^never (?P<value>.+?)\\.?$",
+         "value_template": "never {value}"},
+        {"pattern": "^from now on[,:]\\s+(?P<value>.+?)\\.?$",
+         "transforms": ["strip_always"]},
+        {"pattern": "^ask me before (?P<value>.+?)\\.?$",
+         "value_template": "ask me before {value}"},
+        {"pattern": "^check with me before (?P<value>.+?)\\.?$",
+         "value_template": "check with me before {value}"}
+      ]
+    },
+    {
+      "name": "notes",
+      "kind": "keyed",
+      "concept_slot": "notes",
+      "mtype": "FACT",
+      "scope": "global",
+      "protected": false,
+      "fallback_only": true,
+      "render": "The user noted: {value}.",
+      "phrasings": [
+        {"pattern": "^i(?:'m| am| have|'ve| was) (?P<value>.+?)\\.?$",
+         "min_words": 2},
+        {"pattern": "^(?:but\\s+)?(?P<value>.+?\\bhas\\s+(?:a\\s+)?special\\s+place\\s+in\\s+my\\s+heart)\\.?$",
+         "min_words": 3}
+      ]
+    }
+  ],
+  "learned_favorite": {
+    "pattern": "^my\\s+(?:fav|favorite|favourite)\\s+(?P<noun>[a-z][a-z0-9'\\- ]{0,40}?)\\s+is\\s+(?P<value>.+?)\\.?$",
+    "synonyms": {"colour": "color"},
+    "render": "The user's favorite {noun} is {value}."
+  },
+  "revocations": [
+    {"pattern": "^stop doing (?P<value>.+?)\\.?$"},
+    {"pattern": "^forget (?:that|the) rule(?:\\s+about\\s+(?P<value>.+?))?\\.?$"}
+  ]
+}
