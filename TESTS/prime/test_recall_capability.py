@@ -209,11 +209,13 @@ class TestCapabilityContract:
         assert result.status is RequestStatus.FAILURE
         assert "recall_failed" in result.error
 
-    def test_result_carries_only_role_and_content(self):
+    def test_result_carries_typed_evidence_metadata(self):
         prime = _prime_with_memory("c7.db")
         out = prime.handle(PrimeRequest("recall", {"query": "deployment key"}))
         for item in out.output["results"]:
-            assert set(item) == {"role", "content"}
+            assert {"role", "content", "source_type", "source_id",
+                    "authority", "status", "session_id", "timestamp",
+                    "confidence"} <= set(item)
 
 
 # ======================================================================

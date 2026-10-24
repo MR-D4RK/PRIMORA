@@ -144,7 +144,7 @@ class RecallSpecialist(Specialist):
             {
                 "query": query,
                 "results": [
-                    {"role": item.get("role"), "content": item.get("content")}
+                    dict(item)
                     for item in filtered
                 ],
             }

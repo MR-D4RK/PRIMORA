@@ -108,24 +108,36 @@ class LearnSpecialist(Specialist):
         if self._mind is None:
             return PrimeResult.failure("learn is not bound to a Mind")
 
-        # Record into the session the conversation is actually in. Assuming
-        # "default" would write into a different scope than the dialogue and
-        # surface later as the same memory stored twice. Degrades to
-        # "default" for a minimal Mind-like collaborator.
-        session_id = (
-            payload.get("session_id")
-            or getattr(self._mind, "current_session_id", None)
-            or "default"
-        )
+        # During cognition the loop binds a trusted execution session. A
+        # model-supplied session id may match that binding for compatibility,
+        # but it can never redirect a write into another conversation.
+        trusted_session = getattr(self._mind, "execution_session_id", None)
+        requested_session = payload.get("session_id")
+        if trusted_session:
+            if requested_session is not None and requested_session != trusted_session:
+                return PrimeResult.failure(
+                    "'session_id' is controlled by the active execution session"
+                )
+            session_id = trusted_session
+        else:
+            # Direct programmatic callers retain the historical API. The live
+            # cognitive path always has a trusted binding above.
+            session_id = (
+                requested_session
+                or getattr(self._mind, "current_session_id", None)
+                or "default"
+            )
         if not isinstance(session_id, str) or not session_id.strip():
             return PrimeResult.failure("'session_id' must be a non-empty string")
 
         try:
             effective, diagnostic = self._attest(text, provenance)
-        except Exception:
-            # Attestation must never block a legitimate lesson. If it cannot
-            # be checked, the claim stands as labelled.
-            effective, diagnostic = provenance, ""
+        except Exception as exc:
+            # A provenance check is part of the memory trust boundary. If it
+            # cannot run, do not promote a model-provided label by default.
+            return PrimeResult.failure(
+                f"provenance_attestation_failed: {type(exc).__name__}"
+            )
 
         try:
             summary = self._mind.learn(

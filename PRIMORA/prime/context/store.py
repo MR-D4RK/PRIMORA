@@ -6,6 +6,7 @@ otherwise (probed, never assumed).
 """
 
 import hashlib
+import json
 import math
 import os
 import sqlite3
@@ -235,6 +236,16 @@ CREATE TABLE IF NOT EXISTS retrieval_index_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS formation_status (
+    message_id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    diagnostics TEXT NOT NULL DEFAULT '[]',
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_formation_status_session
+    ON formation_status(session_id, status);
 """
 
 _FTS_SCHEMA = """
@@ -378,6 +389,62 @@ class ContextStore:
                 (session_id, seq, fp),
             ).fetchone()
             return row[0], False, diagnostic
+
+    def set_formation_status(
+        self, message_id: int, session_id: str, status: str,
+        diagnostics: Optional[list[str]] = None,
+    ) -> None:
+        """Record idempotent derived-memory formation progress."""
+        if status not in ("processing", "complete", "incomplete"):
+            raise ValueError("invalid formation status")
+        payload = json.dumps(list(diagnostics or []), ensure_ascii=False)
+        with self._connect() as con:
+            con.execute(
+                "INSERT INTO formation_status"
+                "(message_id, session_id, status, attempts, diagnostics, updated_at)"
+                " VALUES (?, ?, ?, 1, ?, ?)"
+                " ON CONFLICT(message_id) DO UPDATE SET"
+                " session_id=excluded.session_id, status=excluded.status,"
+                " attempts=formation_status.attempts + 1,"
+                " diagnostics=excluded.diagnostics, updated_at=excluded.updated_at",
+                (int(message_id), session_id, status, payload, time.time()),
+            )
+
+    def formation_status(
+        self, message_id: Optional[int] = None,
+        session_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Read derived-memory formation progress for diagnostics/replay."""
+        query = (
+            "SELECT message_id, session_id, status, attempts, diagnostics,"
+            " updated_at FROM formation_status WHERE 1=1"
+        )
+        params: list[Any] = []
+        if message_id is not None:
+            query += " AND message_id = ?"
+            params.append(int(message_id))
+        if session_id is not None:
+            query += " AND session_id = ?"
+            params.append(session_id)
+        if status is not None:
+            query += " AND status = ?"
+            params.append(status)
+        query += " ORDER BY message_id ASC"
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        out = []
+        for row in rows:
+            try:
+                details = json.loads(row[4])
+            except (TypeError, ValueError):
+                details = []
+            out.append({
+                "message_id": row[0], "session_id": row[1],
+                "status": row[2], "attempts": row[3],
+                "diagnostics": details, "updated_at": row[5],
+            })
+        return out
 
     def save_experience_event(
         self, session_id: str, source_message_id: int,

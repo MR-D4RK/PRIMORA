@@ -18,12 +18,15 @@ from PRIMORA.research import (
     SearXNGService,
 )
 from PRIMORA.aurora import Aurora
+from PRIMORA.consult.catalogue import SpecialistRegistry
+from PRIMORA.learning import ModelJev
 from PRIMORA.aurora.interface.server import serve, HOST, PORT
 from PRIMORA.model_server import (
     ModelServerError,
     ModelServerService,
     should_manage,
 )
+from PRIMORA.toolbox.base import ToolRegistry
 
 # Fallback model name used only when PRIMORA_OLLAMA_MODEL is unset.
 # The provider is Prime's fallback for non-specialist capabilities and is
@@ -139,6 +142,17 @@ def prime_provider_from_env(env=None, model=None):
     )
 
 
+def build_prime(provider, research_provider=None):
+    """Compose the production Prime boundary with explicit safe capabilities."""
+    return Prime(
+        provider,
+        research_provider=research_provider,
+        specialists=SpecialistRegistry.from_env(),
+        jev=ModelJev(provider),
+        tools=ToolRegistry.with_builtins(),
+    )
+
+
 def main():
     print("Starting PRIMORA...")
     print("Type 'exit' or 'quit' to quit.\n")
@@ -220,9 +234,7 @@ def main():
         if isinstance(research_provider, SearXNGResearchProvider):
             research_service = SearXNGService.from_env()
             research_service.start()
-        prime = Prime(
-            provider, research_provider=research_provider
-        )
+        prime = build_prime(provider, research_provider)
         aurora = Aurora(prime)
     except Exception as e:
         print(f"ERROR: Failed to initialize PRIMORA: {e}")

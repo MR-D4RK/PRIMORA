@@ -151,6 +151,9 @@ CROSS_SESSION_CAP = 3
 # into the conversation and an answer must be evidence, never the machinery
 # that produced a previous answer.
 INTERNAL_ROLES = frozenset({"tool", "system"})
+ASSISTANT_CONTEXT_PREFIX = (
+    "[conversation context; assistant-authored, not user evidence]\n"
+)
 
 # Per-result character cap for recall output.
 #
@@ -555,7 +558,19 @@ class ContextManager:
             if len(content) > RECALL_MAX_CONTENT_CHARS:
                 content = (content[:RECALL_MAX_CONTENT_CHARS]
                            + RECALL_TRUNCATION_MARKER)
-            out.append({"role": message.role, "content": content})
+            user_source = message.role == "user"
+            out.append({
+                "role": message.role,
+                "content": content,
+                "source_type": "user_statement" if user_source
+                else "conversation_context",
+                "source_id": message.message_id,
+                "authority": "user" if user_source else "assistant",
+                "status": "observed",
+                "session_id": message.session_id,
+                "timestamp": message.timestamp,
+                "confidence": 1.0 if user_source else 0.3,
+            })
             if len(out) >= limit:
                 break
         return out
@@ -2257,6 +2272,13 @@ class ContextManager:
                 if conflict:
                     diagnostics.append(conflict)
                 if is_new:
+                    formation_diags: list[str] = []
+                    try:
+                        store.set_formation_status(
+                            message_id, session_id, "processing")
+                    except Exception as e:
+                        formation_diags.append(
+                            f"formation_status_failed: {e}")
                     # M3 episodic evidence is independent of semantic memory.
                     # Only new explicit user reports are admitted, and the
                     # original message is the source of both text and time.
@@ -2269,7 +2291,7 @@ class ContextManager:
                                     claim.actor, claim.statement,
                                 )
                         except Exception as e:
-                            diagnostics.append(f"episode_capture_failed: {e}")
+                            formation_diags.append(f"episode_capture_failed: {e}")
                     # M4 structured-memory formation first. M5 entity,
                     # alias, and relationship formation runs after it, from
                     # the same persisted message id, and is independently
@@ -2292,19 +2314,34 @@ class ContextManager:
                             assistant_question = self._prior_assistant_text(
                                 store, session_id, message_id
                             )
-                    diagnostics.extend(
+                    formation_diags.extend(
                         self._extract_states(
                             store, session_id, message_id, role, content,
                             context_question, assistant_question,
                         )
                     )
                     if role == "user":
-                        diagnostics.extend(
+                        formation_diags.extend(
                             self._extract_entities(
                                 store, session_id, message_id, content,
                                 timestamp,
                             )
                         )
+                    diagnostics.extend(formation_diags)
+                    failed = any(
+                        item.startswith((
+                            "episode_capture_failed", "state_failed", "m5_failed",
+                            "entity_failed", "formation_status_failed",
+                        )) for item in formation_diags
+                    )
+                    try:
+                        store.set_formation_status(
+                            message_id, session_id,
+                            "incomplete" if failed else "complete",
+                            formation_diags,
+                        )
+                    except Exception as e:
+                        diagnostics.append(f"formation_status_failed: {e}")
             except Exception as e:
                 diagnostics.append(f"store_unavailable: {e}")
                 break
@@ -2312,6 +2349,64 @@ class ContextManager:
                 prior_user = content
             elif role == "assistant":
                 prior_assistant = content
+        return diagnostics
+
+    def formation_status(
+        self, session_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """Inspect derived-memory formation without mutating history."""
+        try:
+            return self._get_store().formation_status(
+                session_id=session_id, status=status)
+        except Exception:
+            return []
+
+    def replay_formation(
+        self, session_id: str, message_id: int,
+    ) -> list[str]:
+        """Retry derived formation for one immutable raw message.
+
+        Writes remain idempotent and the raw message is never changed. This
+        is intentionally explicit so recovery cannot silently reprocess every
+        historical row during normal startup.
+        """
+        store = self._get_store()
+        message = store.fetch_message(int(message_id))
+        if message is None or message.session_id != session_id:
+            return ["formation_replay_failed: message not found in session"]
+        diagnostics: list[str] = []
+        try:
+            store.set_formation_status(message_id, session_id, "processing")
+            if message.role == "user":
+                claim = extract_experience_claim(message.content, message.role)
+                if claim is not None:
+                    store.save_experience_event(
+                        session_id, message_id, claim.kind,
+                        claim.actor, claim.statement)
+            prior_user = self._prior_user_text(store, session_id, message_id)
+            prior_assistant = self._prior_assistant_text(
+                store, session_id, message_id)
+            diagnostics.extend(self._extract_states(
+                store, session_id, message_id, message.role, message.content,
+                prior_user, prior_assistant))
+            if message.role == "user":
+                diagnostics.extend(self._extract_entities(
+                    store, session_id, message_id, message.content,
+                    message.timestamp))
+            failed = any(item.startswith((
+                "episode_capture_failed", "state_failed", "m5_failed",
+                "entity_failed")) for item in diagnostics)
+            store.set_formation_status(
+                message_id, session_id,
+                "incomplete" if failed else "complete", diagnostics)
+        except Exception as exc:
+            diagnostics.append(f"formation_replay_failed: {exc}")
+            try:
+                store.set_formation_status(
+                    message_id, session_id, "incomplete", diagnostics)
+            except Exception:
+                pass
         return diagnostics
 
     @staticmethod
@@ -2560,6 +2655,7 @@ class ContextManager:
         max_new_tokens: int = 256,
         budget: Optional[BudgetConfig] = None,
         working=None,
+        protected_messages: Optional[list[dict[str, str]]] = None,
     ) -> BuildResult:
         """Assemble a bounded working view for one model call.
 
@@ -2629,6 +2725,24 @@ class ContextManager:
         if current is not None:
             selected_texts.append(current.get("content", ""))
         total = base_tokens + current_tokens
+
+        # Capability results are evidence for the next generation, not
+        # ordinary history.  The loop marks the latest request/result pair so
+        # history trimming cannot silently remove the result Aurora must use.
+        # The fitting path may compact a large tool payload, but it always
+        # records what happened in diagnostics.
+        protected = self._fit_protected_messages(
+            protected_messages or [], counter, cfg, total, diagnostics,
+        )
+        for protected_message in protected:
+            fp = self._fp(protected_message)
+            if fp in selected_fps:
+                continue
+            selected.append(protected_message)
+            selected_fps.add(fp)
+            selected_texts.append(protected_message.get("content", ""))
+            total += self._safe_count(
+                counter, [protected_message], diagnostics)
 
         # 3b. Working Memory layer (optional, runtime-only, never persisted).
         # Task state frames the request right after the system instruction.
@@ -2817,11 +2931,13 @@ class ContextManager:
         # is prepended explicitly below, so it must be excluded here to
         # avoid emitting the system instruction twice.
         fact_ids = {id(m) for m in fact_msgs}
+        protected_fps = {self._fp(m) for m in protected}
         synth = [
             m for m in selected
             if id(m) not in history_pos
             and not (system_msg is not None and m is system_msg)
             and id(m) not in fact_ids
+            and self._fp(m) not in protected_fps
         ]
         before_current: list[dict] = []
         after_current: list[dict] = []
@@ -2841,6 +2957,7 @@ class ContextManager:
             + fact_msgs
             + ([current] if current is not None else [])
             + after_current
+            + protected
         )
 
         allowed = max(
@@ -2873,6 +2990,64 @@ class ContextManager:
     @staticmethod
     def _fp(msg: dict[str, str]) -> str:
         return f"{msg.get('role', '')}\x00{msg.get('content', '')}"
+
+    def _fit_protected_messages(
+        self,
+        messages: list[dict[str, str]],
+        counter: Callable[[list[dict[str, str]]], int],
+        cfg: BudgetConfig,
+        total: int,
+        diagnostics: list[str],
+    ) -> list[dict[str, str]]:
+        """Fit mandatory capability evidence without silent eviction.
+
+        The latest assistant request and tool result are a pair.  If the
+        result is too large for the remaining input budget, its payload is
+        compacted with an explicit marker.  Older history is trimmed later,
+        so a successful result cannot disappear merely because it was large.
+        """
+        if not messages:
+            return []
+        out: list[dict[str, str]] = []
+        remaining = max(0, cfg.input_ceiling - total)
+        for original in messages:
+            if remaining <= 0:
+                diagnostics.append("evidence_omitted: no context budget")
+                break
+            message = {
+                "role": str(original.get("role", "tool")),
+                "content": str(original.get("content", "")),
+            }
+            cost = self._safe_count(counter, [message], diagnostics)
+            if cost > remaining:
+                marker = "\n[evidence truncated to fit context budget]"
+                # Character estimation is deliberately conservative; the loop
+                # below verifies the real injected counter before admitting.
+                target_chars = max(32, remaining * 4 - len(marker))
+                if len(message["content"]) > target_chars:
+                    message["content"] = message["content"][:target_chars] + marker
+                    diagnostics.append("evidence_truncated: capability result")
+                    cost = self._safe_count(counter, [message], diagnostics)
+                while cost > remaining and len(message["content"]) > 64:
+                    message["content"] = message["content"][: max(
+                        64, len(message["content"]) // 2
+                    )] + marker
+                    cost = self._safe_count(counter, [message], diagnostics)
+            if cost > remaining:
+                compact = {
+                    "role": message["role"],
+                    "content": "[capability evidence unavailable: context budget exhausted]",
+                }
+                compact_cost = self._safe_count(counter, [compact], diagnostics)
+                if compact_cost <= remaining:
+                    message, cost = compact, compact_cost
+                    diagnostics.append("evidence_compacted: capability result")
+                else:
+                    diagnostics.append("evidence_omitted: capability result")
+                    continue
+            out.append(message)
+            remaining -= cost
+        return out
 
     @staticmethod
     def _estimate_messages(messages: list[dict[str, str]]) -> int:
@@ -2981,6 +3156,8 @@ class ContextManager:
             for hit in hits:
                 if hit.message_id in seen_ids:
                     continue
+                if hit.role in INTERNAL_ROLES:
+                    continue
                 seen_ids.add(hit.message_id)
                 if hit.message_id in stale_ids:
                     suppressed += 1
@@ -3034,6 +3211,8 @@ class ContextManager:
                 continue
             for hit in hits:
                 if hit.session_id == session_id:
+                    continue
+                if hit.role in INTERNAL_ROLES:
                     continue
                 if hit.message_id not in seen_ids:
                     seen_ids.add(hit.message_id)
@@ -3232,12 +3411,17 @@ class ContextManager:
     ) -> tuple[list[dict], int]:
         """The pre-M6 admission path with focused-evidence filtering."""
         admitted: list[dict] = []
-        for _score, _seq, hit, _breakdown in collected["same"]:
+        for _score, _seq, hit, breakdown in collected["same"]:
             if not self._focused_evidence_matches(hit, focus_terms):
+                continue
+            if breakdown.get("relevance", 0.0) <= 0:
                 continue
             if total >= cfg.input_ceiling:
                 break
-            msg = {"role": hit.role, "content": hit.content}
+            content = hit.content
+            if hit.role == "assistant":
+                content = ASSISTANT_CONTEXT_PREFIX + content
+            msg = {"role": hit.role, "content": content}
             fp = f"{hit.role}\x00{hit.content}"
             if fp in selected_fps:
                 continue
@@ -3255,7 +3439,8 @@ class ContextManager:
             cross = self._admit_cross_session(
                 session_id,
                 [item for item in collected["cross"]
-                 if self._focused_evidence_matches(item[3], focus_terms)],
+                 if item[4].get("relevance", 0.0) > 0
+                 and self._focused_evidence_matches(item[3], focus_terms)],
                 selected_fps,
                 selected_texts, counter, cfg, total, diagnostics,
             )
@@ -3305,6 +3490,8 @@ class ContextManager:
         ordered: list[StoredMessage] = []
         seen: set[int] = set()
         for message in store.fetch_messages_by_ids(message_ids[:256]):
+            if message.role in INTERNAL_ROLES:
+                continue
             if not self._focused_evidence_matches(message, focus_terms):
                 continue
             if message.message_id in seen:
@@ -3329,6 +3516,8 @@ class ContextManager:
             content = message.content
             if is_foreign:
                 content = f"{CROSS_SESSION_PREFIX}{content}"
+            elif message.role == "assistant":
+                content = ASSISTANT_CONTEXT_PREFIX + content
             fp = f"{message.role}\x00{content}"
             if fp in selected_fps:
                 continue
@@ -3407,10 +3596,14 @@ class ContextManager:
         if not self._include_foreign_history:
             return [], total
         admitted: list[dict] = []
-        for _, _, _, hit, _breakdown in scored[:cap]:
+        for _, _, _, hit, breakdown in scored[:cap]:
+            if hit.role in INTERNAL_ROLES or breakdown.get("relevance", 0.0) <= 0:
+                continue
             if total >= cfg.input_ceiling:
                 break
             content = f"{CROSS_SESSION_PREFIX}{hit.content}"
+            if hit.role == "assistant":
+                content = CROSS_SESSION_PREFIX + ASSISTANT_CONTEXT_PREFIX + hit.content
             fp = f"{hit.role}\x00{content}"
             if fp in selected_fps:
                 continue

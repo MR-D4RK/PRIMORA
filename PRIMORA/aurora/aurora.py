@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import Callable, Optional
 from PRIMORA.prime.context import BudgetConfig
@@ -219,15 +220,14 @@ class Aurora:
         # Milestone 1: Aurora is handed a Mind, the cognitive boundary, and
         # receives one unified CognitiveContext. A raw ContextManager is still
         # accepted and wrapped, so every existing call site keeps working.
-        if mind is not None:
-            self._mind = mind
-        elif context_manager is not None:
-            # An explicit manager means an isolated store (a test, a tool,
-            # or a per-task runtime), so it gets its own Mind.
-            self._mind = (
-                context_manager if isinstance(context_manager, Mind)
-                else Mind(context_manager)
-            )
+        if mind is not None or context_manager is not None:
+            # Prime owns the boundary. Rebinding through its seam also updates
+            # recall and learning handlers, so an explicit store cannot split
+            # Aurora's conversation from the capability store.
+            binder = getattr(prime, "bind_memory_boundary", None)
+            if not callable(binder):
+                raise TypeError("Prime does not support a shared memory boundary")
+            self._mind = binder(context_manager=context_manager, mind=mind)
         else:
             # Default path: share Prime's single Mind, so the task-local
             # Working Memory belongs to the Prime/Aurora pair, not to a
@@ -249,6 +249,11 @@ class Aurora:
             budget=self._budget(),
             token_counter=self._token_counter(),
             request_extractor=extract_prime_request,
+            enable_memory_interpreter=(
+                str(os.environ.get("PRIMORA_AURORA_MEMORY_INTERPRETER", "1"))
+                .strip().lower() in ("1", "true", "yes", "on")
+                and isinstance(self._brain, (AuroraBrain, OpenAIBrain))
+            ),
         )
         # The learn capability checks a self-reported provenance against what
         # the turn actually gathered, which only the loop's executor records.

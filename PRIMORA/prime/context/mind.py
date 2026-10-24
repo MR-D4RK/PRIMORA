@@ -237,6 +237,7 @@ class Mind:
         self._working = working
         self._last: Optional[CognitiveContext] = None
         self._traces_seen = 0
+        self._execution_session_id: Optional[str] = None
 
     # -- composition ------------------------------------------------------
 
@@ -288,6 +289,16 @@ class Mind:
         if isinstance(session_id, str) and session_id:
             return session_id
         return "default"
+
+    @property
+    def execution_session_id(self) -> Optional[str]:
+        """Trusted session bound by the active cognitive execution."""
+        return self._execution_session_id
+
+    def bind_execution_session(self, session_id: str) -> None:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("execution session must be a non-empty string")
+        self._execution_session_id = session_id
 
     # -- Active Memory ----------------------------------------------------
 
@@ -394,7 +405,7 @@ class Mind:
 
     def verified_episode_history(self, question: str, *,
                                  context: tuple[str, ...] = ()) -> Optional[str]:
-        """Read verified, source-backed cross-session experiences through Prime."""
+        """Read verified, source-backed experiences through Prime."""
         return self._mechanisms.verified_episode_history(question, context=context)
 
     # -- conversation -----------------------------------------------------
@@ -432,6 +443,7 @@ class Mind:
         budget: Optional[BudgetConfig] = None,
         working: Optional[WorkingMemory] = None,
         include_active_memory: bool = True,
+        protected_messages: Optional[list[dict[str, str]]] = None,
     ) -> CognitiveContext:
         """Assemble the one unified context for Aurora.
 
@@ -448,6 +460,7 @@ class Mind:
             max_new_tokens=max_new_tokens,
             budget=budget,
             working=effective_working,
+            protected_messages=protected_messages,
         )
 
         traces = self._mechanisms.retrieval_traces()

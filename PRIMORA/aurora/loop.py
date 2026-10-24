@@ -216,6 +216,33 @@ def _payload_of(request: Any) -> tuple[Any, Any, Any]:
             getattr(request, "metadata", None))
 
 
+def _protected_evidence_tail(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the latest assistant-request/tool-result pair.
+
+    Capability evidence is the input to the next cognition segment.  Keeping
+    this small pair mandatory avoids treating an old transcript as equally
+    important while preserving valid chat-message ordering.
+    """
+    last_user = -1
+    for index, message in enumerate(messages):
+        if message.get("role") == "user":
+            last_user = index
+    tail = messages[last_user + 1:]
+    if not tail:
+        return []
+    tool_index = next(
+        (index for index in range(len(tail) - 1, -1, -1)
+         if tail[index].get("role") == "tool"),
+        None,
+    )
+    if tool_index is None:
+        return [tail[-1]]
+    start = tool_index
+    if start > 0 and tail[start - 1].get("role") == "assistant":
+        start -= 1
+    return tail[start:tool_index + 1]
+
+
 def _answer_result(
     result: Optional[BrainResult], extract: Callable[[str], Any], model: str
 ) -> Optional[BrainResult]:
@@ -419,12 +446,11 @@ class CapabilityExecutor:
         )
         if result.status.value == "success":
             self.succeeded.append(action)
-        # A bounded, session-scoped fingerprint of what this turn returned.
-        # Words, not output: enough to recognise provenance later, with
-        # nothing unbounded kept alive for the purpose.
-        self.evidence.append((action, _fingerprint(rendered)))
-        if len(self.evidence) > EVIDENCE_MAX_ENTRIES:
-            del self.evidence[:-EVIDENCE_MAX_ENTRIES]
+            # Only successful capability results can support a later learning
+            # claim. Failed searches and rejected writes are not evidence.
+            self.evidence.append((action, _fingerprint(rendered[:EVIDENCE_CHARS])))
+            if len(self.evidence) > EVIDENCE_MAX_ENTRIES:
+                del self.evidence[:-EVIDENCE_MAX_ENTRIES]
         return rendered
 
 
@@ -550,6 +576,12 @@ class CognitiveLoop:
             except TypeError:
                 # A replaceable executor may accept no argument at all.
                 begin()
+        bind_session = getattr(self._mind, "bind_execution_session", None)
+        if callable(bind_session):
+            try:
+                bind_session(session_id)
+            except Exception:
+                pass
 
         # The same Mind, and therefore the same task-local Working Memory,
         # for the whole session. Never rebuilt per segment.
@@ -732,6 +764,7 @@ class CognitiveLoop:
                     token_counter=self._counter(),
                     max_new_tokens=self.max_new_tokens,
                     budget=self._budget,
+                    protected_messages=_protected_evidence_tail(messages),
                 )
             except ContextTooLargeError as exc:
                 trace.stop_reason = "context_too_large"
@@ -756,11 +789,24 @@ class CognitiveLoop:
 
             seg_started = time.perf_counter()
             try:
-                generated = self._brain.generate(
-                    context.messages,
-                    max_output_tokens=context.allowed_output,
-                    on_delta=on_delta,
-                )
+                generation_kwargs = {
+                    "max_output_tokens": context.allowed_output,
+                }
+                # Keep the optional streaming keyword out of the call when no
+                # callback is requested. This preserves compatibility with
+                # existing lightweight Brain implementations while retaining
+                # streaming for production brains that support it.
+                if on_delta is not None:
+                    generation_kwargs["on_delta"] = on_delta
+                try:
+                    generated = self._brain.generate(
+                        context.messages, **generation_kwargs)
+                except TypeError as exc:
+                    if on_delta is None or "on_delta" not in str(exc):
+                        raise
+                    generation_kwargs.pop("on_delta", None)
+                    generated = self._brain.generate(
+                        context.messages, **generation_kwargs)
             except Exception as exc:
                 trace.stop_reason = f"generate_failed: {type(exc).__name__}"
                 if result is not None:
@@ -1037,10 +1083,6 @@ class CognitiveLoop:
             signature = _request_signature(
                 getattr(request, "action", ""), payload, context_data, metadata
             )
-            # Re-running a request that already succeeded is redundant: the
-            # result is in the context and nothing new can come of it. Give
-            # the model one correction turn to answer from that result, then
-            # stop instead of executing again.
             if signature in succeeded_signatures:
                 if repeat_granted:
                     trace.stop_reason = "repeated_request"
@@ -1053,8 +1095,7 @@ class CognitiveLoop:
                         "error": (
                             "repeated_request: this exact request already "
                             "ran successfully this turn. Do not request it "
-                            "again; answer from the result you already "
-                            "have, or ask for something different."
+                            "again; answer from the result you already have."
                         ),
                     })},
                 ]

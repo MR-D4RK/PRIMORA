@@ -62,7 +62,8 @@ class CapabilityRegistry:
             CapabilitySpec(
                 name="recall",
                 description=(
-                    "One read-only memory access capability. Always provide query. "
+                    "One read-only stored conversation memory access capability. "
+                    "Always provide query. "
                     "For personal history, dates, preferences, and experiences, "
                     "also provide sources (list: preferences/experiences/facts) "
                     "to get user-source evidence and statement timestamps. "

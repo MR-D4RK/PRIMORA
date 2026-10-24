@@ -555,7 +555,7 @@ class TestProtectionsApply:
         a.mind.begin_task("s", "t")
         a.respond([{"role": "user", "content": "go"}], "s")
         assert a.loop.last_trace.stop_reason == "repeated_request"
-        assert COUNTER["n"] == 2, "allowed twice, then blocked"
+        assert COUNTER["n"] == 1, "a successful duplicate is refused"
 
     def test_tools_go_through_the_one_executor(self):
         """No side door around the budget."""

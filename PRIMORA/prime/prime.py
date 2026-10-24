@@ -11,12 +11,26 @@ from PRIMORA.toolbox.base import ToolRegistry
 
 class Prime:
     def __init__(self, provider, research_provider=None, specialists=None,
-                 jev=None, tools=None):
+                 jev=None, tools=None, context_manager=None, mind=None):
         if provider is None:
             raise ValueError("Prime requires a Provider")
         self._registry = CapabilityRegistry()
-        self._context = ContextManager()
-        self._mind = Mind(self._context)
+        if mind is not None and not isinstance(mind, Mind):
+            raise TypeError("mind must be a Mind")
+        if context_manager is not None and isinstance(context_manager, Mind):
+            if mind is not None and mind is not context_manager:
+                raise ValueError("context_manager Mind conflicts with mind")
+            mind = context_manager
+            context_manager = None
+        if mind is not None:
+            mechanisms = mind.mechanisms
+            if context_manager is not None and mechanisms is not context_manager:
+                raise ValueError("mind and context_manager must share mechanisms")
+            self._mind = mind
+            self._context = mechanisms
+        else:
+            self._context = context_manager or ContextManager()
+            self._mind = Mind(self._context)
         self._orchestrator = Orchestrator(provider, self._registry)
         # The recall capability answers from the Mind, and the registry is
         # built before the Mind exists, so bind it here. Every other
@@ -66,6 +80,35 @@ class Prime:
         use_tool = self._registry.get_specialist("use_tool")
         if use_tool is not None:
             use_tool.set_tools(self._tools)
+
+    def bind_memory_boundary(self, context_manager=None, mind=None) -> Mind:
+        """Bind Prime and every memory capability to one Mind.
+
+        This is the supported seam for embedding PRIMORA with an explicit
+        ContextManager.  A capability must never retain the old default
+        database after Aurora receives a caller-owned memory boundary.
+        """
+        if mind is not None and not isinstance(mind, Mind):
+            raise TypeError("mind must be a Mind")
+        if isinstance(context_manager, Mind):
+            if mind is not None and mind is not context_manager:
+                raise ValueError("context_manager Mind conflicts with mind")
+            mind = context_manager
+            context_manager = None
+        if mind is None:
+            if context_manager is None:
+                raise ValueError("bind_memory_boundary requires a Mind or ContextManager")
+            mind = Mind(context_manager)
+        if context_manager is not None and mind.mechanisms is not context_manager:
+            raise ValueError("mind and context_manager must share mechanisms")
+        self._mind = mind
+        self._context = mind.mechanisms
+        for name in ("recall", "learn"):
+            specialist = self._registry.get_specialist(name)
+            binder = getattr(specialist, "bind", None)
+            if callable(binder):
+                binder(mind)
+        return mind
 
     @property
     def tools(self) -> ToolRegistry:
