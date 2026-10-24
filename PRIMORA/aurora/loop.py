@@ -76,10 +76,15 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from PRIMORA.aurora.brain import Brain, BrainResult
+from PRIMORA.aurora.brain import Brain, BrainResult, AuroraBrain, OpenAIBrain
 from PRIMORA.aurora.claims import unsupported_claim_error
 from PRIMORA.aurora.citations import dangling_citation_error
+from PRIMORA.aurora.conversation_guard import (
+    reject_unrequested_lookup, latest_user_text, repeats_answer_after_correction,
+    denies_assumption_after_correction,
+)
 from PRIMORA.aurora import request_shape
+from PRIMORA.aurora import memory_coordinator
 from PRIMORA.prime.context import BudgetConfig, ContextTooLargeError
 from PRIMORA.prime.context.mind import Mind
 
@@ -459,6 +464,7 @@ class CognitiveLoop:
         deadline_s: float = DEFAULT_DEADLINE_S,
         max_repeats: int = DEFAULT_MAX_REPEATS,
         request_extractor: Optional[Callable[[str], Any]] = None,
+        enable_memory_interpreter: Optional[bool] = None,
     ) -> None:
         if max_cycles < 1:
             raise ValueError("max_cycles must be at least 1")
@@ -478,6 +484,14 @@ class CognitiveLoop:
         # time. Resolved once, not per segment.
         self._request_extractor = request_extractor or _default_extractor()
         self._last_trace: Optional[LoopTrace] = None
+        # Model-led memory is now a normal Prime capability inside cognition.
+        # The old pre-turn classification path is opt-in only, for backwards-
+        # compatibility tests; it is never activated by the production brain.
+        self._enable_memory_interpreter = bool(enable_memory_interpreter)
+        self._legacy_scripted_memory = (
+            not isinstance(brain, (AuroraBrain, OpenAIBrain))
+            and not self._enable_memory_interpreter
+        )
 
     # -- accessors --------------------------------------------------------
 
@@ -587,6 +601,118 @@ class CognitiveLoop:
         # the Mind and can silently refuse or fail, so the loop will not
         # hand the user a success that was never written.
         update_granted = False
+        stale_answer_granted = False
+        accountability_granted = False
+        user_text = latest_user_text(instructed)
+
+        # Historical pre-turn interpretation is explicitly opt-in for old
+        # test harnesses. Production cognition requests memory via the
+        # existing Prime recall capability; it has no preflight router.
+        prior_dialogue = tuple({"role": str(m.get("role")),
+                                "content": str(m.get("content", ""))[:700]}
+                               for m in instructed[:-1]
+                               if m.get("role") in ("user", "assistant"))
+        plan = None
+        if self._enable_memory_interpreter:
+            try:
+                plan = memory_coordinator.interpret(
+                    self._brain, user_text, prior_dialogue)
+            except Exception:
+                plan = None  # Ordinary cognition if the live planner fails.
+        if isinstance(plan, memory_coordinator.MemoryPlan):
+            if plan.clarify:
+                response = BrainResult.success(
+                    "Which specific memory or experience do you mean?",
+                    self._brain.get_model_name())
+            else:
+                try:
+                    evidence = self._mind.memory_query_evidence(
+                        plan.as_dict(), session_id=session_id)
+                except Exception:
+                    response = BrainResult.success(
+                        "I couldn't safely retrieve verified memory evidence "
+                        "right now. I don't want to guess.",
+                        self._brain.get_model_name())
+                else:
+                    response = memory_coordinator.grounded_answer(
+                        self._brain, user_text, plan, evidence)
+            trace.stop_reason = "finished"
+            trace.total_s = time.perf_counter() - started
+            self._persist_turn(messages, 0, response, trace, session_id)
+            if on_delta is not None:
+                on_delta(response.content)
+            return response
+
+        # Legacy handlers are retained for test/fake brain compatibility.
+        # Production Aurora backends NEVER route wording through these
+        # phrase parsers, regardless of how the semantic planner responds.
+        if plan is None and self._legacy_scripted_memory:
+            # A broad request for user-reported likes gets user-source-backed
+            # evidence instead of an unverified model-generated inventory. Subject
+            # categories are matched from the user's own messages, never a list
+            # of hardcoded domains.
+            likes_lookup = getattr(self._mind, "verified_likes_history", None)
+            if callable(likes_lookup):
+                try:
+                    answer = likes_lookup(user_text)
+                except Exception:
+                    answer = None
+                if answer is not None:
+                    result = BrainResult.success(answer, self._brain.get_model_name())
+                    trace.stop_reason = "finished"
+                    trace.total_s = time.perf_counter() - started
+                    self._persist_turn(messages, 0, result, trace, session_id)
+                    if on_delta is not None:
+                        on_delta(answer)
+                    return result
+
+            # Explicit autobiographical event questions use the same source-
+            # verified episodes stored by Prime, without letting the model guess
+            # missing actions or route private experience history to research.
+            # The parser recognizes generic question intent, never subject names.
+            episode_lookup = getattr(self._mind, "verified_episode_history", None)
+            if callable(episode_lookup):
+                # Only user turns in this local conversation provide a follow-up
+                # referent; never use assistant answers as autobiographical proof.
+                episode_context = tuple(str(m.get("content", "")) for m in instructed
+                                        if m.get("role") == "user" and
+                                        m.get("content") != user_text)
+                try:
+                    answer = episode_lookup(user_text, context=episode_context)
+                except Exception:
+                    answer = None
+                if answer is not None:
+                    result = BrainResult.success(answer, self._brain.get_model_name())
+                    trace.stop_reason = "finished"
+                    trace.total_s = time.perf_counter() - started
+                    self._persist_turn(messages, 0, result, trace, session_id)
+                    if on_delta is not None:
+                        on_delta(answer)
+                    return result
+
+            # For explicit personal-history questions, a verified database answer
+            # is safer than asking a language model to guess dates or to research
+            # private conversation history online. Other questions use the normal
+            # Aurora cognitive loop unchanged.
+            verified = getattr(self._mind, "verified_personal_history", None)
+            if callable(verified):
+                prior = tuple(str(m.get("content", "")) for m in instructed
+                              if m.get("role") == "user" and
+                              m.get("content") != user_text)
+                try:
+                    answer = verified(user_text, context=prior)
+                except Exception:
+                    answer = None  # fail back to the ordinary cognition path
+                if answer is not None:
+                    result = BrainResult.success(answer, self._brain.get_model_name())
+                    trace.stop_reason = "finished"
+                    trace.total_s = time.perf_counter() - started
+                    # Preserve user and assistant turns exactly as normal. The
+                    # answerer itself does not write or edit memory records.
+                    self._persist_turn(messages, 0, result, trace, session_id)
+                    if on_delta is not None:
+                        on_delta(answer)
+                    return result
 
         # Length of `messages` as of the last successful build. The
         # end-of-turn persist compares against it to see rows a correction
@@ -829,6 +955,55 @@ class CognitiveLoop:
                         })},
                     ]
                     continue
+                # A verbatim replay after an explicit correction is not an
+                # answer to that correction. Give one bounded retry, then
+                # fail rather than delivering the same stale answer again.
+                if repeats_answer_after_correction(instructed, content):
+                    if stale_answer_granted or cycle >= self.max_cycles - 1:
+                        trace.stop_reason = "stale_answer"
+                        return BrainResult.failure(
+                            "Aurora repeated a previous answer instead of "
+                            "addressing the user's correction.",
+                            self._brain.get_model_name())
+                    stale_answer_granted = True
+                    messages = messages + [
+                        {"role": "assistant", "content": content},
+                        {"role": "tool", "content": json.dumps({
+                            "status": "failure", "output": None,
+                            "error": (
+                                "stale_reply: your answer repeated the previous "
+                                "reply verbatim after a user correction. "
+                                "Address the latest user message directly; "
+                                "do not reuse the prior tool response."
+                            ),
+                        })},
+                    ]
+                    continue
+                # When the user explicitly points out our invented
+                # assumptions, denying that any assumption was made is
+                # misleading. Require a bounded correction, not a canned
+                # apology or a silent rewrite of the user's stored facts.
+                if denies_assumption_after_correction(instructed, content):
+                    if accountability_granted or cycle >= self.max_cycles - 1:
+                        trace.stop_reason = "unacknowledged_assumption"
+                        return BrainResult.failure(
+                            "Aurora denied an assumption the user explicitly "
+                            "challenged instead of addressing the correction.",
+                            self._brain.get_model_name())
+                    accountability_granted = True
+                    messages = messages + [
+                        {"role": "assistant", "content": content},
+                        {"role": "tool", "content": json.dumps({
+                            "status": "failure", "output": None,
+                            "error": (
+                                "accountability: the user identified an "
+                                "unsupported assumption. Do not deny having "
+                                "made it. Acknowledge the unsupported claim "
+                                "and stick to the user's exact words."
+                            ),
+                        })},
+                    ]
+                    continue
                 # Nothing further was asked for. This segment is the answer.
                 segment.requested = False
                 trace.stop_reason = "finished"
@@ -845,6 +1020,19 @@ class CognitiveLoop:
                 trace.stop_reason = "max_cycles"
                 break
 
+            # An unambiguous personal preference is not a request for an
+            # external explanation. Policy is separate from this structural
+            # loop, so other capabilities and actual research questions run.
+            policy_error = reject_unrequested_lookup(request, user_text)
+            if policy_error is not None:
+                messages = messages + [
+                    {"role": "assistant", "content": generated.content},
+                    {"role": "tool", "content": json.dumps({
+                        "status": "failure", "output": None,
+                        "error": policy_error,
+                    })},
+                ]
+                continue
             payload, context_data, metadata = _payload_of(request)
             signature = _request_signature(
                 getattr(request, "action", ""), payload, context_data, metadata

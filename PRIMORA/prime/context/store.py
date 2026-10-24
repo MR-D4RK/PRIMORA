@@ -22,6 +22,7 @@ from .models import (
     CandidateRecord,
     EntityAliasRecord,
     EntityRecord,
+    ExperienceEvent,
     RelationshipRecord,
     SessionRecord,
     StateRecord,
@@ -78,6 +79,21 @@ CREATE TABLE IF NOT EXISTS digests (
 );
 CREATE INDEX IF NOT EXISTS idx_digests_session
     ON digests(session_id);
+CREATE TABLE IF NOT EXISTS experience_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    source_message_id INTEGER NOT NULL UNIQUE,
+    kind TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    statement TEXT NOT NULL,
+    reported_at REAL NOT NULL,
+    authority TEXT NOT NULL DEFAULT 'user',
+    FOREIGN KEY (source_message_id) REFERENCES messages(id)
+);
+CREATE INDEX IF NOT EXISTS idx_experience_events_reported
+    ON experience_events(reported_at, id);
+CREATE INDEX IF NOT EXISTS idx_experience_events_session
+    ON experience_events(session_id, reported_at);
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
     created_at REAL NOT NULL,
@@ -363,6 +379,129 @@ class ContextStore:
             ).fetchone()
             return row[0], False, diagnostic
 
+    def save_experience_event(
+        self, session_id: str, source_message_id: int,
+        kind: str, actor: str, statement: str,
+    ) -> Optional[int]:
+        """Persist verified user provenance once; never trust caller timestamps.
+
+        Event status is *user-reported*, not external factual verification.
+        Only the exact source user message is permitted as event evidence.
+        """
+        if kind not in (
+            "decision", "completion", "resolution", "start", "attempt",
+            "activity", "discussion", "milestone", "end", "setback",
+        ) or actor not in ("i", "we"):
+            raise ValueError("invalid event classification")
+        with self._connect() as con:
+            row = con.execute(
+                "SELECT session_id, role, content, timestamp FROM messages WHERE id = ?",
+                (source_message_id,),
+            ).fetchone()
+            if row is None or row[0] != session_id or row[1] != "user":
+                raise ValueError("event source must be a user message in this session")
+            if row[2].strip() != statement.strip():
+                raise ValueError("event must preserve the original user statement")
+            con.execute(
+                "INSERT OR IGNORE INTO experience_events "
+                "(session_id, source_message_id, kind, actor, statement, "
+                "reported_at, authority) VALUES (?, ?, ?, ?, ?, ?, 'user')",
+                (session_id, source_message_id, kind, actor, statement, row[3]),
+            )
+            found = con.execute(
+                "SELECT id FROM experience_events WHERE source_message_id = ?",
+                (source_message_id,),
+            ).fetchone()
+            return int(found[0]) if found else None
+
+    def fetch_experience_events(
+        self, *, session_id: Optional[str] = None, kind: Optional[str] = None,
+        limit: int = 100,
+    ) -> list[ExperienceEvent]:
+        """Retrieve user-sourced reports in chronological order, across sessions.
+
+        This read API does not inject records into model context. Later
+        episodic retrieval must select and verify evidence deliberately.
+        """
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        query = (
+            "SELECT e.id, e.session_id, e.source_message_id, e.kind, "
+            "e.actor, e.statement, e.reported_at, e.authority "
+            "FROM experience_events e JOIN messages m "
+            "ON m.id = e.source_message_id "
+            "WHERE e.authority = 'user' AND m.role = 'user' "
+            "AND m.session_id = e.session_id AND m.content = e.statement "
+            "AND m.timestamp = e.reported_at"
+        )
+        params: list[Any] = []
+        if session_id is not None:
+            query += " AND e.session_id = ?"
+            params.append(session_id)
+        if kind is not None:
+            query += " AND e.kind = ?"
+            params.append(kind)
+        query += " ORDER BY e.reported_at DESC, e.id DESC LIMIT ?"
+        params.append(limit)
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [ExperienceEvent(*row) for row in reversed(rows)]
+
+    def fetch_legacy_experience_reports(self, *, limit: int = 5000) -> list[ExperienceEvent]:
+        """Read-only fallback for user reports predating experience capture.
+
+        The original message is the evidence; no rows are backfilled or
+        rewritten. Bounded scanning avoids loading unlimited chat history.
+        """
+        from .episodes import extract_experience_claim
+        if not 1 <= limit <= 10000:
+            raise ValueError("invalid legacy experience scan limit")
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT m.id, m.session_id, m.content, m.timestamp "
+                "FROM messages m WHERE m.role = 'user' "
+                "AND length(m.content) <= 1500 "
+                "AND NOT EXISTS (SELECT 1 FROM experience_events e "
+                "WHERE e.source_message_id = m.id) "
+                "ORDER BY m.id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        result = []
+        for message_id, session_id, statement, timestamp in rows:
+            claim = extract_experience_claim(statement)
+            if claim is not None:
+                result.append(ExperienceEvent(
+                    -message_id, session_id, message_id, claim.kind,
+                    claim.actor, claim.statement, timestamp, "user",
+                ))
+        return result
+
+    def immediate_user_reaction(self, source_message_id: int) -> Optional[StoredMessage]:
+        """Next user statement only, after a verified experience source.
+
+        This is supporting evidence, not proof that the subject of a vague
+        reaction was independently resolved. No changes to memory are made.
+        """
+        import re
+        with self._connect() as con:
+            source = con.execute(
+                "SELECT session_id FROM messages "
+                "WHERE id = ? AND role = 'user'", (source_message_id,)
+            ).fetchone()
+            if source is None:
+                return None
+            row = con.execute(
+                "SELECT id, session_id, seq, role, content, timestamp, "
+                "fingerprint, importance FROM messages WHERE session_id = ? "
+                "AND id > ? AND role = 'user' ORDER BY id ASC LIMIT 1",
+                (source[0], source_message_id)
+            ).fetchone()
+        if row is None or not re.fullmatch(
+            r"\s*i (?:really )?(?:loved?|liked?|enjoyed?|hated?|disliked?) "
+            r"(?:it|that|them)[.! ]*", row[4], re.I
+        ):
+            return None
+        return StoredMessage(*row)
+
     def count(self, session_id: str) -> int:
         with self._connect() as con:
             row = con.execute(
@@ -537,6 +676,62 @@ class ContextStore:
         with self._connect() as con:
             rows = con.execute(sql, params).fetchall()
         return [StoredMessage(*r) for r in rows]
+
+    def search_user_evidence(
+        self, terms: tuple[str, ...] = (), *, start: Optional[float] = None,
+        end: Optional[float] = None, limit: int = 180,
+        oldest_first: bool = False,
+    ) -> list[StoredMessage]:
+        """Bounded cross-session *raw* user evidence, even if formation missed it.
+
+        SQL is parameterized and only original user messages qualify. Word
+        matching supplies candidates; Aurora decides their meaning. No memory
+        indexes or existing structured records are mutated by this query.
+        """
+        if not 1 <= limit <= 300:
+            raise ValueError("evidence limit must be 1..300")
+        parts = ["role = 'user'"]
+        params: list[Any] = []
+        if start is not None:
+            parts.append("timestamp >= ?")
+            params.append(float(start))
+        if end is not None:
+            parts.append("timestamp < ?")
+            params.append(float(end))
+        if terms:
+            parts.append("(" + " OR ".join(
+                "content LIKE ? ESCAPE '\\'" for _ in terms) + ")")
+            params.extend("%" + term.replace("\\", "\\\\").replace("%", "\\%")
+                          .replace("_", "\\_") + "%" for term in terms)
+        order = "ASC" if oldest_first else "DESC"
+        params.append(limit)
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id, session_id, seq, role, content, timestamp, "
+                "fingerprint, importance FROM messages WHERE " +
+                " AND ".join(parts) + f" ORDER BY timestamp {order}, id {order} LIMIT ?",
+                params,
+            ).fetchall()
+        return [StoredMessage(*row) for row in rows]
+
+    def neighboring_user_evidence(self, message: StoredMessage) -> list[StoredMessage]:
+        """Two preceding and following user turns; may be unrelated.
+
+        Bound to one session and a two-hour interval. These rows are *context*,
+        not proof that a later reaction referred to the earlier subject.
+        """
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id, session_id, seq, role, content, timestamp, "
+                "fingerprint, importance FROM messages "
+                "WHERE role = 'user' AND session_id = ? AND id != ? "
+                "AND timestamp BETWEEN ? AND ? "
+                "ORDER BY ABS(id - ?) ASC LIMIT 6",
+                (message.session_id, message.message_id,
+                 message.timestamp - 7200, message.timestamp + 7200,
+                 message.message_id),
+            ).fetchall()
+        return [StoredMessage(*row) for row in rows[:4]]
 
     def save_digest(
         self,
@@ -1008,6 +1203,37 @@ class ContextStore:
                 superseded_at=r[15] if len(r) > 15 else None,
             ))
         return out
+
+    def add_state_evidence(self, state_id: int, message_id: int) -> bool:
+        """Attach another user message to an unchanged current state.
+
+        Does not create a successor, change its temporal validity, or edit
+        raw messages. Returns False when the source was already attached.
+        """
+        if isinstance(state_id, bool) or isinstance(message_id, bool):
+            raise ValueError("state_id and message_id must be integers")
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT source_ids, status, authority FROM states WHERE id = ?",
+                (int(state_id),),
+            ).fetchone()
+            if row is None or row[1] != "current" or row[2] != "user":
+                raise ValueError("evidence requires a current user state")
+            origin = con.execute(
+                "SELECT role FROM messages WHERE id = ?", (int(message_id),)
+            ).fetchone()
+            if origin is None or origin[0] != "user":
+                raise ValueError("evidence must reference a user message")
+            ids = [int(value) for value in row[0].split(",") if value]
+            if int(message_id) in ids:
+                return False
+            ids.append(int(message_id))
+            con.execute(
+                "UPDATE states SET source_ids = ? WHERE id = ?",
+                (",".join(str(value) for value in ids), int(state_id)),
+            )
+            return True
 
     def fetch_states(
         self,

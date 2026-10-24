@@ -60,6 +60,42 @@ class DigestRecord:
 
 
 @dataclass(frozen=True)
+class ExperienceEvent:
+    """An explicitly user-reported experience, with one immutable source.
+
+    ``reported_at`` is the time the message was recorded, not a claimed
+    real-world event time. ``verified`` means provenance-verified, not that
+    the external event itself has been independently checked.
+    """
+
+    event_id: int
+    session_id: str
+    source_message_id: int
+    kind: str
+    actor: str
+    statement: str
+    reported_at: float
+    authority: str = "user"
+
+
+@dataclass(frozen=True)
+class EpisodeRecord:
+    """Derived grouping of source-backed event reports, NOT an inferred story.
+
+    Ids are stable for the same evidence, but may change if an older source is
+    subsequently imported. "first/last" are report times, not event times.
+    """
+
+    episode_id: str
+    subject: str
+    events: tuple[ExperienceEvent, ...]
+    source_message_ids: tuple[int, ...]
+    session_ids: tuple[str, ...]
+    first_reported_at: float
+    last_reported_at: float
+
+
+@dataclass(frozen=True)
 class SessionRecord:
     """One conversation session. Identity only — history stays in messages.
 

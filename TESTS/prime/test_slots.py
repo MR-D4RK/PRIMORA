@@ -129,6 +129,121 @@ def test_hate_retires_love_for_same_object_only():
     assert current.supersedes_id == old[0].state_id
 
 
+# 3b. Additive "too" must not create a second like for the same item. ----
+def test_like_too_normalizes_without_losing_song_title():
+    mgr = ContextManager(db_path=_db())
+    hist = []
+    _say(mgr, hist, "slot-additive", "I love Regera too.")
+    _say(mgr, hist, "slot-additive", "I love Regera.")
+    _say(mgr, hist, "slot-additive", "I love the song Me Too.")
+    current = _facts(mgr)
+    assert ("likes for regera", "loves Regera") in current
+    assert ("likes for regera too", "loves Regera too") not in current
+    assert ("likes for song me too", "loves the song Me Too") in current
+
+
+# 3c. Emphatic affection is remembered without silently changing a favorite. --
+def test_yellow_on_another_level_keeps_violet_favorite():
+    path = _db()
+    mgr = ContextManager(db_path=path)
+    hist = []
+    _say(mgr, hist, "slot-color-1", "My favorite color is violet.")
+    _say(mgr, hist, "slot-color-1",
+         "yeah but yellow is on another level for me dont forget it")
+    assert [(s.value, s.scope) for s in _currents(mgr, "favorite color")] == [
+        ("violet", "global")]
+    assert [(s.value, s.scope) for s in _currents(mgr, "likes for yellow")] == [
+        ("feels yellow is on another level", "global")]
+    assert _superseded(mgr, "favorite color") == []
+
+    # New manager and session, so no reliance on the original chat history.
+    restarted = ContextManager(db_path=path)
+    res = _say(restarted, [], "slot-color-2",
+               "What did I say about yellow?")
+    assert "The user feels yellow is on another level." in _joined(res.view)
+
+
+def test_color_emphasis_is_not_a_favorite_swap_or_question():
+    mgr = ContextManager(db_path=_db())
+    hist = []
+    _say(mgr, hist, "slot-color-3", "My favorite color is violet.")
+    _say(mgr, hist, "slot-color-3", "Yellow is on another level for me?")
+    assert _currents(mgr, "likes for yellow") == []
+    _say(mgr, hist, "slot-color-3", "Yellow is on another level for me.")
+    assert _currents(mgr, "likes for yellow")
+    _say(mgr, hist, "slot-color-3", "Actually, my favorite color is yellow.")
+    assert [s.value for s in _currents(mgr, "favorite color")] == ["yellow"]
+    assert [s.value for s in _superseded(mgr, "favorite color")] == ["violet"]
+
+
+# Memory reliability batch: focus, evidence guidance, natural corrections. -----
+def test_focused_color_query_omits_unrelated_retrieved_memories():
+    path = _db()
+    seed = ContextManager(db_path=path, hybrid_retrieval=False)
+    _say(seed, [], "music-session", "I love dubstep.")
+    _say(seed, [], "color-session", "My favorite color is yellow.")
+    _say(seed, [], "color-session", "Yellow is on another level for me.")
+    # An assistant's invented claim mentioning yellow must not become
+    # evidence of the user's actual feelings.
+    seed._get_store().append(
+        "music-session", 2, "assistant", "Yellow feels energetic to you."
+    )
+    # The test deliberately excludes restored conversation history.
+    for hybrid in (False, True):
+        resumed = ContextManager(db_path=path, hybrid_retrieval=hybrid)
+        result = _say(resumed, [], "fresh-color-%s" % hybrid,
+                      "What is my favorite color?")
+        rendered = _joined(result.view).lower()
+        assert "favorite color is yellow" in rendered
+        assert "yellow is on another level" in rendered
+        assert "dubstep" not in rendered
+        assert "yellow feels energetic to you" not in rendered
+
+
+def test_focused_followup_inherits_the_preceding_topic():
+    path = _db()
+    seed = ContextManager(db_path=path, hybrid_retrieval=False)
+    _say(seed, [], "seed-colors", "My favorite color is yellow.")
+    _say(seed, [], "seed-colors", "Yellow is on another level for me.")
+    _say(seed, [], "seed-music", "I hate dubstep.")
+    resumed = ContextManager(db_path=path, hybrid_retrieval=False)
+    history = []
+    _say(resumed, history, "follow-up", "What is my favorite color?")
+    followup = _say(resumed, history, "follow-up", "How do I feel about it?")
+    rendered = _joined(followup.view).lower()
+    assert "yellow is on another level" in rendered
+    assert "dubstep" not in rendered
+
+
+def test_user_fact_guidance_does_not_infer_emotions():
+    mgr = ContextManager(db_path=_db(), hybrid_retrieval=False)
+    res = _say(mgr, [], "guide", "My favorite color is violet.")
+    header = next(line for line in _state_lines(res.view)
+                  if line.startswith("The user's facts"))
+    assert "user-stated only" in header
+    assert "do not invent motives, emotions or reasons" in header
+
+
+def test_reverse_favorite_correction_preserves_old_version():
+    path = _db()
+    mgr = ContextManager(db_path=path)
+    history = []
+    _say(mgr, history, "natural-correction", "My favorite color is violet.")
+    _say(mgr, history, "natural-correction",
+         "Actually, yellow is my favorite color now.")
+    assert [s.value for s in _currents(mgr, "favorite color")] == ["yellow"]
+    assert [s.value for s in _superseded(mgr, "favorite color")] == ["violet"]
+    assert _currents(mgr, "yellow") == []
+    # Restart, no prior history: current value still wins.
+    resumed = ContextManager(db_path=path)
+    result = _say(resumed, [], "fresh-correction",
+                  "What is my favorite color?")
+    assert "favorite color is yellow" in _joined(result.view).lower()
+    _say(resumed, [], "question-should-not-save",
+         "Is green my favorite color?")
+    assert [s.value for s in _currents(resumed, "favorite color")] == ["yellow"]
+
+
 # 4. Single-value slot keeps one current and its history ------------------------
 def test_favorite_color_supersedes_and_keeps_history():
     mgr = ContextManager(db_path=_db())

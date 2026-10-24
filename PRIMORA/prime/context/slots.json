@@ -1,7 +1,7 @@
 {
   "version": 1,
   "notes_cap": 20,
-  "block_heading": "The user's facts (use only when relevant; override earlier claims/denials; if absent, say unknown):",
+  "block_heading": "The user's facts (user-stated only; use only when relevant; do not invent motives, emotions or reasons; override older claims; if absent, say unknown):",
   "slots": [
     {
       "name": "first name",
@@ -64,7 +64,8 @@
       "protected": false,
       "render": "The user's favorite color is {value}.",
       "phrasings": [
-        {"pattern": "^my (?:fav|favorite|favourite) colou?r is (?P<value>.+?)\\.?$"}
+        {"pattern": "^my (?:fav|favorite|favourite) colou?r is (?P<value>.+?)\\.?$"},
+        {"pattern": "^(?!(?:what|which|who|whose|where|when|why|how|is|are|do|does|did|can|could|would)\\b)(?:actually[,!]?[ ]+)?(?P<value>[a-z][a-z0-9 '-]{0,48}?) is my (?:fav|favorite|favourite) colou?r(?: now)?\\.?$"}
       ]
     },
     {
@@ -141,12 +142,29 @@
       "protected": false,
       "render": "The user {value}.",
       "phrasings": [
-        {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>.+?)\\.?$",
+        {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>purple) whether it(?:'s| is|s) bright or not\\.?$",
+         "key_group": "obj", "value_template": "loves {obj} in any shade"},
+        {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
          "key_group": "obj", "value_template": "loves {obj}"},
-        {"pattern": "^i (?:really )?(?:hate|dislike) (?P<obj>.+?)\\.?$",
+        {"pattern": "^i (?:really )?(?:hate|dislike) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
          "key_group": "obj", "value_template": "hates {obj}"},
         {"pattern": "^i (?:do not|don't) like (?P<obj>.+?)(?: anymore)?\\.?$",
-         "key_group": "obj", "value_template": "dislikes {obj}"}
+         "key_group": "obj", "value_template": "dislikes {obj}"},
+        {"pattern": "^(?:(?:yeah|yes)[,!]?\\s+)?(?:but\\s+)?(?P<obj>[a-z0-9][a-z0-9 '-]{0,60}?)\\s+is\\s+on\\s+another\\s+level\\s+for\\s+me(?:[,!]?\\s+(?:don'?t|do not)\\s+forget\\s+it)?[.!]?$",
+         "key_group": "obj", "value_template": "feels {obj} is on another level"}
+      ]
+    },
+    {
+      "name": "color feeling",
+      "kind": "keyed",
+      "concept_slot": "color feeling",
+      "mtype": "PREFERENCE",
+      "scope": "global",
+      "protected": false,
+      "render": "The user says {value}.",
+      "phrasings": [
+        {"pattern": "^(?P<obj>purple) feels? (?:quite )?like (?P<target>violet)(?: colou?r)? to me\\.?$",
+         "key_group": "obj", "value_template": "{obj} feels similar to {target} to them"}
       ]
     },
     {

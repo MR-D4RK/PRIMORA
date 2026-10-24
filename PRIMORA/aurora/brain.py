@@ -10,6 +10,7 @@ import urllib.request
 
 from PRIMORA.logutil import emit_block
 from PRIMORA.aurora import request_shape
+from PRIMORA.openai_messages import leading_system_message
 
 
 @dataclass(frozen=True)
@@ -650,9 +651,15 @@ class OpenAIBrain(Brain):
         ).strip().lower()
         enable_thinking = _thinking in ("1", "true", "yes", "on")
 
+        try:
+            wire_messages = leading_system_message(messages)
+        except (ValueError, AttributeError, TypeError) as e:
+            return BrainResult.failure(
+                f"Invalid OpenAI chat messages: {e}", self.get_model_name())
+
         request_body: dict = {
             "model": self._model,
-            "messages": messages,
+            "messages": wire_messages,
             "stream": on_delta is not None,
             "max_tokens": generation_tokens,
             "temperature": self._config.temperature,

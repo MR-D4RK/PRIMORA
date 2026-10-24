@@ -20,7 +20,11 @@ from . import scoring as scoring_mod
 from . import semantic as semantic_mod
 from . import slots as slots_mod
 from . import state as state_mod
+from . import timeline as timeline_mod
+from .discourse import resolve_preference_reference
 from .digest import build_extractive_digest, maybe_compact
+from .episodes import extract_experience_claim, organize_experience_events
+from .episode_retrieval import render_episode_answer
 from .models import (
     ActiveMemory,
     ActiveMemoryItem,
@@ -113,6 +117,17 @@ _CATEGORY_END_RE = re.compile(
     r"\b(?:is|are|was|were|do|does|did|i|you|we|they|and)\b",
     re.IGNORECASE,
 )
+
+# A request about "what we were talking about" ordinarily means this chat,
+# not an open-ended search of old sessions. "Previously"/"last time"
+# explicitly requests a different scope and is not intercepted.
+_LOCAL_DISCUSSION_RE = re.compile(
+    r"^\s*(?:hey\s+aurora[,!]?\s+)?(?:what\s+(?:were|have)\s+we\s+"
+    r"(?:talking|speaking|chatting)\s+about|what\s+did\s+we\s+"
+    r"(?:talk|discuss)\s+about|what\s+were\s+we\s+discussing)"
+    r"[?!. ]*$", re.IGNORECASE,
+)
+
 
 CROSS_SESSION_CAP = 3
 
@@ -720,6 +735,432 @@ class ContextManager:
             ],
             key=lambda state: (state.valid_from or 0.0, state.state_id),
         )
+
+    def preference_events(
+        self,
+        *,
+        since: Optional[float] = None,
+        until: Optional[float] = None,
+    ) -> list[StateRecord]:
+        """Chronological user preference changes for the future timeline UI.
+
+        Reuses confirmed global state history; repeated equivalent claims
+        only add evidence to the original event. Historical timestamps are
+        first observation times, NOT inferred onset dates. No raw messages,
+        assistant guesses, pending candidates, or unrelated states.
+        """
+        start = (self._normalized_time(since, "since")
+                 if since is not None else float("-inf"))
+        end = (self._normalized_time(until, "until")
+               if until is not None else float("inf"))
+        if start > end:
+            raise ValueError("since must not be later than until")
+        states = self._get_store().fetch_states(scope="global")
+        return sorted(
+            (state for state in states
+             if self._accepted_state(state)
+             and (state.concept.startswith("likes for ")
+                  or state.concept.startswith("favorite "))
+             and state.valid_from is not None
+             and start <= state.valid_from < end),
+            key=lambda state: (state.valid_from, state.state_id),
+        )
+
+    def _temporal_preference_context(
+        self, request: "timeline_mod.TimelineRequest",
+        *,
+        max_events: int = 8,
+    ) -> str:
+        """Evidence-bounded timeline for a user question (read only)."""
+        store = self._get_store()
+        events = self.preference_events(since=request.since)
+        category = request.category
+
+        def matches(state: StateRecord) -> bool:
+            return timeline_mod.category_matches(store, state, category)
+
+        # Filter *before* limiting so unrelated newer preferences cannot
+        # crowd out requested entries. Their source evidence is not assumed
+        # to establish when the user's taste actually began.
+        # Do not label legacy source-less rows as verified user evidence.
+        eligible = [st for st in events if matches(st) and st.source_ids]
+        source_ids = list(dict.fromkeys(
+            st.source_ids[0] for st in eligible if st.source_ids
+        ))
+        evidence = {m.message_id: m for m in
+                    store.fetch_messages_by_ids(source_ids)}
+        eligible = [st for st in eligible
+                    if st.source_ids and st.source_ids[0] in evidence
+                    and evidence[st.source_ids[0]].role == "user"
+                    and 0 <= evidence[st.source_ids[0]].timestamp
+                    <= time.time() + 300]
+        if request.mode == "started":
+            eligible = [st for st in eligible
+                        if st.concept.startswith("likes for ")
+                        and st.source_ids
+                        and st.source_ids[0] in evidence
+                        and evidence[st.source_ids[0]].role == "user"
+                        and timeline_mod.is_explicit_start(
+                            evidence[st.source_ids[0]].content)]
+        elif request.mode == "recent":
+            eligible = [st for st in eligible
+                        if not st.value.casefold().startswith("dislikes ")]
+        # For change queries, retain both current and superseded preference
+        # records so an actual before/after sequence remains visible.
+
+        eligible.sort(key=lambda st: (st.valid_from, st.state_id),
+                      reverse=request.mode != "changes")
+        eligible = eligible[:max_events]
+        lines = [
+            "Verified user preference timeline (structured memory only):",
+            "Times are when Aurora first RECORDED the statement (UTC),",
+            "not necessarily when the user's interest actually began.",
+            "Use only these dated records to answer the timeline question.",
+            "Do not call an old favorite newly discovered, mix unrelated",
+            "categories, infer motives, or use assistant guesses as evidence.",
+        ]
+        if not eligible:
+            lines.append("No matching verified timeline events were found."
+                         " Say so without inventing entries or dates.")
+        for st in eligible:
+            lines.append(timeline_mod.event_line(
+                st, explicitly_started=(st.source_ids and
+                    st.source_ids[0] in evidence and
+                    evidence[st.source_ids[0]].role == "user" and
+                    timeline_mod.is_explicit_start(
+                        evidence[st.source_ids[0]].content))))
+        return "\n".join(lines)
+
+    def _verified_new_likes(self, request) -> str:
+        """Answer explicit 'started liking' questions using user evidence only."""
+        from datetime import datetime, timezone
+
+        store = self._get_store()
+        now = time.time()
+        results = []
+        for state in self.preference_events(since=request.since):
+            if not state.concept.startswith("likes for ") or not state.source_ids:
+                continue
+            if request.category and not timeline_mod.category_matches(
+                    store, state, request.category):
+                continue
+            originals = store.fetch_messages_by_ids(state.source_ids)
+            starts = [m for m in originals
+                      if m.role == "user" and 0 <= m.timestamp <= now + 300
+                      and timeline_mod.is_explicit_start(m.content)]
+            if not starts:
+                continue
+            source = min(starts, key=lambda m: (m.timestamp, m.message_id))
+            reasons = []
+            for reason in store.fetch_states(
+                    scope="global", concept="rationale for " + state.concept,
+                    status="current"):
+                if not self._accepted_state(reason) or not reason.source_ids:
+                    continue
+                sources = store.fetch_messages_by_ids(reason.source_ids)
+                if any(m.role == "user" and
+                       (m.content.strip().rstrip(".! ") == reason.value
+                        or ("because " + reason.value.casefold())
+                        in m.content.casefold())
+                       for m in sources):
+                    reasons.append(reason.value)
+            results.append((source.timestamp, source.message_id, state,
+                            source.content, reasons))
+        results.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        if not results:
+            return ("I couldn't verify any explicitly new interests in "
+                    "my saved user statements for that category.")
+        lines = ["Newly expressed interests (times are when you told me, "
+                 "not necessarily when your interest began):"]
+        for timestamp, mid, state, quote, reasons in results[:10]:
+            date = datetime.fromtimestamp(timestamp, timezone.utc).strftime(
+                "%Y-%m-%d %H:%M UTC")
+            label = state.concept.removeprefix("likes for ")
+            lines.append(f'- {label}: {date}; you said: "{quote}" '
+                         f'(source message {mid}).')
+            if reasons:
+                lines.append("  Your stated reason: " + "; ".join(reasons[:2]))
+            else:
+                lines.append("  I don't have a verified reason stored.")
+        return "\n".join(lines)
+
+    def _verified_favorite_inventory(self, category: str, *,
+                                     dates: bool = False,
+                                     reasons: bool = False) -> str:
+        """One consistent, user-source-backed view for favorite-list questions.
+
+        The model does not supply membership, dates or motives. Unknown
+        reasons remain unknown; unavailable category evidence cannot become
+        a favorite merely because an assistant once mentioned it.
+        """
+        from datetime import datetime, timezone
+
+        store = self._get_store()
+        now = time.time()
+        records = []
+        # Preserve the first verified positive statement even if a later
+        # clarification superseded the current value. This is a READ-only
+        # history lookup; only current states establish current favorites.
+        historical_by_concept = {}
+        for old in store.fetch_states(scope="global"):
+            if not self._accepted_state(old) or not old.source_ids:
+                continue
+            if old.value.casefold().startswith(("dislikes ", "no longer ")):
+                continue
+            historical_by_concept.setdefault(old.concept, []).append(old)
+        current_states = store.fetch_states(scope="global", status="current")
+        for state in current_states:
+            if not self._accepted_state(state) or not self._valid_at(state, now):
+                continue
+            if state.concept.startswith("favorite "):
+                suffix = state.concept[len("favorite "):]
+                if not (suffix == category or suffix.endswith(" " + category)):
+                    continue
+                subject = state.value.strip()
+            elif state.concept.startswith("likes for "):
+                subject = state.concept[len("likes for "):]
+                subject = re.split(
+                    r"\s+(?:the\s+most|regardless\s+of|whether|"
+                    r"too(?:\s+like)?|no\s+matter)\b", subject,
+                    maxsplit=1, flags=re.I)[0].strip()
+                subject = re.sub(r"^(?:the|my)\s+", "", subject, flags=re.I)
+                # Category inherited from a nearby question is not proof
+                # that an unrelated noun is a car. Require a recognized
+                # vehicle name or an explicit category assertion in the
+                # user's own cited statement (checked below).
+                if not timeline_mod.verified_category_hint(category, subject):
+                    explicit_sources = store.fetch_messages_by_ids(state.source_ids)
+                    if not any(m.role == "user" and re.search(
+                        r"\b(?:cars?|vehicles?|automobiles?)\b",
+                        m.content, re.I) for m in explicit_sources):
+                        continue
+            else:
+                continue
+            if not subject or not state.source_ids:
+                continue
+            # Verify the *user* actually named this object. Derived state
+            # labels or assistant-generated text alone are insufficient.
+            tokens = re.findall(r"[\w]+", subject.casefold())
+            key_word = next((t for t in reversed(tokens)
+                             if len(t) >= 2 and t not in
+                             ("car", "classic", "the", "most")), None)
+            if not key_word:
+                continue
+            historical_ids = list(dict.fromkeys(
+                mid for version in historical_by_concept.get(state.concept, ())
+                for mid in version.source_ids
+            ))
+            sources = [m for m in store.fetch_messages_by_ids(historical_ids)
+                       if m.role == "user" and
+                       0 <= m.timestamp <= now + 300 and
+                       key_word in re.findall(r"[\w]+", m.content.casefold())]
+            if not sources:
+                continue
+            source = min(sources, key=lambda m: (m.timestamp, m.message_id))
+            canonical = " ".join(tokens)
+            if not canonical:
+                continue
+            # A direct user-stated preference dimension is evidence, not a
+            # generic description of the car or Aurora's interpretation.
+            stated = re.search(
+                r"\b(?:in\s+terms\s+of|because\s+of|due\s+to)\s+"
+                r"([a-z][a-z0-9 ,&-]{2,80})", source.content, re.I)
+            actual_reasons = []
+            if stated:
+                actual_reasons.append(stated.group(1).strip(" .!"))
+            for rationale in store.fetch_states(
+                    scope="global", concept="rationale for " + state.concept,
+                    status="current"):
+                if not self._accepted_state(rationale) or not rationale.source_ids:
+                    continue
+                evidence = store.fetch_messages_by_ids(rationale.source_ids)
+                if any(m.role == "user" and
+                       (m.content.strip().rstrip(".! ").casefold()
+                        == rationale.value.casefold()
+                        or ("because " + rationale.value.casefold())
+                        in m.content.casefold()) for m in evidence):
+                    if rationale.value not in actual_reasons:
+                        actual_reasons.append(rationale.value)
+            records.append((canonical, subject, state, source, actual_reasons))
+
+        # Group duplicate representations of the same favorite. A primary
+        # favorite outranks a like, but the earliest evidence is retained.
+        grouped = {}
+        for key, subject, state, source, why in records:
+            existing = grouped.get(key)
+            if existing is None:
+                grouped[key] = (subject, state, source, list(why))
+                continue
+            old_subject, old_state, old_source, old_why = existing
+            primary = (state if state.concept.startswith("favorite ")
+                       and not old_state.concept.startswith("favorite ")
+                       else old_state)
+            earlier = min((source, old_source),
+                          key=lambda m: (m.timestamp, m.message_id))
+            grouped[key] = (old_subject, primary, earlier,
+                            list(dict.fromkeys(old_why + why)))
+        if not grouped:
+            return ("I couldn't verify any favorite " + category +
+                    " preferences in your stored user statements. "
+                    "I won't guess or use my earlier replies as evidence.")
+        ordered = sorted(grouped.values(), key=lambda x:
+                         (x[2].timestamp, x[2].message_id))
+        if dates and not reasons:
+            lines = ["Here are the earliest stored user-statement dates I "
+                     "can verify for this category (UTC):"]
+            for subject, state, source, _why in ordered[:30]:
+                date = datetime.fromtimestamp(source.timestamp, timezone.utc)
+                lines.append(f'- {date:%Y-%m-%d %H:%M} UTC: "{source.content}"')
+            return "\n".join(lines)
+        lines = ["Your verified favorite " + category + " preferences "
+                 "(from your own statements):"]
+        for subject, state, source, why in ordered[:30]:
+            # Preserve acronyms and model identifiers rather than changing
+            # 'ZR1' to 'Zr1'. The source quote is the primary evidence.
+            label = " ".join(word.upper() if (any(c.isdigit() for c in word)
+                              and not word.isdigit()) or word == "ie"
+                             else word.capitalize()
+                             for word in subject.split())
+            role = ("favorite " + state.concept.removeprefix("favorite ")
+                    if state.concept.startswith("favorite ") else "liked")
+            line = (f'- {label} ({role}); you said: "{source.content}" '
+                    f'(source message {source.message_id})')
+            if dates:
+                date = datetime.fromtimestamp(source.timestamp, timezone.utc)
+                line += f'; first verified record: {date:%Y-%m-%d %H:%M} UTC'
+            lines.append(line)
+            if reasons:
+                lines.append("  Your stated reason: " + "; ".join(why[:2])
+                             if why else "  No verified reason stored.")
+        lines.append("These are the preferences I could verify, not "
+                     "necessarily every car you've ever mentioned.")
+        return "\n".join(lines)
+
+    def verified_personal_history(self, question: str, *,
+                                  context: tuple[str, ...] = ()) -> Optional[str]:
+        """Give a source-bound answer to explicit personal-history questions.
+
+        Only confirmed USER preference states backed by stored USER messages
+        qualify. Dates are those of the evidence messages (not invented onset
+        times), and unknown dates fail closed. This read-only path deliberately
+        avoids sending factual timestamp lookups to an outside research tool.
+        """
+        from datetime import datetime, timezone
+
+        inventory_category = timeline_mod.favorite_inventory_category(
+            question, context=context)
+        if inventory_category:
+            return self._verified_favorite_inventory(
+                inventory_category,
+                dates=bool(re.search(r"\b(?:when|dates?|times?)\b", question, re.I)),
+                reasons=bool(re.search(r"\b(?:why|reasons?)\b", question, re.I)),
+            )
+        request = timeline_mod.parse_request(question, now=time.time(),
+                                             context=context)
+        # "Just retrieve it from memory" after a dated question is a
+        # clarification, not an unrelated request for outside research.
+        if request is None and re.fullmatch(
+                r"\s*(?:just\s+)?(?:retrieve|check|look\s+up|find)\s+it\s+"
+                r"(?:from|in)\s+(?:your\s+)?memory[.!?]*\s*",
+                question, re.I):
+            for previous in reversed(context[-8:]):
+                candidate = timeline_mod.parse_request(
+                    previous, now=time.time(), context=context)
+                if candidate is not None and candidate.mode in ("dates", "claims"):
+                    request = candidate
+                    break
+        if request is None:
+            return None
+        if request.mode == "started":
+            return self._verified_new_likes(request)
+        if request.mode not in ("dates", "claims"):
+            return None
+        # An ungrounded "them" is ambiguous. Never print arbitrary memories.
+        if request.category == "unresolved":
+            return "Which interest do you mean? I don't want to guess."
+        store = self._get_store()
+        now = time.time()
+        target = request.target
+        def normalize(value: str) -> str:
+            return " ".join(re.findall(r"[\w]+", value.casefold()))
+        target_text = normalize(target or "")
+
+        # Reuse the existing state history (including superseded preferences)
+        # and its message provenance. No new tables or memory extraction.
+        events = self.preference_events()
+        matches = []
+        seen_ids = set()
+        for state in events:
+            if request.category and not timeline_mod.category_matches(
+                    store, state, request.category):
+                continue
+            for original in store.fetch_messages_by_ids(state.source_ids[:32]):
+                if original.role != "user" or original.message_id in seen_ids:
+                    continue
+                if not (0 <= original.timestamp <= now + 300):
+                    continue
+                # Query about Regera must not borrow Apollo's statements.
+                original_words = normalize(original.content)
+                # The target must be in the user's evidence, not merely in
+                # the state's derived concept/value (which could be wrong).
+                if target_text and target_text not in original_words:
+                    subject_tail = target_text.split()[-1]
+                    if len(target_text.split()) < 2 or subject_tail not in original_words.split():
+                        continue
+                seen_ids.add(original.message_id)
+                matches.append((original.timestamp, original.message_id,
+                                original.content, state.concept, state.value))
+        matches.sort(key=lambda item: (item[0], item[1]))
+        if not matches:
+            return ("I couldn't verify that from my stored user statements. "
+                    "I won't guess a date or attribute words to you.")
+        if request.mode == "dates":
+            earliest = matches[0]
+            # strftime %-d is not portable on Windows; format it explicitly.
+            when = datetime.fromtimestamp(earliest[0], timezone.utc)
+            stamp = f"{when:%B} {when.day}, {when:%Y} at {when:%H:%M} UTC"
+            if target:
+                return (f"The earliest verified preference statement I found "
+                        f"about {target} is from {stamp}. "
+                        f"You said: \"{earliest[2]}\". "
+                        "This is the earliest stored evidence I found, not "
+                        "necessarily the first time you ever mentioned it.")
+            lines = ["Here are the earliest stored user-statement dates I can "
+                     "verify for this category (UTC):"]
+            listed = set()
+            for timestamp, _mid, content, concept, value in matches:
+                # Show each distinct favorite/preference once, at its
+                # earliest verified source time, not once per repeated chat.
+                key = normalize(concept + (" " + value if concept.startswith("favorite ") else ""))
+                if key in listed:
+                    continue
+                listed.add(key)
+                when = datetime.fromtimestamp(timestamp, timezone.utc)
+                lines.append(f"- {when:%Y-%m-%d %H:%M} UTC: \"{content}\"")
+                if len(listed) >= 12:
+                    break
+            return "\n".join(lines)
+        # Source-only question: quote what the USER said, never the model.
+        lines = ["These are your verified statements from stored memory:"]
+        for _when, _mid, content, _concept, _value in matches[:8]:
+            lines.append(f"- \"{content}\"")
+        # Reasons must have user-authored evidence, never an assistant claim.
+        for _when, _mid, _content, concept, _value in matches:
+            for rationale in store.fetch_states(
+                    scope="global", concept="rationale for " + concept,
+                    status="current"):
+                if not self._accepted_state(rationale) or not rationale.source_ids:
+                    continue
+                sources = store.fetch_messages_by_ids(rationale.source_ids)
+                if any(s.role == "user" and
+                       (s.content.strip().rstrip(".! ") == rationale.value
+                        or ("because " + rationale.value.casefold())
+                        in s.content.casefold())
+                       for s in sources):
+                    reason = f'- Your stated reason: "{rationale.value}"'
+                    if reason not in lines:
+                        lines.append(reason)
+        return "\n".join(lines)
 
     def when_changed(
         self, scope: str, concept: str
@@ -1375,6 +1816,391 @@ class ContextManager:
     # ------------------------------------------------------------------
     # Ingest
     # ------------------------------------------------------------------
+    def experience_events(self, *, session_id: Optional[str] = None,
+                          kind: Optional[str] = None, limit: int = 100):
+        """Evidence-backed user-reported events, independent of subject.
+
+        This is an inspection API; episodes aren't yet injected into Aurora's
+        prompt. Organizing and retrieving related episodes are later batches.
+        """
+        return self._get_store().fetch_experience_events(
+            session_id=session_id, kind=kind, limit=limit)
+
+    def experience_episodes(self, *, session_id: Optional[str] = None,
+                            limit: int = 100, max_gap_days: int = 45):
+        """Read-only, conservative event groups spanning multiple sessions.
+
+        This is an inspection API; no episodes are injected into model prompts
+        until M3 Batch 3 verifies episodic recall and relevance.
+        """
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be 1..1000")
+        events = self._get_store().fetch_experience_events(
+            session_id=session_id, limit=1000)
+        return organize_experience_events(
+            events, max_gap_days=max_gap_days)[:limit]
+
+    @staticmethod
+    def _self_contained_like(subject: str, value: str) -> bool:
+        """Reject legacy unresolved references at READ time, without deletion.
+
+        These are grammatical ambiguity markers, not lists of allowed domains.
+        A meaningful named preference such as Big Room remains available.
+        """
+        subject = subject.casefold().strip(" .!?\"'")
+        value = value.casefold().strip()
+        if not subject or not value.startswith(("loves ", "likes ")):
+            return False
+        if subject in {"it", "this", "that", "them", "these", "those", "something",
+                       "anything", "everything"}:
+            return False
+        # A dangling referent cannot establish an identifiable liked item.
+        if re.search(r"\b(?:of|about|for|with|from|as|to)\s+"
+                     r"(?:it|this|that|them|these|those)\s*$", subject):
+            return False
+        return True
+
+    @staticmethod
+    def _like_identity(subject: str) -> str:
+        """Conservatively group qualified mentions of the same named subject.
+
+        This is a *read-time* display key, not an update to stored memory.
+        Only grammatical trailing modifiers are stripped; e.g. "Atlas Kite
+        regardless of its size" shares a key with "Atlas Kite", while
+        distinct named items and aspects retain separate identities.
+        """
+        subject = re.sub(r"^(?:the|a|an)\s+", "", subject.casefold().strip())
+        subject = re.split(
+            r"\s+(?:regardless\s+of|whether|even\s+if|no\s+matter\s+"
+            r"(?:what|which|how)|too\s+like)\b|,\s+and\s+it\b",
+            subject, maxsplit=1,
+        )[0]
+        return " ".join(subject.strip(" .,!?").split())
+
+    def memory_query_evidence(self, plan: dict, *, session_id: str = "default") -> str:
+        """Read-only evidence for a validated model-produced memory query plan.
+
+        The plan determines meaning; this method enforces source, time, and
+        bounded-output constraints. It never infers a preference or event.
+        """
+        from datetime import datetime, timezone
+        from . import scoring as scoring_mod
+
+        sources = set(plan["sources"])
+        subject = (plan.get("subject") or "").casefold().strip()
+        days = plan.get("recent_days")
+        first = plan.get("first_mention", False)
+        now = time.time()
+        start = plan.get("from_utc")
+        end = plan.get("to_utc")
+        if start is None:
+            start = now - days * 86400 if days is not None else None
+        store = self._get_store()
+        # Query matching requires a named subject to occur in the actual
+        # memory/source. Domain categories are NOT dictionary-mapped here:
+        # when a topic is broad, the model selects from diverse raw evidence.
+        terms = tuple(scoring_mod.singular(t) for t in
+                      scoring_mod.tokenize(subject)) if subject else ()
+        def matches(*texts):
+            if not terms:
+                return True
+            words = set()
+            for text in texts:
+                words.update(scoring_mod.singular(t) for t in
+                             scoring_mod.tokenize(text))
+            return all(term in words for term in terms)
+        def permitted(ts):
+            return (0 <= ts <= now + 300 and (start is None or ts >= start)
+                    and (end is None or ts < end))
+        items = {}
+        # Current stated memories (or historical versions for first-mention
+        # queries); unresolved/assistant-created rows never qualify.
+        if sources.intersection({"preferences", "facts"}):
+            for state in store.fetch_states(scope="global"):
+                if not self._accepted_state(state) or not state.source_ids:
+                    continue
+                preference = (state.memory_type == "PREFERENCE" or
+                              state.concept.startswith(("likes for ", "favorite ",
+                                                        "rationale for ")))
+                if "facts" not in sources and not preference:
+                    continue
+                if not first and state.status != "current":
+                    continue
+                if preference and state.concept.startswith("likes for "):
+                    if not self._self_contained_like(
+                            state.concept[len("likes for "):], state.value):
+                        continue
+                for msg in store.fetch_messages_by_ids(state.source_ids[:24]):
+                    if msg.role != "user" or not permitted(msg.timestamp):
+                        continue
+                    if not matches(state.concept, state.value, msg.content):
+                        continue
+                    key = msg.message_id
+                    row = items.setdefault(key, {"id": key, "timestamp": msg.timestamp,
+                        "text": msg.content[:500], "from": "user_state", "concepts": []})
+                    label = f"{state.concept}: {state.value}"
+                    if label not in row["concepts"]:
+                        row["concepts"].append(label)
+        if "experiences" in sources:
+            events = (self.experience_events(limit=1000) +
+                      store.fetch_legacy_experience_reports(limit=5000))
+            for event in events:
+                if event.authority != "user" or not permitted(event.reported_at):
+                    continue
+                if not matches(event.statement):
+                    continue
+                original = store.fetch_messages_by_ids([event.source_message_id])
+                if not original or original[0].role != "user":
+                    continue
+                msg = original[0]
+                items.setdefault(msg.message_id, {
+                    "id": msg.message_id, "timestamp": msg.timestamp,
+                    "text": msg.content[:500], "from": "user_experience",
+                    "concepts": [event.kind]})
+                # The immediately subsequent user's remark is a *possible*
+                # reaction, not independent proof of what its referent was.
+                reaction = store.immediate_user_reaction(msg.message_id)
+                if (reaction and permitted(reaction.timestamp) and
+                        0 <= reaction.timestamp - event.reported_at <= 3600):
+                    items.setdefault(reaction.message_id, {
+                        "id": reaction.message_id, "timestamp": reaction.timestamp,
+                        "text": reaction.content[:500], "from":
+                        f"possible_followup_to_{msg.message_id}", "concepts": []})
+        # Keep source-indexed facts visible even when the newest raw messages
+        # are numerous; a recency-only cap would hide old favorites again.
+        structured = sorted(items.values(), key=lambda r: (r["timestamp"], r["id"]),
+                            reverse=not first)
+        structured_ids = set(items)
+        # Structured memory is an index, not the whole person's history.
+        # Retrieve bounded verbatim *user* messages from every session as
+        # candidate evidence, including activities that old extractors never
+        # converted into episodes. No language/topic-specific extraction here.
+        raw_terms = tuple(dict.fromkeys(t for t in terms if len(t) >= 2))[:8]
+        raw_hits = store.search_user_evidence(
+            raw_terms, start=start, end=end, limit=240,
+            oldest_first=first)
+        for msg in raw_hits:
+            if not permitted(msg.timestamp):
+                continue
+            if msg.message_id not in items:
+                items[msg.message_id] = {
+                    "id": msg.message_id, "timestamp": msg.timestamp,
+                    "text": msg.content[:500], "from": "raw_user_statement",
+                    "concepts": [],
+                }
+            if raw_terms:
+                # Nearby *user* messages may give useful conversational
+                # context (e.g. an unnamed reaction after describing a
+                # video). They are NOT asserted as related facts.
+                for neighbor in store.neighboring_user_evidence(msg):
+                    if not permitted(neighbor.timestamp):
+                        continue
+                    items.setdefault(neighbor.message_id, {
+                        "id": neighbor.message_id,
+                        "timestamp": neighbor.timestamp,
+                        "text": neighbor.content[:500],
+                        "from": f"possible_context_for_{msg.message_id}",
+                        "concepts": [],
+                    })
+        raw_only = sorted((r for key, r in items.items()
+                           if key not in structured_ids),
+                          key=lambda r: (r["timestamp"], r["id"]),
+                          reverse=not first)
+        # 60 sourced records + 30 raw-only candidates. Keep both channels in
+        # the evidence window instead of letting one evict the other.
+        ordered = sorted(structured[:60] + raw_only[:30],
+                         key=lambda r: (r["timestamp"], r["id"]),
+                         reverse=not first)
+        omitted_count = max(0, len(structured) - 60) + max(0, len(raw_only) - 30)
+        # Cap output, disclose omissions; do not claim the answer is complete.
+        limit = 90
+        output = ["User-stated evidence (UTC timestamps are dates of statements, "
+                  "not inferred real-world onset/event dates). "
+                  "Only direct user-source records are included."]
+        for row in ordered[:limit]:
+            moment = datetime.fromtimestamp(row["timestamp"], timezone.utc)
+            concepts = "; ".join(row["concepts"][:4])
+            output.append(f'[message {row["id"]}, {moment:%Y-%m-%d %H:%M} UTC, '
+                          f'{row["from"]}] {row["text"]!r}' +
+                          (f' | stored: {concepts}' if concepts else ''))
+        if omitted_count:
+            output.append(f"Additional user-source candidates omitted: {omitted_count}. "
+                          "The full inventory was not included.")
+        return "\n".join(output) if ordered else ""
+
+    def verified_likes_history(self, question: str) -> Optional[str]:
+        """Source-backed, time-bounded, domain-neutral stated likes.
+
+        Explicit broad inventory requests are recognized independently of
+        tense. Records stay immutable; ambiguous legacy likes are hidden and
+        related phrasing is grouped for display with its original evidence.
+        """
+        q = re.sub(r"^\s*(?:hey\s+)?aurora\s*[,!:.]?\s*", "", question,
+                   flags=re.I).strip().rstrip("?!. ]").casefold()
+        category = None
+        window_days = None
+        if re.search(r"\brecent(?:ly)?\b", q):
+            window_days = 7
+        explicit_window = re.search(
+            r"\b(?:in|over|within|during) (?:the )?last (\d{1,3}) "
+            r"(day|week|month)s?\b", q)
+        if explicit_window:
+            size = int(explicit_window.group(1))
+            if size < 1 or size > 365:
+                return "Please request a time window between 1 and 365 units."
+            window_days = size * {"day": 1, "week": 7, "month": 30}[
+                explicit_window.group(2)]
+        stripped = re.sub(r"\s+(?:in|over|within|during) (?:the )?last "
+                          r"\d{1,3} (?:days?|weeks?|months?)$", "", q)
+        verb = r"(?:like|liked|love|loved|enjoy|enjoyed)"
+        # A broad preference inventory includes explicit favorites as well as
+        # likes. This is a query-plan distinction, not a subject whitelist.
+        preference_inventory = bool(re.fullmatch(
+            r"(?:what (?:are|were) my (?:known |current )?preferences|"
+            r"(?:list|show|summarize) (?:all )?my (?:known |current )?preferences|"
+            r"what do you (?:know|remember) about my preferences)", stripped))
+        broad = preference_inventory or bool(re.fullmatch(
+            rf"(?:what (?:have i (?:told you|said)(?: that)? i|do i) "
+            rf"{verb}(?: recently)?|what have i {verb} recently|"
+            rf"what (?:are )?(?:(?:all|every) )?my (?:recent )?"
+            rf"(?:likes|interests)|(?:all|every) (?:my )?"
+            rf"(?:likes|interests?))", stripped))
+        if not broad:
+            matched = re.fullmatch(
+                r"(?:what|which) ([a-z][a-z '\-]{1,60}?) "
+                r"(?:that )?(?:do )?i (?:like|love)", stripped)
+            if matched:
+                category = matched.group(1).strip()
+            else:
+                return None
+        store = self._get_store()
+        now = time.time()
+        earliest = now - window_days * 86400 if window_days is not None else None
+        records = {}
+        for state in store.fetch_states(scope="global", status="current"):
+            if not (self._accepted_state(state) and state.source_ids
+                    and self._valid_at(state, now)):
+                continue
+            if state.concept.startswith("likes for "):
+                subject = state.concept[len("likes for "):]
+                if not self._self_contained_like(subject, state.value):
+                    continue
+                value = state.value
+            elif preference_inventory and state.concept.startswith("favorite "):
+                # Keep favorite dimensions distinct: "favorite color" and
+                # "favorite classic car" are not interchangeable claims.
+                dimension = state.concept[len("favorite "):].strip()
+                if not dimension or not state.value.strip():
+                    continue
+                subject = f"favorite {dimension}"
+                value = f"favorite {dimension}: {state.value}"
+            else:
+                continue
+            # Filter the individual USER evidence timestamps before combining
+            # versions of a preference. A recent statement about an old like
+            # must not vanish, and an old statement must not become recent.
+            messages = [m for m in store.fetch_messages_by_ids(state.source_ids)
+                        if m.role == "user" and 0 <= m.timestamp <= now + 300]
+            if earliest is not None:
+                messages = [m for m in messages if m.timestamp >= earliest]
+            if not messages:
+                continue
+            if category:
+                cat_words = {scoring_mod.singular(w) for w in
+                             scoring_mod.tokenize(category)}
+                evidence_words = {scoring_mod.singular(w) for m in messages
+                                  for w in scoring_mod.tokenize(m.content)}
+                if not cat_words or not cat_words <= evidence_words:
+                    continue
+            key = ("favorite:" + subject.casefold() if
+                   state.concept.startswith("favorite ") else
+                   "like:" + self._like_identity(subject))
+            if not key:
+                continue
+            existing = records.setdefault(key, {"messages": {}, "values": [],
+                                                "latest": -1.0})
+            existing["values"].append(value)
+            for m in messages:
+                existing["messages"][m.message_id] = m
+                existing["latest"] = max(existing["latest"], m.timestamp)
+        ordered = sorted(records.items(), key=lambda row: (-row[1]["latest"], row[0]))
+        if not ordered:
+            return ("I couldn't verify any user-stated likes in that "
+                    "time window or category. That doesn't mean you never "
+                    "mentioned them; I won't guess from unrelated memories.")
+        prefix = (f"Here are your verified likes mentioned in the last "
+                  f"{window_days} days (UTC; time of statement):" if
+                  window_days is not None else
+                  ("Here are your current verified preferences and favorites "
+                   "from your own statements (not necessarily complete):" if
+                   preference_inventory else
+                   "Here are the stored likes I could verify from your own "
+                   "statements (not necessarily a complete list):"))
+        lines = [prefix]
+        # A bounded answer must disclose omissions rather than silently imply
+        # the result is complete. Grouping reduces duplicates before the cap.
+        limit = 30
+        for identity, record in ordered[:limit]:
+            subject = identity.split(":", 1)[1]
+            evidence = sorted(record["messages"].values(),
+                              key=lambda m: (m.timestamp, m.message_id))
+            latest = record["latest"]
+            # Preserve an unmodified value for a single preference. Multiple
+            # qualified phrasings are presented under their shared named item,
+            # with verbatim evidence retaining every nuance.
+            values = list(dict.fromkeys(record["values"]))
+            if len(values) > 1:
+                strength = "loves" if any(v.casefold().startswith("loves ")
+                                           for v in values) else "likes"
+                label = f"{strength} {subject}"
+            else:
+                label = values[0]
+            shown = evidence[:3]
+            quotes = [f'"{m.content}" (message {m.message_id})' for m in shown]
+            when = (time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(latest))
+                    if window_days is not None else None)
+            suffix = (f"; {len(evidence)} verified statements total"
+                      if len(evidence) > len(shown) else "")
+            lines.append(f'- {label}' + (f' ({when})' if when else '') +
+                         '; user evidence: ' + '; '.join(quotes) + suffix)
+        if len(ordered) > limit:
+            lines.append(f"Showing {limit} of {len(ordered)} distinct likes; "
+                         "ask for a narrower category or time range to see more.")
+        return "\n".join(lines)
+
+    def verified_episode_history(self, question: str, *,
+                                 context: tuple[str, ...] = ()) -> Optional[str]:
+        """Evidence-only, domain-neutral episodic lookup across sessions.
+
+        A read-only view over the Batch 1/2 event store; no automatic event
+        inference, training, or mutation takes place during retrieval.
+        """
+        from .episode_retrieval import parse_episode_question
+        if parse_episode_question(question, context=context) is None:
+            return None
+        # Select matching episodes BEFORE applying the small response budget.
+        # Otherwise a valid older activity disappears after 100 newer ones.
+        store = self._get_store()
+        # Read-only legacy evidence supplements structured events; no migration
+        # or guessing is needed to recall older reports made before M3 existed.
+        structured = self.experience_events(limit=1000)
+        legacy = store.fetch_legacy_experience_reports(limit=5000)
+        episodes = organize_experience_events(structured + legacy)
+        parsed = parse_episode_question(question, context=context)
+        reactions = {}
+        if parsed and parsed.include_feelings:
+            for episode in episodes:
+                # The latest *user* reaction can only be attached when the
+                # episode report has a single named subject.
+                for event in episode.events:
+                    if " and " not in episode.subject.casefold():
+                        response = store.immediate_user_reaction(
+                            event.source_message_id)
+                        if response is not None:
+                            reactions[event.source_message_id] = response
+        return render_episode_answer(
+            question, episodes, context=context, reactions=reactions)
+
     def reconcile(
         self,
         messages: list[dict[str, Any]],
@@ -1431,6 +2257,19 @@ class ContextManager:
                 if conflict:
                     diagnostics.append(conflict)
                 if is_new:
+                    # M3 episodic evidence is independent of semantic memory.
+                    # Only new explicit user reports are admitted, and the
+                    # original message is the source of both text and time.
+                    if role == "user":
+                        try:
+                            claim = extract_experience_claim(content, role)
+                            if claim is not None:
+                                store.save_experience_event(
+                                    session_id, message_id, claim.kind,
+                                    claim.actor, claim.statement,
+                                )
+                        except Exception as e:
+                            diagnostics.append(f"episode_capture_failed: {e}")
                     # M4 structured-memory formation first. M5 entity,
                     # alias, and relationship formation runs after it, from
                     # the same persisted message id, and is independently
@@ -1512,11 +2351,76 @@ class ContextManager:
                 candidates = state_mod.extract_candidates(
                     content, role, context_question, assistant_question
                 )
+                reference_message = None
+                # Never store ``likes for it``. Resolve only a user-to-user
+                # reference with a uniquely named antecedent in this session.
+                if not candidates:
+                    recent = [m for m in store.fetch_latest(session_id, 6)
+                              if m.role == "user" and m.message_id != message_id]
+                    previous = recent[-1] if recent else None
+                    current = store.fetch_messages_by_ids([message_id])
+                    if (previous and current and
+                            0 < current[0].seq - previous.seq <= 3):
+                        explicit = resolve_preference_reference(
+                            content, previous.content)
+                        if explicit:
+                            candidates = state_mod.extract_candidates(
+                                explicit, "user")
+                            reference_message = previous.message_id
+                # A consecutive USER statement can explain "that's why
+                # I love X". Assistant statements never supply the motive.
+                prior = [m for m in store.fetch_latest(session_id, 4)
+                         if m.role == "user" and m.message_id != message_id]
+                previous = prior[-1] if prior else None
+                followup = None
+                if previous:
+                    current = store.fetch_messages_by_ids([message_id])
+                    if current and 0 < current[0].seq - previous.seq <= 3:
+                        followup = state_mod.extract_followup_preference_reason(
+                            content, previous.content)
+                if followup:
+                    # "Regera" and "Koenigsegg Regera" may refer to the
+                    # same preference. Resolve a short name only if there is
+                    # exactly ONE matching current preference; never guess.
+                    from dataclasses import replace as dc_replace
+                    shorthand = followup[0].concept.removeprefix("likes for ")
+                    candidates_pool = [st.concept for st in store.fetch_states(
+                        scope="global", status="current")
+                        if st.concept.startswith("likes for ") and (
+                            st.concept == followup[0].concept or
+                            st.concept.endswith(" " + shorthand))]
+                    candidates_pool = sorted(set(candidates_pool))
+                    if len(candidates_pool) == 1:
+                        canonical = candidates_pool[0]
+                        followup = (
+                            dc_replace(followup[0], concept=canonical),
+                            dc_replace(followup[1],
+                                       concept="rationale for " + canonical),
+                        )
+                    candidates.extend(followup)
                 if not candidates:
                     return []
-                return state_mod.apply_user_candidates(
+                diagnostics = state_mod.apply_user_candidates(
                     store, session_id, message_id, candidates
                 )
+                if reference_message is not None:
+                    for candidate in candidates:
+                        for saved in store.fetch_states(
+                                scope="global", concept=candidate.concept,
+                                status="current"):
+                            if saved.value == candidate.value:
+                                store.add_state_evidence(saved.state_id,
+                                                         reference_message)
+                                break
+                if followup and previous is not None:
+                    for reason in store.fetch_states(
+                            scope="global", concept=followup[1].concept,
+                            status="current"):
+                        if reason.value == followup[1].value:
+                            store.add_state_evidence(reason.state_id,
+                                                     previous.message_id)
+                            break
+                return diagnostics
             if role == "assistant":
                 return state_mod.check_assistant_conflict(
                     store, session_id, message_id, content
@@ -1752,6 +2656,18 @@ class ContextManager:
             except Exception as e:
                 diagnostics.append(f"working_failed: {e}")
 
+        # Explicit timeline questions need reserved space for dated user
+        # evidence, not just the most recent conversation turns.
+        timeline_request = timeline_mod.parse_request(
+            current.get("content", "") if current else "", now=time.time()
+        )
+        # Narrow verified history questions are answered by the dedicated
+        # read-only Mind path. Do not steal ordinary slot retrieval while
+        # assembling model context (the historical "what did I say about
+        # yellow" slot behavior must keep working).
+        if timeline_request is not None and timeline_request.mode in ("dates", "claims"):
+            timeline_request = None
+
         # 4. Newest conversation turns up to the input target, less the
         # reserve the structured [state ...] facts still need. Without it
         # the fill runs all the way to the target and a later fact has only
@@ -1766,6 +2682,11 @@ class ContextManager:
         history_limit = max(
             total, cfg.input_target - min(reserved, headroom // 2)
         )
+        if timeline_request is not None:
+            evidence_reserve = min(300, max(0, cfg.input_ceiling - total))
+            history_limit = max(
+                total, min(history_limit, cfg.input_ceiling - evidence_reserve)
+            )
         for msg in reversed(rest):
             if total >= history_limit:
                 break
@@ -1784,6 +2705,25 @@ class ContextManager:
         degraded = False
         fact_msgs: list[dict] = []
 
+        local_discussion_query = bool(
+            current and _LOCAL_DISCUSSION_RE.fullmatch(
+                current.get("content", "")))
+        if local_discussion_query:
+            note = (
+                "Session scope: the user asks what was discussed in THIS "
+                "conversation. Use only earlier messages in this session; "
+                "do not describe memories from other sessions as this "
+                "session's conversation. If there are no earlier user "
+                "messages here, say we have not discussed a topic yet."
+            )
+            note_msg = {"role": "system", "content": note}
+            if total + self._safe_count(counter, [note_msg], diagnostics) \
+                    <= cfg.input_ceiling:
+                selected.append(note_msg)
+                selected_fps.add(self._fp(note_msg))
+                selected_texts.append(note)
+                total += self._safe_count(counter, [note_msg], diagnostics)
+
         # 5. Structured authority first: current session metadata, then
         # current scoped state. Both outrank free-form retrieval below.
         try:
@@ -1795,23 +2735,33 @@ class ContextManager:
             degraded = True
             diagnostics.append(f"state_failed: session info failed: {e}")
         try:
-            state_total = self._add_current_state(
-                session_id, current, selected, selected_fps,
-                selected_texts, counter, cfg, total, diagnostics,
-                facts_out=fact_msgs,
-            )
-            total = state_total
+            if timeline_request is not None:
+                content = self._temporal_preference_context(timeline_request)
+                fact = {"role": "system", "content": content}
+                cost = self._safe_count(counter, [fact], diagnostics)
+                if total + cost <= cfg.input_ceiling:
+                    fact_msgs.append(fact)
+                    total += cost
+                else:
+                    diagnostics.append("timeline_truncated: no room for evidence")
+            else:
+                total = self._add_current_state(
+                    session_id, current, selected, selected_fps,
+                    selected_texts, counter, cfg, total, diagnostics,
+                    facts_out=fact_msgs,
+                )
         except Exception as e:
             degraded = True
             diagnostics.append(f"state_failed: assembly failed: {e}")
 
         # 6. Retrieval over older material (only what still fits).
         try:
-            admitted = self._retrieve(
+            admitted = (([], total) if (local_discussion_query or timeline_request)
+                        else self._retrieve(
                 session_id, history, current, selected,
                 selected_fps, selected_texts, counter, cfg, total,
                 diagnostics,
-            )
+            ))
             selected.extend(admitted[0])
             total = admitted[1]
         except Exception as e:
@@ -1821,7 +2771,8 @@ class ContextManager:
         # 6b. Explicit cross-session state questions get per-session
         # scoped values with identity; never flattened, never silent.
         try:
-            total = self._add_cross_session_states(
+            if not local_discussion_query and not timeline_request:
+                total = self._add_cross_session_states(
                 session_id, current, selected, selected_fps,
                 selected_texts, counter, cfg, total, diagnostics,
             )
@@ -1831,10 +2782,11 @@ class ContextManager:
 
         # 7. Digests (stored first, then freshly compacted if warranted).
         try:
-            d_total = self._add_digests(
+            d_total = (total if (local_discussion_query or timeline_request)
+                       else self._add_digests(
                 session_id, current, history, selected, selected_fps,
                 selected_texts, counter, cfg, total, diagnostics,
-            )
+            ))
             total = d_total
         except Exception as e:
             degraded = True
@@ -1842,10 +2794,11 @@ class ContextManager:
 
         # 8. Optional memory hook (no-op in V1).
         try:
-            total = self._add_memories(
-                session_id, current, history, selected, selected_fps,
-                selected_texts, counter, cfg, total, diagnostics,
-            )
+            if not local_discussion_query and not timeline_request:
+                total = self._add_memories(
+                    session_id, current, history, selected, selected_fps,
+                    selected_texts, counter, cfg, total, diagnostics,
+                )
         except Exception as e:
             degraded = True
             diagnostics.append(f"memory_failed: {e}")
@@ -2123,6 +3076,61 @@ class ContextManager:
         scored.sort(key=lambda s: (-s[0], s[1], s[2]))
         return scored
 
+    def _focused_favorite_terms(
+        self, query_text: str, previous_user_text: str = ""
+    ) -> Optional[set[str]]:
+        """Ground a focused favorite lookup in its category/current value.
+
+        Deliberately not used for broad profile/history questions. A short
+        anaphoric follow-up ('how do I feel about it?') may inherit the
+        category only from the immediately preceding user question.
+        """
+        if self._wants_history(query_text):
+            return None
+        category_query = query_text
+        category = self._favorite_category(query_text)
+        if (category is None and re.search(r"\b(?:it|that)\b", query_text, re.I)
+                and _QUESTION_RE.search(query_text)):
+            category_query = previous_user_text
+            category = self._favorite_category(previous_user_text)
+        if not category:
+            return None
+        # Multiple favorites and historical rankings require broad recall,
+        # rather than constraining evidence to a single stored favorite.
+        if re.search(r"\b(?:fav|favorite|favourite)\s+[a-z]+s\b",
+                     category_query, re.I):
+            return None
+        try:
+            states = self._get_store().fetch_states(
+                scope="global", concept=f"favorite {category}",
+                status="current",
+            )
+        except Exception:
+            return None
+        values = [st for st in states if st.authority == "user"]
+        if not values:
+            return None
+        terms = set(scoring_mod.tokenize(category))
+        for st in values:
+            # An entire sentence is not a safe topical expansion.
+            value_terms = scoring_mod.tokenize(st.value)
+            if len(value_terms) <= 4:
+                terms.update(value_terms)
+        return terms or None
+
+    @staticmethod
+    def _focused_evidence_matches(message: StoredMessage,
+                                  focus_terms: Optional[set[str]]) -> bool:
+        if focus_terms is None:
+            return True
+        # Aurora's previous interpretations are not user preference evidence.
+        if message.role != "user":
+            return False
+        candidate = {scoring_mod.singular(t) for t in
+                     scoring_mod.tokenize(message.content)}
+        focus = {scoring_mod.singular(t) for t in focus_terms}
+        return bool(candidate & focus)
+
     def _retrieve(
         self,
         session_id: str,
@@ -2144,6 +3152,19 @@ class ContextManager:
         )
         if not query_terms:
             return [], total
+        previous_user_text = self._recent_user_text(
+            [m for m in history if m is not current]
+        )
+        focus_terms = self._focused_favorite_terms(
+            query_text, previous_user_text
+        )
+        # Include the actual current favorite in the evidence search;
+        # a user's feelings about yellow may not literally say "color".
+        if focus_terms:
+            query_terms.extend(
+                sorted(term for term in focus_terms
+                       if term not in query_terms)
+            )
         collected = self.collect_lexical_candidates(
             session_id, query_terms, selected_fps, selected_texts,
             diagnostics,
@@ -2173,7 +3194,7 @@ class ContextManager:
                 self._retrieval_traces.append(trace)
                 admitted, total = self._admit_hybrid(
                     session_id, trace, selected_fps, selected_texts, counter,
-                    cfg, total, diagnostics,
+                    cfg, total, diagnostics, focus_terms=focus_terms,
                 )
                 if self._shadow_retrieval:
                     self._record_shadow(
@@ -2194,7 +3215,7 @@ class ContextManager:
 
         return self._admit_lexical(
             session_id, collected, selected_fps, selected_texts, counter,
-            cfg, total, diagnostics,
+            cfg, total, diagnostics, focus_terms=focus_terms,
         )
 
     def _admit_lexical(
@@ -2207,10 +3228,13 @@ class ContextManager:
         cfg: BudgetConfig,
         total: int,
         diagnostics: list[str],
+        focus_terms: Optional[set[str]] = None,
     ) -> tuple[list[dict], int]:
-        """The pre-M6 admission path. Unchanged, and the live fallback."""
+        """The pre-M6 admission path with focused-evidence filtering."""
         admitted: list[dict] = []
         for _score, _seq, hit, _breakdown in collected["same"]:
+            if not self._focused_evidence_matches(hit, focus_terms):
+                continue
             if total >= cfg.input_ceiling:
                 break
             msg = {"role": hit.role, "content": hit.content}
@@ -2229,7 +3253,10 @@ class ContextManager:
         # provenance-tagged so the model can tell it apart.
         try:
             cross = self._admit_cross_session(
-                session_id, collected["cross"], selected_fps,
+                session_id,
+                [item for item in collected["cross"]
+                 if self._focused_evidence_matches(item[3], focus_terms)],
+                selected_fps,
                 selected_texts, counter, cfg, total, diagnostics,
             )
             admitted.extend(cross[0])
@@ -2248,6 +3275,7 @@ class ContextManager:
         cfg: BudgetConfig,
         total: int,
         diagnostics: list[str],
+        focus_terms: Optional[set[str]] = None,
     ) -> tuple[list[dict], int]:
         """Admit the fused hybrid ranking into the working view.
 
@@ -2277,6 +3305,8 @@ class ContextManager:
         ordered: list[StoredMessage] = []
         seen: set[int] = set()
         for message in store.fetch_messages_by_ids(message_ids[:256]):
+            if not self._focused_evidence_matches(message, focus_terms):
+                continue
             if message.message_id in seen:
                 continue
             seen.add(message.message_id)
@@ -2634,6 +3664,9 @@ class ContextManager:
             return None
         match = _FAVORITE_QUERY_RE.search(q)
         if not match:
+            # Explicit request for the omitted members of a car list.
+            if re.search(r"\bother\s+cars?\b", q, re.I):
+                return "car"
             return None
         phrase = _CATEGORY_END_RE.split(match.group(1), 1)[0].strip()
         if not phrase:
@@ -2691,7 +3724,13 @@ class ContextManager:
                 for message in window
                 if message.role == "user"
                 and message.message_id != exclude_id
-                and _QUESTION_RE.search(message.content)
+                and (
+                    _QUESTION_RE.search(message.content)
+                    or re.search(r"\b(?:fav|favorite|favourite)\s+"
+                                 r"(?:[a-z]+\s+){0,2}"
+                                 + re.escape(category) + r"s?\b",
+                                 message.content, re.I)
+                )
                 for term in scoring_mod.tokenize(message.content)
             }
             if terms <= found:
@@ -2716,6 +3755,10 @@ class ContextManager:
         query_text = current.get("content", "") if current else ""
         query_terms = scoring_mod.build_query(query_text)
         current_id = self._current_message_id(store, session_id, current)
+        if _LOCAL_DISCUSSION_RE.fullmatch(query_text):
+            # No global personal facts should masquerade as what was said
+            # in *this* conversation.
+            return total
 
         # Session scope only: another session's current value must never
         # answer for this session. Cross-session questions are handled
@@ -2755,12 +3798,9 @@ class ContextManager:
         bridge_category = (
             self._favorite_category(query_text) if query_text else None
         )
-        if bridge_category and any(
-            state.concept == f"favorite {bridge_category}"
-            or state.concept.startswith(f"favorite {bridge_category} ")
-            for state in current_states
-        ):
-            bridge_category = None
+        # Do not suppress other liked items merely because a primary
+        # favorite is stored. "My favorite car" and "cars I also love"
+        # are separate facts and must both be available for list queries.
         ranked = []
         for st in current_states:
             overlap = scoring_mod.relevance(
@@ -2771,7 +3811,16 @@ class ContextManager:
         bridge_ids: set[int] = set()
         if bridge_category:
             for overlap, st in ranked:
-                if overlap > 0 or not st.concept.startswith("likes for "):
+                # A narrower favorite category ("classic car") is also a
+                # valid car favorite. It should be rendered as a fact,
+                # rather than treated as an inferred preference.
+                if st.concept.startswith("favorite "):
+                    suffix = st.concept[len("favorite "):]
+                    if suffix == bridge_category or suffix.endswith(
+                            " " + bridge_category):
+                        bridge_ids.add(st.state_id)
+                    continue
+                if not st.concept.startswith("likes for "):
                     continue
                 if self._state_context_matches(
                         store, st, bridge_category, current_id):
@@ -2835,6 +3884,12 @@ class ContextManager:
             if total >= cfg.input_ceiling:
                 break
             if st.state_id not in bridge_ids:
+                continue
+            # The canonical state must be visible alongside its raw source;
+            # a user may have misspelled the name in the source message.
+            _emit(slots_mod.render_sentence(st.concept, st.value),
+                  cfg.input_ceiling)
+            if st.concept.startswith("favorite "):
                 continue
             try:
                 sources = store.fetch_messages_by_ids(

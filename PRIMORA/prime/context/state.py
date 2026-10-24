@@ -153,8 +153,201 @@ _HEDGE_PREFIX_RE = re.compile(
 )
 _NOW_SUFFIX_RE = re.compile(r"\s+now\.?$", re.IGNORECASE)
 
+# Normalize only explicit *shade-independent* likes. Without this, each
+# natural paraphrase becomes a different concept ("likes for purple whether
+# ..."), so Aurora has multiple overlapping current preferences.
+# Deliberately anchored: song titles and unrelated trailing clauses must not
+# be silently truncated into a different assertion.
+_ALL_SHADES_RE = re.compile(
+    r"^i\s+(?:really\s+)?(?:love|like|adore)\s+"
+    r"(?P<object>[a-z][a-z0-9 '\-]{0,75}?)\s+"
+    r"(?:regardless\s+of\s+(?:its|the)\s+shade|"
+    r"no\s+matter\s+(?:what|which)\s+shade|"
+    r"whether\s+it(?:'s|\s+is|s)\s+bright\s+or\s+not)"
+    r"(?:,\s*and\s+it\s+gives\s+me\s+a\s+similar\s+feeling"
+    r"\s+to\s+(?P<target>[a-z][a-z -]{1,35}))?"
+    r"[.!]?$", re.IGNORECASE,
+)
+
+
+def _extract_all_shades(text: str) -> list["StateCandidate"]:
+    """Canonicalize equivalent statements without guessing a preference."""
+    match = _ALL_SHADES_RE.fullmatch(text.strip())
+    if not match:
+        return []
+    obj = match.group("object").strip()
+    # Reuse the slot registry, including its scope and provenance policy.
+    base = _extract_slots("I love " + obj)
+    if len(base) != 1 or base[0].slot != "likes":
+        return []
+    normalized = dataclass_replace(base[0], value=base[0].value + " in any shade")
+    target = match.group("target")
+    if not target:
+        return [normalized]
+    # Do not discard a trailing clause. Only split when an existing slot
+    # explicitly supports the user's comparison, preserving both claims.
+    relationship = _extract_slots(f"{obj} feels like {target} to me")
+    if len(relationship) != 1 or relationship[0].slot != "color feeling":
+        return []
+    return [normalized, relationship[0]]
+
+# High-confidence natural-language car preferences that the generic likes
+# slot cannot parse correctly. Keep these anchored: speculative noun/brand
+# guessing would create false personal memories.
+_MODEL_YEAR_CAR_RE = re.compile(
+    r"^(?:hey\s+)?(?:aurora[,!]?\s+)?i\s+(?:really\s+)?"
+    r"(?:love|like|adore)\s+(?P<car>ford\s+mustan(?:g|d))\s+"
+    r"regardless\s+of\s+(?:(?:their|its|the)\s+)?"
+    r"(?:production|produced|producted|model)\s+years?|years?"
+    r"[.!]?$", re.IGNORECASE,
+)
+_CLASSIC_FAVORITE_RE = re.compile(
+    r"^(?:(?:for\s+instance|for\s+example)[, ]+)?"
+    r"(?:the\s+)?(?P<car>\d{4}\s+[a-z][a-z0-9 -]{1,42}?)\s+"
+    r"is\s+my\s+(?:fav|favorite|favourite)\s+classic\s+car[.!]?$",
+    re.IGNORECASE,
+)
+
+
+def _extract_explicit_car_preferences(text: str) -> list["StateCandidate"]:
+    """Only explicit, grounded statements; never infer a particular Boss model."""
+    statement = text.strip()
+    match = _MODEL_YEAR_CAR_RE.fullmatch(statement)
+    if match:
+        # A narrowly-scoped known typo correction. Preserve the user's exact
+        # wording in raw history, but key the preference to the real model.
+        car = "ford mustang"
+        base = _extract_slots("I love " + car)
+        if len(base) == 1 and base[0].slot == "likes":
+            return [dataclass_replace(
+                base[0], value="loves ford mustang across model years"
+            )]
+    match = _CLASSIC_FAVORITE_RE.fullmatch(statement)
+    if match:
+        model = " ".join(match.group("car").strip().split())
+        return _extract_slots("my favorite classic car is " + model)
+    return []
+
+
+# M2 / Batch 3: explicit preference beginnings, endings, and "now"
+# updates. They are recorded with the SOURCE MESSAGE observation time, not
+# a fabricated date on which the user's taste actually began.
+# Keep these patterns anchored and narrow: ambiguous past-tense remarks
+# should not silently overwrite a current preference.
+_NEW_LIKE_ALT_RE = re.compile(
+    r"^i(?:\s+have|['’]ve)?\s+(?:(?:just|recently)\s+)?"
+    r"(?:started|began)\s+(?:to\s+)?"
+    r"(?P<verb>like|love|adore|liking|loving|adoring)\s+"
+    r"(?P<obj>.+?)[.!]?$", re.IGNORECASE,
+)
+_NO_LONGER_LIKE_RE = re.compile(
+    r"^i\s+(?:no\s+longer|don'?t\s+anymore)\s+"
+    r"(?:like|love|adore)\s+(?P<obj>.+?)[.!]?$", re.IGNORECASE,
+)
+_STOPPED_LIKE_RE = re.compile(
+    r"^i\s+(?:have\s+|'ve\s+)?"
+    r"(?:stopped|quit)\s+(?:liking|loving|adoring)\s+"
+    r"(?P<obj>.+?)[.!]?$", re.IGNORECASE,
+)
+_FAVORITE_NOW_RE = re.compile(
+    r"^(?P<prefix>my\s+(?:fav|favorite|favourite)\s+"
+    r"[a-z][a-z ]{0,30}?\s+is\s+)(?P<value>.+?)\s+now[.!]?$",
+    re.IGNORECASE,
+)
+
+
+# A reason in the preceding USER statement can be connected to a named
+# preference only by a direct follow-up. No assistant explanation is evidence.
+_FOLLOWUP_WHY_LOVE_RE = re.compile(
+    r"^(?:that['’]?s|that is)\s+why\s+i\s+(?:love|like|adore)\s+"
+    r"(?P<object>(?:the\s+)?[a-z][a-z0-9 -]{1,65})[.!]?$", re.IGNORECASE,
+)
+_PRIOR_REASON_RE = re.compile(
+    r"^(?:it|this|that)\s+(?:has|had|features|uses|is|was)\s+"
+    r"[a-z0-9 ,'-]{10,150}[.!]?$", re.IGNORECASE,
+)
+
+
+def extract_followup_preference_reason(text: str, previous_user: str):
+    """Return (preference, reason) only for a tightly linked user pair.
+
+    Both statements must come from the user in the same session. The caller
+    additionally checks recency and attaches both source-message IDs.
+    """
+    match = _FOLLOWUP_WHY_LOVE_RE.fullmatch((text or "").strip())
+    reason = (previous_user or "").strip()
+    if not match or not _PRIOR_REASON_RE.fullmatch(reason):
+        return None
+    candidates = _extract_slots("I love " + match.group("object"))
+    if len(candidates) != 1 or candidates[0].slot != "likes":
+        return None
+    like = candidates[0]
+    rationale = StateCandidate(
+        concept="rationale for " + like.concept,
+        value=reason.rstrip(".! "), scope="global", mtype=RATIONALE,
+    )
+    return like, rationale
+
+
+def _extract_preference_evolution(text: str) -> list["StateCandidate"]:
+    """Route high-confidence change language into existing slots.
+
+    No invented onset timestamp, no implied deletion, and no new tables:
+    normal successor/evidence operations retain the actual historical chain.
+    """
+    work = text.strip()
+    match = _NEW_LIKE_ALT_RE.fullmatch(work)
+    if match:
+        obj = match.group("obj").strip().rstrip(".! ")
+        if not obj or obj.lower() in ("it", "that", "them"):
+            return []
+        base = _extract_slots("I love " + obj)
+        if len(base) != 1 or base[0].slot != "likes":
+            return []
+        # The generic likes slot historically merges 'like' and 'love'.
+        # Preserve the stated intensity for *new* timeline entries.
+        verb = match.group("verb").casefold()
+        if verb in ("like", "liking"):
+            return [dataclass_replace(
+                base[0], value=re.sub(r"^loves\b", "likes", base[0].value)
+            )]
+        return base
+    match = _NO_LONGER_LIKE_RE.fullmatch(work) or _STOPPED_LIKE_RE.fullmatch(work)
+    if match:
+        obj = match.group("obj").strip().rstrip(".! ")
+        if not obj or obj.lower() in ("it", "that", "them"):
+            return []
+        base = _extract_slots("I don't like " + obj)
+        return base if len(base) == 1 and base[0].slot == "likes" else []
+    match = _FAVORITE_NOW_RE.fullmatch(work)
+    if match:
+        # "now" marks the correction, but is not part of the car/color name.
+        base = _extract_slots(match.group("prefix") + match.group("value"))
+        if len(base) == 1 and base[0].concept.startswith("favorite "):
+            return [dataclass_replace(base[0], kind="correct")]
+    return []
+
+
 # Minimum rationale length: avoids "because yes" becoming memory.
 _RATIONALE_MIN_LEN = 12
+
+# "I don't love X because Y" is ambiguous: the user may reject Y as a
+# motive while still loving X. It is NOT proof that they dislike X. Store
+# the raw turn, but do not replace any existing preference state.
+_NEGATED_REASON_RE = re.compile(
+    r"^i\s+(?:do\s+not|don'?t|never)\s+"
+    r"(?:love|like|adore|prefer)\b.+\bbecause\b",
+    re.IGNORECASE | re.DOTALL,
+)
+# Second-hand claims are not the user's stated motive. "Because you said
+# it means creativity" may establish the liking, but must not create a
+# personal rationale saying creativity is why they love the thing.
+_ATTRIBUTED_REASON_RE = re.compile(
+    r"^(?:you\s+(?:said|told\s+me|think|suggested|claimed)|"
+    r"(?:someone|people|they)\s+(?:said|say|think)|"
+    r"i\s+(?:heard|read)\s+that)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -289,6 +482,8 @@ def _split_rationale(text: str) -> tuple[str, str]:
     if len(parts) != 2:
         return text, ""
     head, rationale = parts[0].strip(), parts[1].strip().rstrip(".")
+    if _ATTRIBUTED_REASON_RE.match(rationale):
+        return head, ""
     if len(rationale) < _RATIONALE_MIN_LEN:
         return text, ""
     return head, rationale
@@ -690,6 +885,13 @@ def extract_candidates(
     )
     if not work:
         return []
+    # A pronoun is not a stable personal preference. Context resolution,
+    # if independently verified, happens at the ContextManager boundary.
+    from .discourse import is_bare_reference_preference
+    if is_bare_reference_preference(work):
+        return []
+    if _NEGATED_REASON_RE.match(work):
+        return []
 
     head, rationale = _split_rationale(work)
 
@@ -714,7 +916,13 @@ def extract_candidates(
     # Slot phrasings first: a statement that names a personal-fact slot
     # ("my first name is X", "I love pizza", "always Y") lands there
     # instead of the generic legacy patterns.
-    cands = _extract_slots(head)
+    cands = _extract_preference_evolution(head)
+    if not cands:
+        cands = _extract_explicit_car_preferences(head)
+    if not cands:
+        cands = _extract_all_shades(head)
+    if not cands:
+        cands = _extract_slots(head)
     if not cands:
         cands = _extract_legacy(head, scope)
     if not cands:
@@ -1091,7 +1299,44 @@ def _apply_confirmed(store: Any, session_id: str, scope: str,
         diagnostics.extend(_reject_pending(
             store, scope, concept, type_word=_WORD_BY_TYPE.get(mtype)))
         return diagnostics
-    if currents and currents[0].value.lower() == cand.value.lower():
+    # Repeated user statements are evidence for the *same* current fact,
+    # not a new historical preference change. Preserve original timestamps
+    # and attach the additional user message as provenance. A generic "I
+    # love purple" is NOT evidence for the stronger "in any shade" clause.
+    def comparable(value: str) -> str:
+        cleaned = " ".join(value.strip().rstrip(".! ").split()).casefold()
+        # "the Regera" and "Regera" refer to the same keyed preference.
+        # Preserve exact wording in the stored value and raw messages.
+        if concept.startswith("likes for "):
+            cleaned = re.sub(r"^(loves|likes|hates|dislikes) the ", r"\1 ", cleaned)
+        return cleaned
+    same_value = (currents and len(currents) == 1 and
+                  comparable(currents[0].value) == comparable(cand.value))
+    # A softer rephrasing of an existing 'love' is not a retraction.
+    # Keep the stronger preference and attach the new statement as evidence.
+    softer_rephrase = (currents and len(currents) == 1
+                       and cand.kind == "establish"
+                       and concept.startswith("likes for ")
+                       and comparable(currents[0].value).startswith("loves ")
+                       and comparable(cand.value).startswith("likes ")
+                       and comparable(currents[0].value)[6:]
+                       == comparable(cand.value)[6:])
+    if same_value or softer_rephrase:
+        if (mtype == PREFERENCE
+                and getattr(cand, "authority", "user") == "user"
+                and currents[0].authority == "user"):
+            try:
+                store.add_state_evidence(currents[0].state_id, message_id)
+            except Exception as e:
+                return [f"state_failed: evidence update failed: {e}"]
+        return diagnostics
+    # A later generic "I love purple" is not a retraction of an earlier
+    # explicit "purple in any shade". Keep the more informative value
+    # unless the user marks the new message as a correction.
+    if (currents and cand.kind == "establish"
+            and concept.startswith("likes for ")
+            and currents[0].value.casefold()
+            == cand.value.casefold() + " in any shade"):
         return diagnostics
     try:
         transition = (

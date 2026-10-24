@@ -105,6 +105,13 @@ class RecallSpecialist(Specialist):
         query = payload.get("query")
         if not isinstance(query, str) or not query.strip():
             return PrimeResult.failure("Missing or invalid 'query' in payload")
+        if "sources" in payload:
+            # One public memory capability. Structured, source-backed reads
+            # are an alternate mode of recall, NOT another language router.
+            from .memory_evidence import MemoryEvidenceSpecialist
+            evidence_payload = {k: v for k, v in payload.items() if k != "query"}
+            return MemoryEvidenceSpecialist(self._mind).handle(evidence_payload)
+
 
         raw_limit = payload.get("limit", DEFAULT_LIMIT)
         if raw_limit is None:

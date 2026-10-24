@@ -61,14 +61,29 @@ class CapabilityRegistry:
         self.register(
             CapabilitySpec(
                 name="recall",
-                description="Search your own stored conversation memory for "
-                "passages relevant to a question; returns verbatim messages.",
+                description=(
+                    "One read-only memory access capability. Always provide query. "
+                    "For personal history, dates, preferences, and experiences, "
+                    "also provide sources (list: preferences/experiences/facts) "
+                    "to get user-source evidence and statement timestamps. "
+                    "Optionally provide subject (short search topic), "
+                    "date_from and date_to (ISO YYYY-MM-DD local dates, together), "
+                    "first_mention (boolean) or reasons (boolean). "
+                    "Without sources, recall searches conversation passages. "
+                    "Memory is not independent proof an event occurred."
+                ),
                 payload_schema={
                     "type": "object",
                     "properties": {
                         "query": {"type": "string", "description": "What to search the stored conversation for"},
                         "limit": {"type": "integer", "description": "Maximum passages to return (1-12, default 5)"},
-                        "session_id": {"type": "string", "description": "Session to search; omit for the current one"}
+                        "session_id": {"type": "string", "description": "Session to search; omit for current"},
+                        "sources": {"type": "array", "items": {"type": "string", "enum": ["preferences", "experiences", "facts"]}},
+                        "subject": {"type": "string"},
+                        "date_from": {"type": "string"},
+                        "date_to": {"type": "string"},
+                        "first_mention": {"type": "boolean"},
+                        "reasons": {"type": "boolean"}
                     },
                     "required": ["query"],
                     "additionalProperties": False

@@ -78,6 +78,29 @@ class OllamaProvider(Provider):
             return PrimeResult.failure(f"Ollama response parse error: {e}")
 
 
+def _normalize_openai_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Send one leading system message to strict OpenAI-compatible templates.
+
+    PRIMORA assembles its context from several source-backed system blocks.
+    Some model chat templates, including Qwen3.5, reject every system message
+    except the first one. Preserve the original non-system conversation order
+    and consolidate system instructions in their original relative order.
+    No memory content is modified or persisted by this transport adjustment.
+    """
+    positions = [index for index, message in enumerate(messages)
+                 if isinstance(message, dict) and message.get("role") == "system"]
+    if not positions or (positions == [0]):
+        return messages
+    contents = [messages[index].get("content") for index in positions]
+    if any(not isinstance(content, str) for content in contents):
+        # Do not discard or stringify structured system content silently.
+        return messages
+    combined = "\n\n".join(content for content in contents if content.strip())
+    conversation = [message for message in messages
+                    if not (isinstance(message, dict) and message.get("role") == "system")]
+    return ([{"role": "system", "content": combined}] if combined else []) + conversation
+
+
 class OpenAICompatibleProvider(Provider):
     """Chat provider for OpenAI-compatible HTTP servers (llama.cpp
     llama-server, vLLM, LM Studio, ...). Same ``invoke`` contract and
@@ -110,7 +133,7 @@ class OpenAICompatibleProvider(Provider):
 
         request_body: dict[str, Any] = {
             "model": model,
-            "messages": messages,
+            "messages": _normalize_openai_system_messages(messages),
             "stream": False,
         }
 

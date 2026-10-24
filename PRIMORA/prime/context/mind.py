@@ -380,6 +380,23 @@ class Mind:
         """
         return self._mechanisms.recall(query, session_id=session_id, limit=limit)
 
+    def verified_personal_history(self, question: str, *,
+                                  context: tuple[str, ...] = ()) -> Optional[str]:
+        """Direct read-only lookup of evidenced user history, via Prime."""
+        return self._mechanisms.verified_personal_history(
+            question, context=context)
+
+    def memory_query_evidence(self, plan: dict, *, session_id: str = "default") -> str:
+        return self._mechanisms.memory_query_evidence(plan, session_id=session_id)
+
+    def verified_likes_history(self, question: str) -> Optional[str]:
+        return self._mechanisms.verified_likes_history(question)
+
+    def verified_episode_history(self, question: str, *,
+                                 context: tuple[str, ...] = ()) -> Optional[str]:
+        """Read verified, source-backed cross-session experiences through Prime."""
+        return self._mechanisms.verified_episode_history(question, context=context)
+
     # -- conversation -----------------------------------------------------
 
     def reconcile(
