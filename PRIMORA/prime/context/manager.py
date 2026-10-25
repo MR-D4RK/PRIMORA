@@ -2383,6 +2383,7 @@ class ContextManager:
                         self._extract_states(
                             store, session_id, message_id, role, content,
                             context_question, assistant_question,
+                            global_personal_preferences=self._memory_v2_enabled,
                         )
                     )
                     # V2 typed formation is opt-in and proposal-only.  The
@@ -2470,7 +2471,8 @@ class ContextManager:
                 store, session_id, message_id)
             diagnostics.extend(self._extract_states(
                 store, session_id, message_id, message.role, message.content,
-                prior_user, prior_assistant))
+                prior_user, prior_assistant,
+                global_personal_preferences=self._memory_v2_enabled))
             if (
                 message.role == "user"
                 and self._memory_v2_enabled
@@ -2531,6 +2533,7 @@ class ContextManager:
         content: str,
         context_question: Optional[str] = None,
         assistant_question: Optional[str] = None,
+        global_personal_preferences: bool = False,
     ) -> list[str]:
         """Deterministic state extraction. Never invents on failure."""
         try:
@@ -2538,6 +2541,18 @@ class ContextManager:
                 candidates = state_mod.extract_candidates(
                     content, role, context_question, assistant_question
                 )
+                if global_personal_preferences and not re.search(
+                    r"\b(?:this session|this conversation|for now|temporarily|only here)\b",
+                    content, re.IGNORECASE,
+                ):
+                    from dataclasses import replace as dc_replace
+                    candidates = [
+                        dc_replace(candidate, scope="global")
+                        if candidate.mtype == state_mod.PREFERENCE
+                        and candidate.scope == "session"
+                        else candidate
+                        for candidate in candidates
+                    ]
                 reference_message = None
                 # Never store ``likes for it``. Resolve only a user-to-user
                 # reference with a uniquely named antecedent in this session.
@@ -2587,6 +2602,18 @@ class ContextManager:
                     candidates.extend(followup)
                 if not candidates:
                     return []
+                if global_personal_preferences and not re.search(
+                    r"\b(?:this session|this conversation|for now|temporarily|only here)\b",
+                    content, re.IGNORECASE,
+                ):
+                    from dataclasses import replace as dc_replace
+                    candidates = [
+                        dc_replace(candidate, scope="global")
+                        if candidate.mtype == state_mod.PREFERENCE
+                        and candidate.scope == "session"
+                        else candidate
+                        for candidate in candidates
+                    ]
                 diagnostics = state_mod.apply_user_candidates(
                     store, session_id, message_id, candidates
                 )

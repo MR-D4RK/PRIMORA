@@ -76,6 +76,54 @@ def test_typed_formation_validates_quotes_and_non_assertions(tmp_path):
     assert not rejected.admitted_ids and any("non_assertion" in d for d in rejected.diagnostics)
 
 
+def test_typed_formation_rejects_inverted_predicate_values_and_bad_provenance(tmp_path):
+    manager = ContextManager(db_path=tmp_path / "inverted.db", enable_memory_v2=True)
+    store = manager._get_store()
+    message_id, *_ = store.append("alpha", 0, "user", "I like kinetic sculptures", timestamp=10)
+    message = store.fetch_message(message_id)
+    inverted = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "kinetic sculptures", "value": "like",
+        "claim_kind": "assertion", "actor": "user", "scope": "session",
+        "source_ids": [message_id], "source_quote": "I like kinetic sculptures",
+    }]}))
+    result = apply_proposals(store, "alpha", message, inverted)
+    assert not result.admitted_ids
+    assert any("preference_value_is_predicate" in item for item in result.diagnostics)
+    assert not store.fetch_states(scope="alpha", status="current")
+    invalid_source = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "kinetic sculptures", "value": "sculptures",
+        "claim_kind": "assertion", "actor": "user", "scope": "global",
+        "source_ids": [999999], "source_quote": "I like kinetic sculptures",
+    }]}))
+    rejected = apply_proposals(store, "alpha", message, invalid_source)
+    assert not rejected.admitted_ids
+    assert any("source_not_user" in item for item in rejected.diagnostics)
+    omitted_provenance = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "preferred kinetic sculpture",
+        "value": "kinetic sculptures", "claim_kind": "assertion", "actor": "user",
+        "scope": "session",
+    }]}))
+    bound = apply_proposals(store, "alpha", message, omitted_provenance)
+    saved = store.fetch_states(scope="global", status="current")
+    assert bound.admitted_ids and saved[-1].source_ids == [message_id]
+
+
+def test_inverted_qwen_preference_cannot_duplicate_deterministic_memory(tmp_path):
+    provider = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "kinetic sculptures", "value": "like",
+        "claim_kind": "assertion", "actor": "user", "scope": "global",
+        "source_ids": [1], "source_quote": "I like kinetic sculptures",
+    }]}))
+    manager = ContextManager(
+        db_path=tmp_path / "inverted-manager.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    manager.reconcile([{"role": "user", "content": "I like kinetic sculptures"}], "s")
+    states = manager._get_store().fetch_states(scope="global", status="current")
+    assert any(row.value.startswith("loves kinetic sculptures") for row in states)
+    assert not any(row.concept == "kinetic sculptures" and row.value == "like" for row in states)
+
+
 def test_provider_failure_falls_back_and_feature_off_preserves_legacy(tmp_path):
     broken = FakeProvider("not json")
     manager = ContextManager(
@@ -116,8 +164,47 @@ def test_empty_qwen_response_keeps_deterministic_preference_and_timing(tmp_path)
         and "db_ms=" in item
         for item in diagnostics
     )
-    states = manager._get_store().fetch_states(scope="s", status="current")
+    states = manager._get_store().fetch_states(scope="global", status="current")
     assert any("asymmetrical architecture" in row.value for row in states)
+
+
+def test_v2_personal_preferences_are_global_across_sessions(tmp_path):
+    provider = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "preferred kinetic sculpture",
+        "value": "kinetic sculptures", "claim_kind": "assertion", "actor": "user",
+        "scope": "session", "source_ids": [1],
+        "source_quote": "I like kinetic sculptures",
+    }]}))
+    manager = ContextManager(
+        db_path=tmp_path / "cross-session.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    manager.reconcile([{"role": "user", "content": "I like kinetic sculptures"}], "alpha")
+    assert manager._get_store().fetch_states(scope="global", status="current")
+    evidence = manager.memory_query_evidence({
+        "sources": ["preferences"],
+        "query": "What are the last three things I told you I liked?",
+        "result_count": 3, "order": "recent", "temporal_scope": "current",
+    }, session_id="beta")
+    assert "kinetic sculptures" in evidence
+
+
+def test_explicit_temporary_preference_remains_session_scoped(tmp_path):
+    provider = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "preferred temporary sculpture",
+        "value": "temporary sculpture", "claim_kind": "assertion", "actor": "user",
+        "scope": "global", "source_ids": [1],
+        "source_quote": "For now I like a temporary sculpture",
+    }]}))
+    manager = ContextManager(
+        db_path=tmp_path / "temporary-scope.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    manager.reconcile([{
+        "role": "user", "content": "For now I like a temporary sculpture"
+    }], "alpha")
+    assert not manager._get_store().fetch_states(scope="global", status="current")
+    assert manager._get_store().fetch_states(scope="alpha", status="current")
 
 
 def test_event_and_relationship_proposals_remain_source_backed(tmp_path):
@@ -196,7 +283,7 @@ def test_reasoning_only_provider_output_still_uses_safe_json_validation(tmp_path
     }], "s")
     # The deterministic path is already sufficient for this wording; the
     # assertion verifies that any reasoning JSON remains source validated.
-    states = manager._get_store().fetch_states(scope="s", status="current")
+    states = manager._get_store().fetch_states(scope="global", status="current")
     assert any("asymmetrical architecture" in row.value for row in states)
 
 

@@ -26,6 +26,11 @@ CLAIM_KINDS = frozenset({
 ADMITTABLE_CLAIMS = frozenset({"assertion"})
 MAX_CANDIDATES = 8
 MAX_TEXT = 1000
+PREFERENCE_PREDICATES = frozenset({
+    "like", "likes", "liked", "love", "loves", "loved", "prefer",
+    "prefers", "preferred", "enjoy", "enjoys", "enjoyed", "favorite",
+    "favourite",
+})
 
 
 @dataclass(frozen=True)
@@ -171,6 +176,13 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
         return False, "invalid_scope"
     if not candidate.concept or not candidate.value:
         return False, "missing_concept_or_value"
+    if candidate.kind == "preference":
+        if candidate.value.casefold().strip(" .!?\"'") in PREFERENCE_PREDICATES:
+            return False, "preference_value_is_predicate"
+        if re.match(r"^(?:i|we)\s+(?:like|love|prefer|enjoy)\b", candidate.value, re.I):
+            return False, "preference_value_is_statement"
+        if candidate.concept.casefold().strip(" .!?\"'") in PREFERENCE_PREDICATES:
+            return False, "preference_concept_is_predicate"
     if len(candidate.concept) > 240 or len(candidate.value) > MAX_TEXT:
         return False, "proposal_too_long"
     if not candidate.source_ids or any(i <= 0 for i in candidate.source_ids):
@@ -213,7 +225,7 @@ def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[li
                 '{"candidates":[{"kind":"preference|state|event|relationship|observation",'
                 '"concept":"...","value":"...","claim_kind":"assertion|hypothesis|question|fiction|negation|third_party|assistant",'
                 '"actor":"user","scope":"session|global","source_ids":[ID],"source_quote":"exact substring",'
-                '"predicate":"..."}]} . Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
+                f'"predicate":"..."}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
             )},
             {"role": "user", "content": message.content},
         ],
@@ -280,6 +292,24 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
     diagnostics: list[str] = []
     processing_started = time.perf_counter()
     for candidate in candidates:
+        candidate, provenance_bound = _bind_current_provenance(candidate, message)
+        if provenance_bound:
+            diagnostics.append("provenance_bound_to_current_user_source")
+        session_bound = bool(re.search(
+            r"\b(?:this session|this conversation|for now|temporarily|only here)\b",
+            message.content, re.IGNORECASE,
+        ))
+        if candidate.kind == "preference" and (
+            (candidate.scope == "session" and not session_bound)
+            or (candidate.scope == "global" and session_bound)
+        ):
+            # Personal preferences are cross-session by default. Explicit
+            # temporary/session wording remains session-scoped. Provenance
+            # validation still runs after this normalization.
+            from dataclasses import replace
+            candidate = replace(
+                candidate, scope="session" if session_bound else "global"
+            )
         valid, reason = validate_candidate(
             candidate, session_id=session_id, message=message,
             source_lookup=store.fetch_message,
@@ -360,4 +390,28 @@ def _timing_diagnostic(timings: dict[str, float]) -> str:
     return "typed_formation_timing: " + " ".join(
         f"{key}={value:.2f}ms" for key, value in sorted(timings.items())
     )
+
+
+def _bind_current_provenance(
+    candidate: TypedMemoryCandidate, message: Any,
+) -> tuple[TypedMemoryCandidate, bool]:
+    """Fill only omitted provenance from the exact message Prime is forming.
+
+    A model may omit the repeated source fields even after being instructed to
+    emit them. Binding an omission to the current user message is safe and
+    deterministic; an explicit wrong id or unsupported quote still reaches
+    the normal rejection gates unchanged.
+    """
+    from dataclasses import replace
+
+    if candidate.source_ids:
+        if candidate.source_ids == [message.message_id] and not candidate.source_quote:
+            return replace(candidate, source_quote=message.content), True
+        return candidate, False
+    if candidate.source_quote and candidate.source_quote.casefold() not in message.content.casefold():
+        return candidate, False
+    return replace(
+        candidate, source_ids=[message.message_id],
+        source_quote=candidate.source_quote or message.content,
+    ), True
 
