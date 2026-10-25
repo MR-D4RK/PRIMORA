@@ -93,7 +93,16 @@ def run_benchmark(seed: int = 7) -> dict[str, Any]:
         source_covered = all("source_ids=" in line for line in evidence.splitlines() if line.startswith("[message "))
         correction_ok = 1.0
         source_preservation = 1.0
-        continuity = 1.0 if any("item_000" in line for line in evidence.splitlines()) is False else 1.0
+        cross_session_sources = 0
+        for state in manager._get_store().fetch_states(scope="global", status="current"):
+            if any(
+                (manager._get_store().fetch_message(source_id) is not None
+                 and manager._get_store().fetch_message(source_id).session_id != "session-199")
+                for source_id in state.source_ids
+            ):
+                cross_session_sources += 1
+                break
+        continuity = 1.0 if cross_session_sources else 0.0
     p50 = statistics.median(latencies)
     ordered = sorted(latencies)
     p95 = ordered[max(0, int(len(ordered) * 0.95) - 1)]
