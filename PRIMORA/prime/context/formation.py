@@ -31,6 +31,29 @@ PREFERENCE_PREDICATES = frozenset({
     "prefers", "preferred", "enjoy", "enjoys", "enjoyed", "favorite",
     "favourite",
 })
+_PREFERENCE_FILLER_WORDS = frozenset({
+    "a", "an", "and", "for", "i", "my", "the", "thing", "things",
+    "user", "preferred", "preference", "preferences", "like", "likes",
+    "liked", "love", "loves", "loved", "prefer", "prefers", "preferred",
+    "enjoy", "enjoys", "enjoyed", "favorite", "favourite",
+})
+
+
+def _preference_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for raw in re.findall(r"[a-z0-9]+", text.casefold()):
+        if raw in _PREFERENCE_FILLER_WORDS or len(raw) < 3:
+            continue
+        if raw.endswith("ies") and len(raw) > 4:
+            raw = raw[:-3] + "y"
+        elif raw.endswith("s") and len(raw) > 4:
+            raw = raw[:-1]
+        terms.add(raw)
+    return terms
+
+
+def _preference_fingerprint(concept: str, value: str) -> set[str]:
+    return _preference_terms(f"{concept} {value}")
 
 
 @dataclass(frozen=True)
@@ -201,6 +224,15 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
         for source in sources
     ):
         return False, "source_quote_not_supported"
+    if candidate.kind == "preference":
+        candidate_terms = _preference_fingerprint(
+            candidate.concept, candidate.value
+        )
+        source_terms = set().union(*(
+            _preference_terms(source.content) for source in sources
+        ))
+        if not candidate_terms or not candidate_terms.issubset(source_terms):
+            return False, "preference_generalization_not_source_supported"
     for start, end in ((candidate.occurred_from, candidate.occurred_until),
                        (candidate.valid_from, candidate.valid_until)):
         if start is not None and (not math.isfinite(start)):
@@ -346,6 +378,27 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             continue
         scope = "global" if candidate.scope == "global" else session_id
         existing = [state for state in store.fetch_states(scope=scope, concept=candidate.concept, status="current")]
+        if candidate.kind == "preference":
+            candidate_terms = _preference_fingerprint(
+                candidate.concept, candidate.value
+            )
+            deduplicated = False
+            for state in store.fetch_states(scope=scope, status="current"):
+                if not set(candidate.source_ids).intersection(state.source_ids):
+                    continue
+                state_terms = _preference_fingerprint(state.concept, state.value)
+                if candidate_terms and candidate_terms.issubset(state_terms):
+                    for source_id in candidate.source_ids:
+                        if source_id not in state.source_ids:
+                            store.add_state_evidence(state.state_id, source_id)
+                    admitted.append(state.state_id)
+                    diagnostics.append(
+                        f"proposal_deduplicated: preference state {state.state_id}"
+                    )
+                    deduplicated = True
+                    break
+            if deduplicated:
+                continue
         predecessor_ids = [state.state_id for state in existing]
         try:
             same = next((state for state in existing if state.value.casefold() == candidate.value.casefold()), None)

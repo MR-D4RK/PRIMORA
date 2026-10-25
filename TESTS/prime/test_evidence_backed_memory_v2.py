@@ -106,6 +106,15 @@ def test_typed_formation_rejects_inverted_predicate_values_and_bad_provenance(tm
     bound = apply_proposals(store, "alpha", message, omitted_provenance)
     saved = store.fetch_states(scope="global", status="current")
     assert bound.admitted_ids and saved[-1].source_ids == [message_id]
+    generalized = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "preferred art form",
+        "value": "kinetic sculptures", "claim_kind": "assertion", "actor": "user",
+        "scope": "global", "source_ids": [message_id],
+        "source_quote": "I like kinetic sculptures",
+    }]}))
+    generalized_result = apply_proposals(store, "alpha", message, generalized)
+    assert not generalized_result.admitted_ids
+    assert any("generalization_not_source_supported" in item for item in generalized_result.diagnostics)
 
 
 def test_inverted_qwen_preference_cannot_duplicate_deterministic_memory(tmp_path):
@@ -122,6 +131,35 @@ def test_inverted_qwen_preference_cannot_duplicate_deterministic_memory(tmp_path
     states = manager._get_store().fetch_states(scope="global", status="current")
     assert any(row.value.startswith("loves kinetic sculptures") for row in states)
     assert not any(row.concept == "kinetic sculptures" and row.value == "like" for row in states)
+
+
+def test_three_unrelated_preferences_do_not_double_into_six_states(tmp_path):
+    class DuplicateProvider:
+        def invoke(self, capability, payload):
+            text = payload["messages"][-1]["content"]
+            subject = text.split(maxsplit=2)[-1].rstrip(".")
+            return PrimeResult.success({"content": json.dumps({"candidates": [{
+                "kind": "preference", "concept": f"preferred {subject}",
+                "value": subject, "claim_kind": "assertion", "actor": "user",
+                "scope": "session", "source_ids": [payload["source_message_id"]],
+                "source_quote": text,
+            }]})})
+
+    manager = ContextManager(
+        db_path=tmp_path / "three-preferences.db", enable_memory_v2=True,
+        formation_provider=DuplicateProvider(),
+    )
+    for text in (
+        "I like kinetic sculptures",
+        "I prefer alpine jazz",
+        "I love copper architecture",
+    ):
+        manager.reconcile([{"role": "user", "content": text}], "s")
+    states = manager._get_store().fetch_states(scope="global", status="current")
+    assert len([row for row in states if row.memory_type == "PREFERENCE"]) == 3
+    assert {"kinetic sculptures", "alpine jazz", "copper architecture"}.issubset(
+        {row.value.removeprefix("loves ") for row in states}
+    )
 
 
 def test_provider_failure_falls_back_and_feature_off_preserves_legacy(tmp_path):
