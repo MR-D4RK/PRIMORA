@@ -24,6 +24,10 @@ _POSITIVE_PREFERENCE_WORDS = re.compile(
 _PREDICATE_WORDS = re.compile(
     r"\b(liked|loved|enjoyed|preferred|like|love|enjoy|prefer|favorite|favourite|dislike|hate)s?\b", re.I,
 )
+_HISTORICAL_MARKERS = re.compile(
+    r"\b(?:previous(?:ly)?|earlier|before|formerly|used to|historical(?:ly)?|"
+    r"in the past|back then|old likes?)\b", re.I,
+)
 _EXPLICIT_USER_PREFERENCE = re.compile(
     r"\b(?:i|my)\s+(?:really\s+|usually\s+|always\s+|currently\s+)?"
     r"(?:like|love|enjoy|prefer|favor|favour|hate|dislike|favorite|favourite)\b",
@@ -59,7 +63,12 @@ def interpret(text: str, plan: Optional[dict[str, Any]] = None) -> Optional[Quer
     order = plan.get("order") or ("oldest" if re.search(r"\bfirst\b|earliest|oldest", text) else "recent" if re.search(r"\blast\b|latest|recent", text) else "relevance")
     if order not in {"relevance", "recent", "oldest"}:
         order = "relevance"
-    temporal = plan.get("temporal_scope") or ("recent" if re.search(r"\brecent|last\b", text) else "current")
+    if _HISTORICAL_MARKERS.search(text):
+        temporal = "historical"
+    else:
+        temporal = plan.get("temporal_scope") or (
+            "recent" if re.search(r"\brecent|last\b", text) else "current"
+        )
     if temporal not in {"current", "historical", "recent"}:
         temporal = "current"
     match = _PREDICATE_WORDS.search(text)

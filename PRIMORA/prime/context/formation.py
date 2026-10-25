@@ -29,13 +29,16 @@ MAX_TEXT = 1000
 PREFERENCE_PREDICATES = frozenset({
     "like", "likes", "liked", "love", "loves", "loved", "prefer",
     "prefers", "preferred", "enjoy", "enjoys", "enjoyed", "favorite",
-    "favourite",
+    "favourite", "dislike", "dislikes", "disliked", "hate", "hates",
+    "hated", "don't like", "do not like",
 })
 _PREFERENCE_FILLER_WORDS = frozenset({
     "a", "an", "and", "for", "i", "my", "the", "thing", "things",
     "user", "preferred", "preference", "preferences", "like", "likes",
     "liked", "love", "loves", "loved", "prefer", "prefers", "preferred",
     "enjoy", "enjoys", "enjoyed", "favorite", "favourite",
+    "dislike", "dislikes", "disliked", "hate", "hates", "hated", "don",
+    "dont", "do", "not",
 })
 
 

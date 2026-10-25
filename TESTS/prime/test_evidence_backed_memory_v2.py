@@ -245,6 +245,51 @@ def test_explicit_temporary_preference_remains_session_scoped(tmp_path):
     assert manager._get_store().fetch_states(scope="alpha", status="current")
 
 
+def test_historical_preference_query_includes_superseded_source_only_when_requested(tmp_path):
+    manager = ContextManager(
+        db_path=tmp_path / "historical-preferences.db", enable_memory_v2=True,
+        hybrid_retrieval=False,
+    )
+    manager.reconcile([
+        {"role": "user", "content": "I like kinetic sculptures", "seq": 0, "timestamp": 100},
+        {"role": "user", "content": "Actually, I don't like kinetic sculptures", "seq": 1, "timestamp": 200},
+    ], "alpha")
+    current = manager.memory_query_evidence({
+        "sources": ["preferences"],
+        "query": "What are the last things I told you I liked?",
+        "result_count": 10, "order": "recent", "temporal_scope": None,
+    }, session_id="beta")
+    historical = manager.memory_query_evidence({
+        "sources": ["preferences"],
+        "query": "What did I previously like?",
+        "result_count": 10, "order": "recent", "temporal_scope": None,
+    }, session_id="beta")
+    assert "kinetic sculptures" not in current
+    assert "I like kinetic sculptures" in historical
+    assert "source_ids=" in historical
+
+
+def test_negative_qwen_preference_deduplicates_deterministic_dislike(tmp_path):
+    provider = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "kinetic sculptures",
+        "value": "dislike kinetic sculptures", "claim_kind": "assertion",
+        "actor": "user", "scope": "global", "source_ids": [1],
+        "source_quote": "I don't like kinetic sculptures",
+    }]}))
+    manager = ContextManager(
+        db_path=tmp_path / "negative-dedup.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    manager.reconcile([{
+        "role": "user", "content": "I don't like kinetic sculptures"
+    }], "alpha")
+    states = [row for row in manager._get_store().fetch_states(
+        scope="global", status="current"
+    ) if row.memory_type == "PREFERENCE"]
+    assert len(states) == 1
+    assert states[0].value.startswith("dislikes kinetic sculptures")
+
+
 def test_event_and_relationship_proposals_remain_source_backed(tmp_path):
     manager = ContextManager(db_path=tmp_path / "typed-events.db", enable_memory_v2=True)
     store = manager._get_store()

@@ -166,7 +166,9 @@ class MemoryV2Console:
                 # wording such as "last three" instead of forcing 30.
                 "result_count": None,
                 "order": "recent",
-                "temporal_scope": "current",
+                # Let query intent distinguish current questions from
+                # historical wording such as "previously liked".
+                "temporal_scope": None,
             },
             session_id=self.session_id,
         )
