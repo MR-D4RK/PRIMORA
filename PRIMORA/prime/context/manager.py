@@ -2349,11 +2349,17 @@ class ContextManager:
                     # original message is the source of both text and time.
                     if role == "user":
                         try:
-                            claim = extract_experience_claim(content, role)
+                            source_message = store.fetch_message(message_id)
+                            claim = extract_experience_claim(
+                                content, role,
+                                reported_at=(source_message.timestamp if source_message else timestamp),
+                            )
                             if claim is not None:
                                 store.save_experience_event(
                                     session_id, message_id, claim.kind,
                                     claim.actor, claim.statement,
+                                    claim.occurred_at, claim.occurred_precision,
+                                    claim.occurred_timezone,
                                 )
                         except Exception as e:
                             formation_diags.append(f"episode_capture_failed: {e}")
@@ -2461,11 +2467,15 @@ class ContextManager:
         try:
             store.set_formation_status(message_id, session_id, "processing")
             if message.role == "user":
-                claim = extract_experience_claim(message.content, message.role)
+                claim = extract_experience_claim(
+                    message.content, message.role,
+                    reported_at=message.timestamp,
+                )
                 if claim is not None:
                     store.save_experience_event(
                         session_id, message_id, claim.kind,
-                        claim.actor, claim.statement)
+                        claim.actor, claim.statement, claim.occurred_at,
+                        claim.occurred_precision, claim.occurred_timezone)
             prior_user = self._prior_user_text(store, session_id, message_id)
             prior_assistant = self._prior_assistant_text(
                 store, session_id, message_id)

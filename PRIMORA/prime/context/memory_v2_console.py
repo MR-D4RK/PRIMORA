@@ -158,6 +158,11 @@ class MemoryV2Console:
         if not query:
             self._write("Usage: :evidence QUERY")
             return
+        episode = self.manager.verified_episode_history(query)
+        if episode is not None:
+            self._write("Episodic evidence:")
+            self._write(episode)
+            return
         evidence = self.manager.memory_query_evidence(
             {
                 "sources": ["preferences", "facts", "experiences"],

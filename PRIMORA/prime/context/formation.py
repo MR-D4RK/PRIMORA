@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from PRIMORA.prime.contract import RequestStatus
+from .episodes import extract_experience_claim
 
 MEMORY_KINDS = frozenset({"preference", "state", "event", "relationship", "observation"})
 CLAIM_KINDS = frozenset({
@@ -32,6 +33,16 @@ PREFERENCE_PREDICATES = frozenset({
     "favourite", "dislike", "dislikes", "disliked", "hate", "hates",
     "hated", "don't like", "do not like",
 })
+_EVENT_KIND_MAP = {
+    "visit": "activity", "visited": "activity", "attend": "activity",
+    "attended": "activity", "watch": "activity", "watched": "activity",
+    "read": "activity", "play": "activity", "played": "activity",
+    "listen": "activity", "listened": "activity", "activity": "activity",
+    "complete": "completion", "completed": "completion",
+    "finish": "completion", "finished": "completion",
+    "resolve": "resolution", "resolved": "resolution",
+    "start": "start", "started": "start", "begin": "start", "began": "start",
+}
 _PREFERENCE_FILLER_WORDS = frozenset({
     "a", "an", "and", "for", "i", "my", "the", "thing", "things",
     "user", "preferred", "preference", "preferences", "like", "likes",
@@ -194,7 +205,9 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
         return False, "unsupported_kind"
     if candidate.claim_kind not in CLAIM_KINDS:
         return False, "unsupported_claim_kind"
-    if candidate.claim_kind not in ADMITTABLE_CLAIMS:
+    if candidate.claim_kind not in ADMITTABLE_CLAIMS and not (
+        candidate.kind == "preference" and candidate.claim_kind == "negation"
+    ):
         return False, f"non_assertion:{candidate.claim_kind}"
     if candidate.actor != "user":
         return False, "authority_actor_not_user"
@@ -362,11 +375,25 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             ))
             continue
         if candidate.kind == "event":
-            event_kind = candidate.predicate or "activity"
+            source = store.fetch_message(candidate.source_ids[0])
+            claim = extract_experience_claim(
+                source.content, "user", reported_at=source.timestamp
+            ) if source is not None else None
+            event_kind = _EVENT_KIND_MAP.get(
+                (candidate.predicate or "").casefold(),
+                claim.kind if claim is not None else "activity",
+            )
+            actor = claim.actor if claim is not None else (
+                "we" if source is not None and source.content.casefold().startswith("we ") else "i"
+            )
+            statement = claim.statement if claim is not None else source.content
             try:
                 event_id = store.save_experience_event(
-                    session_id, candidate.source_ids[0], event_kind, "i",
-                    store.fetch_message(candidate.source_ids[0]).content,
+                    session_id, candidate.source_ids[0], event_kind, actor,
+                    statement,
+                    claim.occurred_at if claim is not None else None,
+                    claim.occurred_precision if claim is not None else "unknown",
+                    claim.occurred_timezone if claim is not None else "UTC",
                 )
             except Exception as exc:
                 diagnostics.append(f"event_proposal_held:{exc}")

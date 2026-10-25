@@ -91,6 +91,9 @@ CREATE TABLE IF NOT EXISTS experience_events (
     statement TEXT NOT NULL,
     reported_at REAL NOT NULL,
     authority TEXT NOT NULL DEFAULT 'user',
+    occurred_at REAL,
+    occurred_precision TEXT NOT NULL DEFAULT 'unknown',
+    occurred_timezone TEXT NOT NULL DEFAULT 'UTC',
     FOREIGN KEY (source_message_id) REFERENCES messages(id)
 );
 CREATE INDEX IF NOT EXISTS idx_experience_events_reported
@@ -384,6 +387,20 @@ class ContextStore:
                     "ALTER TABLE relationships ADD COLUMN source_episode_ids"
                     " TEXT NOT NULL DEFAULT ''"
                 )
+            event_cols = {
+                r[1] for r in con.execute(
+                    "PRAGMA table_info(experience_events)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("occurred_at", "REAL"),
+                ("occurred_precision", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("occurred_timezone", "TEXT NOT NULL DEFAULT 'UTC'"),
+            ):
+                if column not in event_cols:
+                    con.execute(
+                        f"ALTER TABLE experience_events ADD COLUMN {column} {definition}"
+                    )
             entity_cols = {
                 r[1] for r in con.execute("PRAGMA table_info(entities)").fetchall()
             }
@@ -534,6 +551,9 @@ class ContextStore:
     def save_experience_event(
         self, session_id: str, source_message_id: int,
         kind: str, actor: str, statement: str,
+        occurred_at: Optional[float] = None,
+        occurred_precision: str = "unknown",
+        occurred_timezone: str = "UTC",
     ) -> Optional[int]:
         """Persist verified user provenance once; never trust caller timestamps.
 
@@ -545,6 +565,10 @@ class ContextStore:
             "activity", "discussion", "milestone", "end", "setback",
         ) or actor not in ("i", "we"):
             raise ValueError("invalid event classification")
+        if occurred_precision not in ("unknown", "day", "instant"):
+            raise ValueError("invalid occurred_precision")
+        if occurred_at is not None:
+            occurred_at = self._normalize_timestamp(occurred_at, "occurred_at")
         with self._connect() as con:
             row = con.execute(
                 "SELECT session_id, role, content, timestamp FROM messages WHERE id = ?",
@@ -557,8 +581,10 @@ class ContextStore:
             con.execute(
                 "INSERT OR IGNORE INTO experience_events "
                 "(session_id, source_message_id, kind, actor, statement, "
-                "reported_at, authority) VALUES (?, ?, ?, ?, ?, ?, 'user')",
-                (session_id, source_message_id, kind, actor, statement, row[3]),
+                "reported_at, authority, occurred_at, occurred_precision, "
+                "occurred_timezone) VALUES (?, ?, ?, ?, ?, ?, 'user', ?, ?, ?)",
+                (session_id, source_message_id, kind, actor, statement, row[3],
+                 occurred_at, occurred_precision, occurred_timezone),
             )
             found = con.execute(
                 "SELECT id FROM experience_events WHERE source_message_id = ?",
@@ -579,7 +605,8 @@ class ContextStore:
             raise ValueError("limit must be between 1 and 1000")
         query = (
             "SELECT e.id, e.session_id, e.source_message_id, e.kind, "
-            "e.actor, e.statement, e.reported_at, e.authority "
+            "e.actor, e.statement, e.reported_at, e.authority, e.occurred_at,"
+            " e.occurred_precision, e.occurred_timezone "
             "FROM experience_events e JOIN messages m "
             "ON m.id = e.source_message_id "
             "WHERE e.authority = 'user' AND m.role = 'user' "
@@ -619,11 +646,13 @@ class ContextStore:
             ).fetchall()
         result = []
         for message_id, session_id, statement, timestamp in rows:
-            claim = extract_experience_claim(statement)
+            claim = extract_experience_claim(statement, reported_at=timestamp)
             if claim is not None:
                 result.append(ExperienceEvent(
                     -message_id, session_id, message_id, claim.kind,
                     claim.actor, claim.statement, timestamp, "user",
+                    claim.occurred_at, claim.occurred_precision,
+                    claim.occurred_timezone,
                 ))
         return result
 

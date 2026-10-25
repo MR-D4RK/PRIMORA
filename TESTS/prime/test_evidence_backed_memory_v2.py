@@ -1,6 +1,7 @@
 """Read-only V2 contracts; every test uses a disposable SQLite database."""
 
 import json
+from datetime import datetime, timezone
 
 import pytest
 
@@ -12,6 +13,7 @@ from PRIMORA.prime.context.observation import (
     ObservationProposal,
     ObservationService,
 )
+from PRIMORA.prime.context.episodes import extract_experience_claim
 from PRIMORA.prime.context.manager import ContextManager
 from PRIMORA.prime.context.store import ContextStore
 
@@ -288,6 +290,71 @@ def test_negative_qwen_preference_deduplicates_deterministic_dislike(tmp_path):
     ) if row.memory_type == "PREFERENCE"]
     assert len(states) == 1
     assert states[0].value.startswith("dislikes kinetic sculptures")
+
+
+def test_episode_question_matches_only_requested_activity_and_two_clocks(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRIMORA_USER_TIMEZONE", "America/New_York")
+    manager = ContextManager(db_path=tmp_path / "episodes.db", hybrid_retrieval=False)
+    reported = datetime(2025, 1, 2, 4, 30, tzinfo=timezone.utc).timestamp()
+    manager.reconcile([{
+        "role": "user", "content": "Yesterday, I visited the gallery.",
+        "timestamp": reported,
+    }, {
+        "role": "user", "content": "I watched a film.",
+        "timestamp": reported + 60,
+    }], "s")
+    events = manager.experience_events(session_id="s")
+    gallery = next(event for event in events if "gallery" in event.statement)
+    assert gallery.reported_at == reported
+    assert gallery.occurred_precision == "day"
+    # Dec 31 2024 05:00 UTC is midnight Dec 31 in America/New_York, the
+    # previous local day relative to the reported Jan 1 23:30 local time.
+    assert gallery.occurred_at == datetime(2024, 12, 31, 5, tzinfo=timezone.utc).timestamp()
+    answer = manager.verified_episode_history("When did I visit the gallery?")
+    assert answer is not None
+    assert "gallery" in answer
+    assert "film" not in answer
+    assert "occurred 2024-12-31 05:00 UTC" in answer
+    assert "reported 2025-01-02 04:30 UTC" in answer
+
+
+def test_qwen_activity_classification_uses_valid_first_person_source(tmp_path):
+    provider = FakeProvider(json.dumps({"candidates": [{
+        "kind": "event", "concept": "gallery visit", "value": "visited",
+        "predicate": "visited", "claim_kind": "assertion", "actor": "user",
+        "scope": "session", "source_ids": [1],
+        "source_quote": "I visited the gallery",
+    }]}))
+    manager = ContextManager(
+        db_path=tmp_path / "qwen-event.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    manager.reconcile([{
+        "role": "user", "content": "I visited the gallery"
+    }], "s")
+    events = manager.experience_events(session_id="s")
+    assert len(events) == 1
+    assert events[0].kind == "activity"
+    assert events[0].statement == "I visited the gallery"
+
+
+def test_qwen_negation_is_a_valid_negative_preference(tmp_path):
+    provider = FakeProvider(json.dumps({"candidates": [{
+        "kind": "preference", "concept": "preferred hardstyle",
+        "value": "hardstyle", "claim_kind": "negation", "actor": "user",
+        "scope": "global", "source_ids": [1],
+        "source_quote": "I hate hardstyle",
+    }]}))
+    manager = ContextManager(
+        db_path=tmp_path / "negative-qwen.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    manager.reconcile([{"role": "user", "content": "I hate hardstyle"}], "s")
+    states = [row for row in manager._get_store().fetch_states(
+        scope="global", status="current"
+    ) if row.memory_type == "PREFERENCE"]
+    assert len(states) == 1
+    assert states[0].value.startswith(("dislikes hardstyle", "hates hardstyle"))
 
 
 def test_event_and_relationship_proposals_remain_source_backed(tmp_path):

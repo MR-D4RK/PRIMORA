@@ -63,9 +63,11 @@ class DigestRecord:
 class ExperienceEvent:
     """An explicitly user-reported experience, with one immutable source.
 
-    ``reported_at`` is the time the message was recorded, not a claimed
-    real-world event time. ``verified`` means provenance-verified, not that
-    the external event itself has been independently checked.
+    ``reported_at`` is the time the message was recorded. ``occurred_at`` is
+    optional source-backed relative-date resolution with an explicit
+    precision; it is never substituted when the user did not provide one.
+    ``verified`` means provenance-verified, not that the external event itself
+    has been independently checked.
     """
 
     event_id: int
@@ -76,6 +78,9 @@ class ExperienceEvent:
     statement: str
     reported_at: float
     authority: str = "user"
+    occurred_at: Optional[float] = None
+    occurred_precision: str = "unknown"
+    occurred_timezone: str = "UTC"
 
 
 @dataclass(frozen=True)
