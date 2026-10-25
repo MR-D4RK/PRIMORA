@@ -18,7 +18,7 @@ _PREFERENCE_WORDS = re.compile(
     re.I,
 )
 _PREDICATE_WORDS = re.compile(
-    r"\b(like|love|enjoy|prefer|favorite|favourite|dislike|hate)s?\b", re.I,
+    r"\b(liked|loved|enjoyed|preferred|like|love|enjoy|prefer|favorite|favourite|dislike|hate)s?\b", re.I,
 )
 _EXPLICIT_USER_PREFERENCE = re.compile(
     r"\b(?:i|my)\s+(?:really\s+|usually\s+|always\s+|currently\s+)?"
@@ -36,6 +36,7 @@ class QueryIntent:
     order: str = "relevance"
     temporal_scope: str = "current"
     subject: Optional[str] = None
+    positive_only: bool = False
 
 
 def interpret(text: str, plan: Optional[dict[str, Any]] = None) -> Optional[QueryIntent]:
@@ -59,6 +60,14 @@ def interpret(text: str, plan: Optional[dict[str, Any]] = None) -> Optional[Quer
         temporal = "current"
     match = _PREDICATE_WORDS.search(text)
     predicate = match.group(1).casefold() if match else "preference"
+    if predicate in {"liked", "likes"}:
+        predicate = "like"
+    elif predicate in {"loved", "loves"}:
+        predicate = "love"
+    elif predicate in {"enjoyed", "enjoys"}:
+        predicate = "enjoy"
+    elif predicate in {"preferred", "prefers"}:
+        predicate = "prefer"
     if predicate in {"favorite", "favourite"}:
         predicate = "favorite"
     subject = plan.get("subject")
@@ -68,11 +77,19 @@ def interpret(text: str, plan: Optional[dict[str, Any]] = None) -> Optional[Quer
         match = re.search(r"\b(?:about|for|in)\s+([a-z][a-z0-9 _-]{1,80})", text)
         if match and not re.search(r"\b(?:the last|recent)", match.group(1)):
             subject = match.group(1).strip(" ?.! ")
-    return QueryIntent("preference", predicate, "global", count, order, temporal, subject)
+    positive_only = bool(re.search(
+        r"\b(?:like|liked|love|loved|enjoy|enjoyed|prefer|preferred)\b", text
+    )) and "preference" not in text
+    return QueryIntent("preference", predicate, "global", count, order, temporal, subject, positive_only)
 
 
 def _predicate_match(intent: QueryIntent, text: str, concept: str, value: str) -> bool:
     corpus = f"{text} {concept} {value}".casefold()
+    if intent.positive_only and re.search(
+        r"\b(?:do not|don't|never)\s+(?:really\s+)?(?:like|love|enjoy|prefer)\b"
+        r"|\b(?:dislike|hate)\b", text.casefold()
+    ):
+        return False
     if intent.predicate == "preference":
         return bool(_PREFERENCE_WORDS.search(corpus))
     if intent.predicate == "favorite":
@@ -86,6 +103,15 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
     now = now if now is not None else __import__("time").time()
     candidates: list[dict[str, Any]] = []
     states = store.fetch_states(scope="global") + store.fetch_states(scope=session_id)
+    # A raw message that was the source of a superseded preference is
+    # historical evidence, not a current answer. Keep its immutable row, but
+    # do not let the lexical fallback re-admit it after the lifecycle gate.
+    invalid_preference_sources = {
+        source_id
+        for state in states
+        if state.memory_type == "PREFERENCE" and state.status != "current"
+        for source_id in state.source_ids
+    }
     for state in states:
         allowed_status = ("current", "superseded") if intent.temporal_scope == "historical" else ("current",)
         if state.authority != "user" or state.status not in allowed_status or not state.source_ids:
@@ -140,6 +166,8 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
         raw_messages = []
     for msg in raw_messages:
         if msg.role != "user" or not _EXPLICIT_USER_PREFERENCE.search(msg.content):
+            continue
+        if msg.message_id in invalid_preference_sources:
             continue
         if not _predicate_match(intent, msg.content, "", ""):
             continue

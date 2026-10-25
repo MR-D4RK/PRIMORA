@@ -154,14 +154,21 @@ def test_relationship_temporal_source_episode_is_additive(tmp_path):
 def test_benchmark_is_disposable_and_reports_unavailable_hardware():
     report = run_benchmark()
     assert report["conversations"] >= 200 and report["domains"] >= 50
-    assert report["candidate"]["p_at_3"] >= 0.90
-    assert report["candidate"]["recall_at_3"] >= 0.85
-    assert report["candidate"]["exact_order_count"] >= 0.95
-    assert report["formation"]["precision"] >= 0.90
-    assert report["formation"]["recall"] >= 0.90
-    assert report["formation"]["f1"] >= 0.90
+    assert report["candidate"]["retrieval"]["p_at_3"] >= 0.90
+    assert report["candidate"]["retrieval"]["recall_at_3"] >= 0.85
+    assert report["candidate"]["retrieval"]["exact_order_count"] >= 0.95
+    assert report["candidate"]["formation"]["precision"] >= 0.90
+    assert report["candidate"]["formation"]["recall"] >= 0.90
+    assert report["candidate"]["formation"]["f1"] >= 0.90
+    assert report["baseline"]["model_calls"] == 0
+    assert report["candidate"]["model_calls"] == report["conversations"]
+    assert report["baseline"]["retrieval"]["p_at_3"] < report["candidate"]["retrieval"]["p_at_3"]
+    assert report["baseline"]["abstention"] == 0.0
+    assert report["candidate"]["abstention"] == 1.0
     assert report["source_preservation"] == 1.0
-    assert report["unsupported_claim_rate"] == 0.0
+    assert report["alias_resolution"] == 1.0
+    assert report["two_clock_events"] == 1.0
+    assert report["unsupported_claim_rate"] == report["candidate"]["unsupported_claim_rate"]
     assert report["production_db_touched"] is False
     assert report["qwen_validation"] == "NOT RUN"
 
