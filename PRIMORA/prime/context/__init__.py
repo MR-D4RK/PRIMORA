@@ -32,6 +32,8 @@ from .models import (
     SessionRecord,
     ShadowComparison,
     StateRecord,
+    ObservationRecord,
+    ObservationHistoryRecord,
     StoredMessage,
     noop_memory,
 )
@@ -68,6 +70,8 @@ __all__ = [
     "SessionRecord",
     "ShadowComparison",
     "StateRecord",
+    "ObservationRecord",
+    "ObservationHistoryRecord",
     "StoredMessage",
     "WorkingMemory",
     "estimate_tokens",

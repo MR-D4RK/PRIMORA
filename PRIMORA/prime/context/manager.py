@@ -13,6 +13,8 @@ from typing import Any, Callable, Optional
 
 from . import entities as entities_mod
 from . import entity_formation as entity_formation_mod
+from . import formation as formation_mod
+from . import query_intent as query_intent_mod
 from . import hybrid as hybrid_mod
 from . import queries as queries_mod
 from . import relationships as relationships_mod
@@ -234,10 +236,27 @@ class ContextManager:
         semantic_index=None,
         hybrid_retrieval: Optional[bool] = None,
         include_foreign_history: bool = True,
+        formation_provider=None,
+        enable_memory_v2: Optional[bool] = None,
+        memory_v2: Optional[bool] = None,
     ):
         self._db_path = db_path
         self._budget = budget or BudgetConfig.from_env()
         self._memory_provider = memory_provider
+        self._formation_provider = formation_provider
+        if enable_memory_v2 is None:
+            enable_memory_v2 = memory_v2
+        if enable_memory_v2 is None:
+            enabled_values = (
+                os.environ.get("PRIMORA_MEMORY_V2", "0"),
+                os.environ.get("PRIMORA_MEMORY_V2_FORMATION", "0"),
+                os.environ.get("PRIMORA_MEMORY_V2_RETRIEVAL", "0"),
+            )
+            enable_memory_v2 = any(
+                value.strip().lower() in ("1", "true", "yes", "on")
+                for value in enabled_values
+            )
+        self._memory_v2_enabled = bool(enable_memory_v2)
         self._store: Optional[ContextStore] = None
         # M6 LIVE. Hybrid retrieval is the returned result. Defaults on;
         # set hybrid_retrieval=False (or PRIMORA_HYBRID_RETRIEVAL=0) to roll
@@ -309,6 +328,17 @@ class ContextManager:
 
     def clear_shadow_records(self) -> None:
         self._shadow_records.clear()
+
+    @property
+    def memory_v2_enabled(self) -> bool:
+        return self._memory_v2_enabled
+
+    def set_memory_v2_enabled(self, enabled: bool) -> None:
+        """Roll back the additive V2 formation path without touching data."""
+        self._memory_v2_enabled = bool(enabled)
+
+    def set_formation_provider(self, provider) -> None:
+        self._formation_provider = provider
 
     def retrieval_traces(self) -> list[RetrievalTrace]:
         return list(self._retrieval_traces)
@@ -1901,6 +1931,18 @@ class ContextManager:
         from datetime import datetime, timezone
         from . import scoring as scoring_mod
 
+        # V2 typed retrieval is an opt-in replacement for the broad raw
+        # candidate path.  It validates relevance before applying recency and
+        # count, fixing the "last three likes" failure without adding an LLM
+        # call.  A caller that does not provide the original question keeps
+        # the legacy behavior byte-for-byte.
+        if self._memory_v2_enabled and plan.get("query"):
+            typed_intent = query_intent_mod.interpret(plan.get("query", ""), plan)
+            if typed_intent is not None and set(plan.get("sources", ())) & {"preferences", "facts"}:
+                return query_intent_mod.preference_evidence(
+                    self._get_store(), typed_intent, session_id=session_id,
+                )
+
         sources = set(plan["sources"])
         subject = (plan.get("subject") or "").casefold().strip()
         days = plan.get("recent_days")
@@ -2343,6 +2385,22 @@ class ContextManager:
                             context_question, assistant_question,
                         )
                     )
+                    # V2 typed formation is opt-in and proposal-only.  The
+                    # deterministic extractor above always runs first, so a
+                    # provider timeout or malformed response cannot remove
+                    # legacy behavior or admit an unsupported claim.
+                    if (
+                        role == "user"
+                        and self._memory_v2_enabled
+                        and self._formation_provider is not None
+                    ):
+                        typed = formation_mod.apply_proposals(
+                            store, session_id, store.fetch_message(message_id),
+                            self._formation_provider,
+                        )
+                        formation_diags.extend(
+                            [f"typed_formation:{item}" for item in typed.diagnostics]
+                        )
                     if role == "user":
                         formation_diags.extend(
                             self._extract_entities(
@@ -2413,6 +2471,17 @@ class ContextManager:
             diagnostics.extend(self._extract_states(
                 store, session_id, message_id, message.role, message.content,
                 prior_user, prior_assistant))
+            if (
+                message.role == "user"
+                and self._memory_v2_enabled
+                and self._formation_provider is not None
+            ):
+                typed = formation_mod.apply_proposals(
+                    store, session_id, message, self._formation_provider,
+                )
+                diagnostics.extend(
+                    [f"typed_formation:{item}" for item in typed.diagnostics]
+                )
             if message.role == "user":
                 diagnostics.extend(self._extract_entities(
                     store, session_id, message_id, message.content,

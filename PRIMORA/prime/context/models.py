@@ -143,6 +143,66 @@ class StateRecord:
 
 
 @dataclass(frozen=True)
+class ObservationRecord:
+    """A source-backed observation owned by Prime.
+
+    Observations are deliberately separate from states: they may describe a
+    proposed or unresolved interpretation while retaining the exact user
+    evidence that supports it.  ``proof_count`` is derived from linked
+    sources and is never a model supplied confidence value.
+    """
+
+    observation_id: int
+    session_id: str
+    scope: str
+    concept: str
+    normalized_concept: str
+    value: str
+    observation_type: str
+    actor: str
+    subject: str
+    predicate: str
+    source_ids: list[int]
+    source_episode_ids: list[str]
+    authority: str
+    status: str
+    confidence: float
+    created_at: float
+    observed_at: Optional[float] = None
+    occurred_from: Optional[float] = None
+    occurred_until: Optional[float] = None
+    valid_from: Optional[float] = None
+    valid_until: Optional[float] = None
+    supersedes_id: Optional[int] = None
+    superseded_at: Optional[float] = None
+    proof_count: int = 0
+
+    @property
+    def id(self) -> int:
+        return self.observation_id
+
+    @property
+    def source_message_ids(self) -> list[int]:
+        return list(self.source_ids)
+
+
+@dataclass(frozen=True)
+class ObservationHistoryRecord:
+    """Immutable snapshot taken before an observation lifecycle change."""
+
+    history_id: int
+    observation_id: int
+    snapshot: dict[str, Any]
+    reason: str
+    changed_at: float
+    superseded_by_id: Optional[int] = None
+
+    @property
+    def id(self) -> int:
+        return self.history_id
+
+
+@dataclass(frozen=True)
 class CandidateRecord:
     """One proposed memory awaiting confirmation.
 
@@ -183,6 +243,9 @@ class EntityRecord:
     status: str = "candidate"
     merged_into_entity_id: Optional[int] = None
     merged_at: Optional[float] = None
+    source_episode_ids: list[str] = field(default_factory=list)
+    valid_from: Optional[float] = None
+    valid_until: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +287,7 @@ class RelationshipRecord:
     status: str = "candidate"
     supersedes_id: Optional[int] = None
     superseded_at: Optional[float] = None
+    source_episode_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

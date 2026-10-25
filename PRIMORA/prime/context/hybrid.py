@@ -77,9 +77,14 @@ def gate_state(state, at_time: float, temporal: str) -> tuple[bool, str]:
     return True, "pass"
 
 
-def gate_entity(entity, temporal: str) -> tuple[bool, str]:
+def gate_entity(entity, temporal: str, at_time: Optional[float] = None) -> tuple[bool, str]:
     if entity.authority != "user":
         return False, "authority"
+    if at_time is not None and entity.valid_from is not None and not (
+        entity.valid_from <= at_time
+        and (entity.valid_until is None or at_time < entity.valid_until)
+    ):
+        return False, "outside_validity"
     if temporal == "current":
         if entity.status != "active":
             return False, "not_active"
@@ -129,7 +134,7 @@ def semantic_channel(
             if record is None or record.scope != row["scope"]:
                 record, ok, reason = None, False, "missing"
             else:
-                ok, reason = gate_entity(record, temporal)
+                ok, reason = gate_entity(record, temporal, at_time)
         if not ok:
             diagnostics.append(
                 f"semantic_gated: {kind}:{ref_id} reason={reason}"
@@ -255,7 +260,7 @@ def structural_channel(
             ):
                 if related.entity.entity_id == entity.entity_id:
                     continue
-                ok, reason = gate_entity(related.entity, temporal)
+                ok, reason = gate_entity(related.entity, temporal, at_time)
                 if not ok:
                     diagnostics.append(
                         f"structural_gated: entity:"

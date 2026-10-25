@@ -25,6 +25,8 @@ from .models import (
     EntityRecord,
     ExperienceEvent,
     RelationshipRecord,
+    ObservationRecord,
+    ObservationHistoryRecord,
     SessionRecord,
     StateRecord,
     StoredMessage,
@@ -158,7 +160,10 @@ CREATE TABLE IF NOT EXISTS entities (
     confidence REAL NOT NULL DEFAULT 0.3,
     created_at REAL NOT NULL,
     observed_at REAL,
-    merged_at REAL
+    merged_at REAL,
+    source_episode_ids TEXT NOT NULL DEFAULT '',
+    valid_from REAL,
+    valid_until REAL
 );
 CREATE INDEX IF NOT EXISTS idx_entities_scope_name_status
     ON entities(scope, normalized_name, status);
@@ -198,6 +203,7 @@ CREATE TABLE IF NOT EXISTS relationships (
     object_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'candidate',
     source_ids TEXT NOT NULL,
+    source_episode_ids TEXT NOT NULL DEFAULT '',
     authority TEXT NOT NULL DEFAULT 'user',
     confidence REAL NOT NULL DEFAULT 0.3,
     created_at REAL NOT NULL,
@@ -216,6 +222,64 @@ CREATE INDEX IF NOT EXISTS idx_relationships_object
     ON relationships(scope, object_kind, object_id, status);
 CREATE INDEX IF NOT EXISTS idx_relationships_supersedes
     ON relationships(supersedes_id);
+CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    concept TEXT NOT NULL,
+    normalized_concept TEXT NOT NULL,
+    value TEXT NOT NULL,
+    observation_type TEXT NOT NULL DEFAULT 'observation',
+    actor TEXT NOT NULL DEFAULT 'user',
+    subject TEXT NOT NULL DEFAULT '',
+    predicate TEXT NOT NULL DEFAULT '',
+    authority TEXT NOT NULL DEFAULT 'user',
+    status TEXT NOT NULL DEFAULT 'current',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at REAL NOT NULL,
+    observed_at REAL,
+    occurred_from REAL,
+    occurred_until REAL,
+    valid_from REAL,
+    valid_until REAL,
+    supersedes_id INTEGER,
+    superseded_at REAL,
+    FOREIGN KEY (supersedes_id) REFERENCES observations(id)
+);
+CREATE INDEX IF NOT EXISTS idx_observations_scope_status
+    ON observations(scope, status);
+CREATE INDEX IF NOT EXISTS idx_observations_normalized_concept
+    ON observations(normalized_concept);
+CREATE INDEX IF NOT EXISTS idx_observations_valid_interval
+    ON observations(scope, valid_from, valid_until);
+CREATE TABLE IF NOT EXISTS observation_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL,
+    source_message_id INTEGER,
+    source_episode_id TEXT,
+    source_quote TEXT NOT NULL DEFAULT '',
+    source_role TEXT NOT NULL DEFAULT 'user',
+    linked_at REAL NOT NULL,
+    FOREIGN KEY (observation_id) REFERENCES observations(id),
+    FOREIGN KEY (source_message_id) REFERENCES messages(id),
+    UNIQUE(observation_id, source_message_id, source_episode_id, source_quote)
+);
+CREATE INDEX IF NOT EXISTS idx_observation_sources_observation
+    ON observation_sources(observation_id);
+CREATE INDEX IF NOT EXISTS idx_observation_sources_message
+    ON observation_sources(source_message_id);
+CREATE TABLE IF NOT EXISTS observation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    changed_at REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (observation_id) REFERENCES observations(id),
+    FOREIGN KEY (superseded_by_id) REFERENCES observations(id)
+);
+CREATE INDEX IF NOT EXISTS idx_observation_history_observation
+    ON observation_history(observation_id, changed_at, id);
 CREATE TABLE IF NOT EXISTS retrieval_vectors (
     vector_id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
@@ -278,6 +342,7 @@ class ContextStore:
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(str(self._db_path), timeout=30.0)
+        con.execute("PRAGMA foreign_keys=ON;")
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("PRAGMA synchronous=NORMAL;")
         return con
@@ -309,6 +374,26 @@ class ContextStore:
             ):
                 if column not in state_cols:
                     con.execute(f"ALTER TABLE states ADD COLUMN {column} REAL")
+            relationship_cols = {
+                r[1] for r in con.execute(
+                    "PRAGMA table_info(relationships)"
+                ).fetchall()
+            }
+            if "source_episode_ids" not in relationship_cols:
+                con.execute(
+                    "ALTER TABLE relationships ADD COLUMN source_episode_ids"
+                    " TEXT NOT NULL DEFAULT ''"
+                )
+            entity_cols = {
+                r[1] for r in con.execute("PRAGMA table_info(entities)").fetchall()
+            }
+            for column, definition in (
+                ("source_episode_ids", "TEXT NOT NULL DEFAULT ''"),
+                ("valid_from", "REAL"),
+                ("valid_until", "REAL"),
+            ):
+                if column not in entity_cols:
+                    con.execute(f"ALTER TABLE entities ADD COLUMN {column} {definition}")
             con.execute(
                 "UPDATE states SET observed_at = COALESCE(observed_at, created_at),"
                 " valid_from = COALESCE(valid_from, created_at)"
@@ -1248,6 +1333,234 @@ class ContextStore:
                 (status, state_id),
             )
 
+    # ------------------------------------------------------------------
+    # Evidence-backed observations (additive V2 surface)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _observation_normalize(value: str) -> str:
+        return " ".join(str(value).strip().casefold().split())
+
+    def _observation_row_to_record(self, row) -> ObservationRecord:
+        return ObservationRecord(
+            observation_id=int(row[0]), session_id=row[1], scope=row[2],
+            concept=row[3], normalized_concept=row[4], value=row[5],
+            observation_type=row[6], actor=row[7], subject=row[8],
+            predicate=row[9], authority=row[10], status=row[11],
+            confidence=float(row[12]), created_at=row[13], observed_at=row[14],
+            occurred_from=row[15], occurred_until=row[16], valid_from=row[17],
+            valid_until=row[18], supersedes_id=row[19], superseded_at=row[20],
+            source_ids=[int(v) for v in (row[21] or "").split(",") if v],
+            source_episode_ids=[v for v in (row[22] or "").split(",") if v],
+            proof_count=int(row[23] or 0),
+        )
+
+    def _observation_select(self) -> str:
+        return (
+            "SELECT o.id, o.session_id, o.scope, o.concept,"
+            " o.normalized_concept, o.value, o.observation_type, o.actor,"
+            " o.subject, o.predicate, o.authority, o.status, o.confidence,"
+            " o.created_at, o.observed_at, o.occurred_from, o.occurred_until,"
+            " o.valid_from, o.valid_until, o.supersedes_id, o.superseded_at,"
+            " COALESCE((SELECT group_concat(DISTINCT source_message_id)"
+            "   FROM observation_sources s WHERE s.observation_id=o.id"
+            "     AND s.source_message_id IS NOT NULL), ''),"
+            " COALESCE((SELECT group_concat(DISTINCT source_episode_id)"
+            "   FROM observation_sources s WHERE s.observation_id=o.id"
+            "     AND s.source_episode_id IS NOT NULL), ''),"
+            " (SELECT count(*) FROM observation_sources s"
+            "   WHERE s.observation_id=o.id)"
+            " FROM observations o"
+        )
+
+    def create_observation(
+        self,
+        session_id: str,
+        scope: str,
+        concept: str,
+        value: str,
+        source_ids: list[int],
+        *,
+        source_quotes: Optional[dict[int, str]] = None,
+        source_episode_ids: Optional[list[str]] = None,
+        observation_type: str = "observation",
+        actor: str = "user",
+        subject: str = "",
+        predicate: str = "",
+        authority: str = "user",
+        status: str = "current",
+        confidence: float = 1.0,
+        timestamp: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        occurred_from: Optional[float] = None,
+        occurred_until: Optional[float] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        supersedes_id: Optional[int] = None,
+    ) -> int:
+        """Insert an observation and its deduplicated evidence links.
+
+        This low-level store method performs no model interpretation.  The
+        observation service validates authority and source ownership before
+        calling it; the checks here make direct callers fail closed too.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be non-empty")
+        if scope != "global" and scope != session_id:
+            raise ValueError("observation scope must be global or session_id")
+        if authority != "user" and status == "current":
+            raise ValueError("only user observations may be current")
+        if status not in ("current", "superseded", "unresolved", "candidate", "rejected"):
+            raise ValueError("invalid observation status")
+        if not str(concept).strip() or not str(value).strip():
+            raise ValueError("observation concept and value are required")
+        ids = list(dict.fromkeys(int(v) for v in source_ids))
+        episodes = list(dict.fromkeys(str(v).strip() for v in (source_episode_ids or []) if str(v).strip()))
+        if not ids and not episodes:
+            raise ValueError("observation requires source provenance")
+        created = self._normalize_timestamp(timestamp, "created_at") if timestamp is not None else time.time()
+        normalized_from = self._normalize_timestamp(valid_from, "valid_from") if valid_from is not None else None
+        normalized_until = self._normalize_timestamp(valid_until, "valid_until") if valid_until is not None else None
+        occurred_start = self._normalize_timestamp(occurred_from, "occurred_from") if occurred_from is not None else None
+        occurred_end = self._normalize_timestamp(occurred_until, "occurred_until") if occurred_until is not None else None
+        self._validate_interval(normalized_from, normalized_until)
+        self._validate_interval(occurred_start, occurred_end)
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            for source_id in ids:
+                row = con.execute(
+                    "SELECT session_id, role, timestamp FROM messages WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                if row is None or row[1] != "user":
+                    raise ValueError("observation sources must be user messages")
+                if scope != "global" and row[0] != scope:
+                    raise ValueError("observation source crosses scope")
+            observed = self._resolve_observed_at(con, ids, created, observed_at)
+            effective_from = normalized_from if normalized_from is not None else observed
+            self._validate_interval(effective_from, normalized_until)
+            cur = con.execute(
+                "INSERT INTO observations"
+                "(session_id, scope, concept, normalized_concept, value,"
+                " observation_type, actor, subject, predicate, authority,"
+                " status, confidence, created_at, observed_at, occurred_from,"
+                " occurred_until, valid_from, valid_until, supersedes_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, scope, concept.strip(), self._observation_normalize(concept),
+                 value.strip(), observation_type, actor, subject, predicate,
+                 authority, status, float(confidence), created, observed,
+                 occurred_start, occurred_end, effective_from, normalized_until,
+                 supersedes_id),
+            )
+            observation_id = int(cur.lastrowid)
+            for source_id in ids:
+                con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at) VALUES (?, ?, NULL, ?, 'user', ?)",
+                    (observation_id, source_id,
+                     (source_quotes or {}).get(source_id, "")[:1000], created),
+                )
+            for episode_id in episodes:
+                con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at) VALUES (?, NULL, ?, '', 'user', ?)",
+                    (observation_id, episode_id, created),
+                )
+            return observation_id
+
+    def fetch_observations(
+        self, *, session_id: Optional[str] = None, scope: Optional[str] = None,
+        concept: Optional[str] = None, status: Optional[str] = None,
+        normalized_concept: Optional[str] = None, at_time: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> list[ObservationRecord]:
+        query = self._observation_select() + " WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (("o.session_id", session_id), ("o.scope", scope),
+                              ("o.concept", concept), ("o.status", status),
+                              ("o.normalized_concept", normalized_concept)):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
+        if at_time is not None:
+            stamp = self._normalize_timestamp(at_time, "at_time")
+            query += " AND o.valid_from <= ? AND (o.valid_until IS NULL OR ? < o.valid_until)"
+            params.extend([stamp, stamp])
+        query += " ORDER BY o.id ASC"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connect() as con:
+            rows = con.execute(query, params).fetchall()
+        return [self._observation_row_to_record(row) for row in rows]
+
+    def fetch_observation_history(self, observation_id: int) -> list[ObservationHistoryRecord]:
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id, observation_id, snapshot_json, reason, changed_at,"
+                " superseded_by_id FROM observation_history"
+                " WHERE observation_id = ? ORDER BY id ASC", (int(observation_id),)
+            ).fetchall()
+        return [ObservationHistoryRecord(
+            history_id=int(row[0]), observation_id=int(row[1]),
+            snapshot=json.loads(row[2]), reason=row[3], changed_at=row[4],
+            superseded_by_id=row[5]) for row in rows]
+
+    def fetch_observation_sources(self, observation_id: int) -> list[dict[str, Any]]:
+        """Return the immutable evidence links used to derive proof_count."""
+        with self._connect() as con:
+            rows = con.execute(
+                "SELECT id, observation_id, source_message_id, source_episode_id,"
+                " source_quote, source_role, linked_at FROM observation_sources"
+                " WHERE observation_id = ? ORDER BY id ASC", (int(observation_id),)
+            ).fetchall()
+        return [{"id": row[0], "observation_id": row[1],
+                 "source_message_id": row[2], "source_episode_id": row[3],
+                 "source_quote": row[4], "source_role": row[5],
+                 "linked_at": row[6]} for row in rows]
+
+    def supersede_observation(
+        self, observation_id: int, *, reason: str = "superseded",
+        replacement_id: Optional[int] = None, transition_time: Optional[float] = None,
+        valid_until: Optional[float] = None,
+    ) -> ObservationRecord:
+        transition = self._normalize_timestamp(transition_time, "transition_time") if transition_time is not None else time.time()
+        end = self._normalize_timestamp(valid_until, "valid_until") if valid_until is not None else transition
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(self._observation_select() + " WHERE o.id = ?", (int(observation_id),)).fetchone()
+            if row is None:
+                raise ValueError("observation not found")
+            current = self._observation_row_to_record(row)
+            if current.status != "current":
+                raise ValueError("only current observations may be superseded")
+            snapshot = {"observation_id": current.observation_id, "session_id": current.session_id,
+                        "scope": current.scope, "concept": current.concept,
+                        "normalized_concept": current.normalized_concept, "value": current.value,
+                        "observation_type": current.observation_type, "actor": current.actor,
+                        "subject": current.subject, "predicate": current.predicate,
+                        "source_ids": current.source_ids, "source_episode_ids": current.source_episode_ids,
+                        "authority": current.authority, "status": current.status,
+                        "confidence": current.confidence, "created_at": current.created_at,
+                        "observed_at": current.observed_at, "occurred_from": current.occurred_from,
+                        "occurred_until": current.occurred_until, "valid_from": current.valid_from,
+                        "valid_until": current.valid_until, "supersedes_id": current.supersedes_id,
+                        "superseded_at": current.superseded_at, "proof_count": current.proof_count}
+            con.execute(
+                "INSERT INTO observation_history(observation_id, snapshot_json, reason, changed_at, superseded_by_id)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (current.observation_id, json.dumps(snapshot, ensure_ascii=False), reason, transition, replacement_id),
+            )
+            con.execute(
+                "UPDATE observations SET status='superseded', valid_until=?, superseded_at=?"
+                " WHERE id=? AND status='current'", (end, transition, current.observation_id),
+            )
+            updated = con.execute(self._observation_select() + " WHERE o.id = ?", (current.observation_id,)).fetchone()
+        return self._observation_row_to_record(updated)
+
     def _state_rows_to_records(self, rows) -> list[StateRecord]:
         out = []
         for r in rows:
@@ -1446,6 +1759,8 @@ class ContextStore:
             source_ids=[int(value) for value in row[8].split(",") if value],
             authority=row[9], confidence=row[10], created_at=row[11],
             observed_at=row[12], merged_at=row[13],
+            source_episode_ids=[value for value in (row[14] or "").split(",") if value],
+            valid_from=row[15], valid_until=row[16],
         )
 
     def _entity_rows_to_records(self, rows) -> list[EntityRecord]:
@@ -1455,7 +1770,8 @@ class ContextStore:
         return (
             "SELECT id, session_id, scope, entity_type, display_name,"
             " normalized_name, status, merged_into_entity_id, source_ids,"
-            " authority, confidence, created_at, observed_at, merged_at"
+            " authority, confidence, created_at, observed_at, merged_at,"
+            " source_episode_ids, valid_from, valid_until"
             " FROM entities"
         )
 
@@ -1475,6 +1791,7 @@ class ContextStore:
         normalized_name: Optional[str] = None,
         entity_ids: Optional[list[int]] = None,
         limit: Optional[int] = None,
+        at_time: Optional[float] = None,
     ) -> list[EntityRecord]:
         if entity_ids is not None and not entity_ids:
             return []
@@ -1498,6 +1815,11 @@ class ContextStore:
         if entity_ids is not None:
             query += " AND id IN (%s)" % ",".join("?" for _ in entity_ids)
             params.extend(int(value) for value in entity_ids)
+        if at_time is not None:
+            evaluation_time = self._normalize_timestamp(at_time, "at_time")
+            query += " AND (valid_from IS NULL OR valid_from <= ?)"
+            query += " AND (valid_until IS NULL OR ? < valid_until)"
+            params.extend([evaluation_time, evaluation_time])
         query += " ORDER BY id ASC"
         if limit is not None:
             if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
@@ -1523,6 +1845,9 @@ class ContextStore:
         observed_at: Optional[float] = None,
         merged_into_entity_id: Optional[int] = None,
         merged_at: Optional[float] = None,
+        source_episode_ids: Optional[list[str]] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
     ) -> int:
         if entity_type not in ENTITY_TYPES:
             raise ValueError(f"unknown entity_type={entity_type!r}")
@@ -1552,6 +1877,15 @@ class ContextStore:
             self._normalize_timestamp(merged_at, "merged_at")
             if merged_at is not None else None
         )
+        normalized_from = (
+            self._normalize_timestamp(valid_from, "valid_from")
+            if valid_from is not None else None
+        )
+        normalized_until = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else None
+        )
+        self._validate_interval(normalized_from, normalized_until)
         with self._connect() as con:
             observed = self._resolve_observed_at(
                 con, sources, created_at, observed_at
@@ -1560,13 +1894,16 @@ class ContextStore:
                 "INSERT INTO entities"
                 "(session_id, scope, entity_type, display_name,"
                 " normalized_name, status, merged_into_entity_id, source_ids,"
-                " authority, confidence, created_at, observed_at, merged_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " authority, confidence, created_at, observed_at, merged_at,"
+                " source_episode_ids, valid_from, valid_until)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id, scope, entity_type, display_name.strip(),
                     normalized_name, status, merged_into_entity_id,
                     ",".join(str(value) for value in sources), authority,
                     confidence, created_at, observed, normalized_merged_at,
+                    ",".join(str(value) for value in (source_episode_ids or [])),
+                    normalized_from, normalized_until,
                 ),
             )
             return int(cur.lastrowid)
@@ -1894,6 +2231,7 @@ class ContextStore:
             authority=row[10], confidence=row[11], created_at=row[12],
             observed_at=row[13], valid_from=row[14], valid_until=row[15],
             supersedes_id=row[16], superseded_at=row[17],
+            source_episode_ids=[value for value in (row[18] or "").split(",") if value],
         )
 
     def _relationship_select(self) -> str:
@@ -1901,7 +2239,8 @@ class ContextStore:
             "SELECT id, session_id, scope, relationship_type, subject_kind,"
             " subject_id, object_kind, object_id, status, source_ids,"
             " authority, confidence, created_at, observed_at, valid_from,"
-            " valid_until, supersedes_id, superseded_at FROM relationships"
+            " valid_until, supersedes_id, superseded_at, source_episode_ids"
+            " FROM relationships"
         )
 
     def _relationship_endpoint(
@@ -1978,18 +2317,22 @@ class ContextStore:
         valid_until: Optional[float],
         supersedes_id: Optional[int],
         superseded_at: Optional[float],
+        source_episode_ids: Optional[list[str]] = None,
     ) -> int:
         cur = con.execute(
             "INSERT INTO relationships"
             "(session_id, scope, relationship_type, subject_kind, subject_id,"
-            " object_kind, object_id, status, source_ids, authority, confidence,"
+            " object_kind, object_id, status, source_ids, source_episode_ids,"
+            " authority, confidence,"
             " created_at, observed_at, valid_from, valid_until, supersedes_id,"
             " superseded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            " ?, ?, ?)",
+            " ?, ?, ?, ?)",
             (
                 session_id, scope, relationship_type, subject_kind,
                 subject_id, object_kind, object_id, status,
-                ",".join(str(value) for value in source_ids), authority,
+                ",".join(str(value) for value in source_ids),
+                ",".join(str(value) for value in (source_episode_ids or [])),
+                authority,
                 confidence, created_at, observed_at, valid_from, valid_until,
                 supersedes_id, superseded_at,
             ),
@@ -2066,6 +2409,7 @@ class ContextStore:
         observed_at: Optional[float] = None,
         valid_from: Optional[float] = None,
         valid_until: Optional[float] = None,
+        source_episode_ids: Optional[list[str]] = None,
     ) -> int:
         if status not in ("candidate", "unresolved"):
             raise ValueError("relationships must be created as candidate or unresolved")
@@ -2104,7 +2448,7 @@ class ContextStore:
                 con, session_id, scope, relationship_type, subject_kind,
                 subject_id, object_kind, object_id, sources, status,
                 authority, confidence, created_at, observed, effective_from,
-                normalized_until, None, None,
+                normalized_until, None, None, source_episode_ids,
             )
 
     def confirm_relationship(

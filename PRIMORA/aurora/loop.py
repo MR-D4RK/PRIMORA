@@ -658,7 +658,8 @@ class CognitiveLoop:
             else:
                 try:
                     evidence = self._mind.memory_query_evidence(
-                        plan.as_dict(), session_id=session_id)
+                        {**plan.as_dict(), "query": user_text},
+                        session_id=session_id)
                 except Exception:
                     response = BrainResult.success(
                         "I couldn't safely retrieve verified memory evidence "

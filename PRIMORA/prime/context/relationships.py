@@ -62,6 +62,7 @@ def create_candidate(
     observed_at: Optional[float] = None,
     valid_from: Optional[float] = None,
     valid_until: Optional[float] = None,
+    source_episode_ids: Optional[list[str]] = None,
 ) -> tuple[int, list[str]]:
     if relationship_type not in RELATIONSHIP_TYPES:
         raise ValueError(f"unknown relationship_type={relationship_type!r}")
@@ -89,6 +90,7 @@ def create_candidate(
         observed_at=observed_at,
         valid_from=valid_from,
         valid_until=valid_until,
+        source_episode_ids=source_episode_ids,
     )
     return relationship_id, [
         f"relationship_candidate_created: {relationship_type}"
