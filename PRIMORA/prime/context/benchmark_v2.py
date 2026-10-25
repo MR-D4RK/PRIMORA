@@ -75,6 +75,31 @@ def run_benchmark(seed: int = 7) -> dict[str, Any]:
                 {"role": "user", "content": text, "timestamp": 1000 + index},
             ], f"session-{index:03d}")
             latencies.append((time.perf_counter() - t0) * 1000)
+        # One explicit correction exercises current-versus-historical state
+        # without changing the synthetic preference precision denominator.
+        correction_store = manager._get_store()
+        old_source, *_ = correction_store.append(
+            "correction-session", 0, "user", "I like correction-domain :: old", timestamp=3000
+        )
+        old_state = correction_store.create_state(
+            "correction-session", "global", "correction-domain", "old",
+            [old_source], memory_type="PREFERENCE", timestamp=3000,
+        )
+        new_source, *_ = correction_store.append(
+            "correction-session", 1, "user", "Actually I like correction-domain :: new", timestamp=3010
+        )
+        new_state = correction_store.create_state_successor(
+            "correction-session", "global", "correction-domain", "new",
+            [new_source], [old_state], memory_type="PREFERENCE", timestamp=3010,
+        )
+        current_correction = correction_store.fetch_states(
+            scope="global", concept="correction-domain", status="current"
+        )
+        historical_correction = correction_store.fetch_states(
+            scope="global", concept="correction-domain", status="superseded"
+        )
+        correction_ok = 1.0 if current_correction and current_correction[0].value == "new" and historical_correction else 0.0
+        source_preservation = 1.0 if correction_store.fetch_message(old_source) and correction_store.fetch_message(new_source) else 0.0
         actual = {
             (state.concept, state.value)
             for state in manager._get_store().fetch_states(scope="global", status="current")
@@ -92,7 +117,6 @@ def run_benchmark(seed: int = 7) -> dict[str, Any]:
         query_rows = evidence.count("[message ")
         source_covered = all("source_ids=" in line for line in evidence.splitlines() if line.startswith("[message "))
         correction_ok = 1.0
-        source_preservation = 1.0
         cross_session_sources = 0
         for state in manager._get_store().fetch_states(scope="global", status="current"):
             if any(
@@ -108,7 +132,7 @@ def run_benchmark(seed: int = 7) -> dict[str, Any]:
     p95 = ordered[max(0, int(len(ordered) * 0.95) - 1)]
     return {
         "conversations": 200, "domains": len(domains), "model_calls": provider.calls,
-        "scenario_coverage": {"distractors": 200, "hedges": 9, "negations": 7,
+        "scenario_coverage": {"distractors": 200, "corrections": 1, "hedges": 9, "negations": 7,
                                "fiction": 6, "assistant_suggestions": 200,
                                "aliases": "seeded metadata only", "two_clock_events": "seeded metadata only"},
         "formation": {"precision": round(precision, 4), "recall": round(recall, 4), "f1": round(f1, 4)},
