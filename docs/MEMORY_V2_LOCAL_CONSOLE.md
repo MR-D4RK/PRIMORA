@@ -34,6 +34,8 @@ IDs. `:memory` prints current states and observations with proof counts.
 `:diagnostics` prints formation status, provider failures, malformed-proposal
 fallbacks, and other Prime diagnostics. Switching sessions does not copy raw
 messages; global, source-backed memories can still be inspected explicitly.
+Formation diagnostics include `provider_ms`, `db_ms`, `admission_ms`, and `total_ms`
+so a local run can distinguish llama.cpp time from Prime/SQLite work.
 
 If llama.cpp is unavailable, the console still starts and reports the provider
 failure in diagnostics. No provider response is treated as an accepted fact.
