@@ -104,6 +104,11 @@ _ACTIVITY_LIST = re.compile(
     rf"^what (?:have|did) i (?P<action>{_ACTIVITY_VERB})"
     r"(?:\s+(?:recently|lately|in the last \d+ days?))?\s*[?!.]*$", re.I,
 )
+_COMPLETION_LIST = re.compile(
+    r"^what (?:have|did) i (?P<action>finished|completed)"
+    r"(?:\s+(?:recently|lately|in the last \d+ days?))?\s*[?!.]*$",
+    re.I,
+)
 _EVENT_DATE_FOLLOWUP = re.compile(
     r"^when did i tell you about (?:it|that)(?:\s*[?!.]*)$", re.I,
 )
@@ -167,6 +172,14 @@ def parse_episode_question(
         return EpisodeQuery((), all_experiences=True,
                             action=matched_list.group("action").casefold(),
                             since=since)
+
+    matched_completion = _COMPLETION_LIST.fullmatch(q)
+    if matched_completion:
+        last = re.search(r"\blast (\d+) days?\b", q, re.I)
+        since = time.time() - int(last.group(1)) * 86400 if last else None
+        return EpisodeQuery(
+            (), all_experiences=True, event_kind="completion", since=since
+        )
 
     if _EVENT_DATE_FOLLOWUP.fullmatch(q):
         prior = parse_episode_question(context[-1]) if context else None

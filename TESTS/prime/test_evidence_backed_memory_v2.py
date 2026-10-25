@@ -318,6 +318,41 @@ def test_episode_question_matches_only_requested_activity_and_two_clocks(tmp_pat
     assert "reported 2025-01-02 04:30 UTC" in answer
 
 
+def test_relative_dates_before_and_after_activity_and_unknown_are_preserved():
+    reported = datetime(2025, 1, 2, 4, 30, tzinfo=timezone.utc).timestamp()
+    before = extract_experience_claim(
+        "Yesterday I visited an art gallery", reported_at=reported
+    )
+    after = extract_experience_claim(
+        "I visited an art gallery yesterday", reported_at=reported
+    )
+    unknown = extract_experience_claim(
+        "I visited an art gallery", reported_at=reported
+    )
+    assert before is not None and after is not None
+    assert before.occurred_at == after.occurred_at
+    assert before.occurred_precision == after.occurred_precision == "day"
+    assert unknown is not None
+    assert unknown.occurred_at is None and unknown.occurred_precision == "unknown"
+
+
+def test_completion_inventory_is_filtered_and_cross_session(tmp_path):
+    manager = ContextManager(db_path=tmp_path / "completion-query.db", hybrid_retrieval=False)
+    manager.reconcile([{
+        "role": "user", "content": "I finished the ceramic lantern",
+        "timestamp": 1700000000,
+    }], "older-session")
+    manager.reconcile([{
+        "role": "user", "content": "I watched an unrelated film",
+        "timestamp": 1700000100,
+    }], "current-session")
+    answer = manager.verified_episode_history("What have I finished?")
+    assert answer is not None
+    assert "ceramic lantern" in answer
+    assert "unrelated film" not in answer
+    assert "source message" in answer
+
+
 def test_qwen_activity_classification_uses_valid_first_person_source(tmp_path):
     provider = FakeProvider(json.dumps({"candidates": [{
         "kind": "event", "concept": "gallery visit", "value": "visited",

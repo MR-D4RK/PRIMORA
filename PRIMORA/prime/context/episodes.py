@@ -51,7 +51,8 @@ _ACTION_RE = "|".join(re.escape(word) for word in sorted(_ACTIONS, key=len, reve
 _CLAIM_RE = re.compile(
     rf"^\s*(?:(?P<relative>today|yesterday|earlier today|last night|recently|just)\s*[,;:]?\s+)?"
     rf"(?P<actor>I|we)\s+(?:(?:have|had)\s+)?(?:(?:recently|just)\s+)?"
-    rf"(?P<action>{_ACTION_RE})\b(?:\s+(?P<object>.+))?$",
+    rf"(?P<action>{_ACTION_RE})\b(?:\s+(?P<object>.+?))?"
+    rf"(?:\s+(?P<relative_after>today|yesterday|earlier today|last night|recently|just))?$",
     re.IGNORECASE,
 )
 
@@ -107,7 +108,8 @@ def extract_experience_claim(
     if obj.casefold().startswith(("if ", "maybe ", "perhaps ", "not ", "never ")):
         return None
     occurred_at, occurred_precision, occurred_timezone = _resolve_relative_date(
-        match.group("relative"), reported_at, timezone_name
+        match.group("relative") or match.group("relative_after"),
+        reported_at, timezone_name
     )
     return ExperienceClaim(
         kind=_ACTIONS[match.group("action").lower()],
