@@ -17,6 +17,10 @@ _PREFERENCE_WORDS = re.compile(
     r"\b(?:like|liked|love|loved|enjoy|enjoyed|prefer|preferred|favorite|favourite|dislike|hate)\b",
     re.I,
 )
+_POSITIVE_PREFERENCE_WORDS = re.compile(
+    r"\b(?:like|liked|likes|love|loved|loves|enjoy|enjoyed|enjoys|"
+    r"prefer|preferred|prefers|favorite|favourite)\b", re.I,
+)
 _PREDICATE_WORDS = re.compile(
     r"\b(liked|loved|enjoyed|preferred|like|love|enjoy|prefer|favorite|favourite|dislike|hate)s?\b", re.I,
 )
@@ -92,6 +96,11 @@ def _predicate_match(intent: QueryIntent, text: str, concept: str, value: str) -
         return False
     if intent.predicate == "preference":
         return bool(_PREFERENCE_WORDS.search(corpus))
+    if intent.predicate in {"like", "love", "enjoy", "prefer", "favorite"}:
+        # A positive preference query is intentionally predicate-family
+        # based. "I prefer asymmetrical architecture" is the same kind of
+        # user preference as "I like blue architecture".
+        return bool(_POSITIVE_PREFERENCE_WORDS.search(corpus))
     if intent.predicate == "favorite":
         return bool(re.search(r"\bfavo(?:u)?rite\b", corpus)) or concept.casefold().startswith("favorite ")
     return bool(re.search(rf"\b{re.escape(intent.predicate)}(?:s|ed)?\b", corpus))

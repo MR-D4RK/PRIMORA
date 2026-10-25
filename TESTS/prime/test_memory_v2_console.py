@@ -48,6 +48,7 @@ def test_console_supports_sessions_evidence_and_diagnostics(tmp_path):
     joined = "\n".join(output)
     assert "database=" in joined and "console.db" in joined
     assert "Memory evidence:" in joined
+    assert "requested count: 3" in joined
     assert "source_ids=" in joined
     assert "Formation status:" in joined
     assert "History for alpha:" in joined

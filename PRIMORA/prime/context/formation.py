@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -54,6 +55,29 @@ class FormationResult:
     held_ids: list[int] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     model_calls: int = 0
+    timings_ms: dict[str, float] = field(default_factory=dict)
+
+
+class _TimingStore:
+    """Thin timing proxy for the SQLite calls made during proposal admission."""
+
+    def __init__(self, store: Any) -> None:
+        self._store = store
+        self.elapsed_ms = 0.0
+
+    def __getattr__(self, name: str):
+        target = getattr(self._store, name)
+        if not callable(target):
+            return target
+
+        def timed(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return target(*args, **kwargs)
+            finally:
+                self.elapsed_ms += (time.perf_counter() - started) * 1000
+
+        return timed
 
 
 def _string(value: Any, limit: int = MAX_TEXT) -> str:
@@ -83,7 +107,23 @@ def parse_candidates(payload: Any) -> list[TypedMemoryCandidate]:
         try:
             data = json.loads(text)
         except (TypeError, ValueError):
-            return []
+            # llama.cpp/Qwen can return a short reasoning preamble followed
+            # by the requested JSON object. Decode only an actual JSON object;
+            # field and provenance validation still happen below.
+            data = None
+            decoder = json.JSONDecoder()
+            for position, character in enumerate(text[:4000]):
+                if character != "{":
+                    continue
+                try:
+                    candidate, _ = decoder.raw_decode(text[position:])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(candidate, dict):
+                    data = candidate
+                    break
+            if data is None:
+                return []
         if isinstance(data, dict):
             data = data.get("candidates", data.get("proposals", []))
     else:
@@ -179,7 +219,14 @@ def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[li
         ],
         "session_id": session_id,
         "source_message_id": message.message_id,
-        "options": {"temperature": 0, "max_tokens": 600},
+        "options": {
+            "temperature": 0,
+            "max_tokens": 256,
+            # Qwen3 chat templates otherwise spend a local model's budget in
+            # reasoning_content before emitting the requested JSON.
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
+        "response_format": {"type": "json_object"},
     }
     try:
         result = provider.invoke("memory_formation", payload)
@@ -188,22 +235,50 @@ def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[li
     if getattr(result, "status", None) != RequestStatus.SUCCESS:
         return [], f"provider_failure:{getattr(result, 'error', 'unknown')}"
     output = getattr(result, "output", None)
-    if isinstance(output, dict) and "content" in output:
-        output = output["content"]
+    if isinstance(output, dict):
+        output = output.get("content") or output.get("reasoning_content") or output.get("reasoning")
     candidates = parse_candidates(output)
     if not candidates and output not in ({"candidates": []}, "{\"candidates\": []}"):
+        if isinstance(output, str) and _empty_candidate_object(output):
+            return [], "ok"
         return [], "malformed_json_or_empty"
     return candidates, "ok"
 
 
+def _empty_candidate_object(text: str) -> bool:
+    decoder = json.JSONDecoder()
+    for position, character in enumerate(text[:4000]):
+        if character != "{":
+            continue
+        try:
+            candidate, _ = decoder.raw_decode(text[position:])
+        except (TypeError, ValueError):
+            continue
+        if isinstance(candidate, dict) and candidate.get("candidates") == []:
+            return True
+    return False
+
+
 def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) -> FormationResult:
     """Validate and admit proposals; deterministic extraction remains separate."""
+    timed_store = _TimingStore(store)
+    store = timed_store
+    started = time.perf_counter()
+    provider_started = time.perf_counter()
     candidates, diagnostic = provider_proposals(provider, message, session_id)
+    provider_ms = (time.perf_counter() - provider_started) * 1000
+    timings = {"provider_ms": provider_ms}
     if diagnostic != "ok":
-        return FormationResult(diagnostics=[diagnostic], model_calls=1)
+        timings["db_ms"] = timed_store.elapsed_ms
+        timings["total_ms"] = (time.perf_counter() - started) * 1000
+        return FormationResult(
+            diagnostics=[diagnostic, _timing_diagnostic(timings)],
+            model_calls=1, timings_ms=timings,
+        )
     admitted: list[int] = []
     held: list[int] = []
     diagnostics: list[str] = []
+    processing_started = time.perf_counter()
     for candidate in candidates:
         valid, reason = validate_candidate(
             candidate, session_id=session_id, message=message,
@@ -271,6 +346,18 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             admitted.append(state_id)
         except Exception as exc:
             diagnostics.append(f"proposal_write_failed:{exc}")
+    processing_ms = (time.perf_counter() - processing_started) * 1000
+    timings["admission_ms"] = processing_ms
+    timings["db_ms"] = timed_store.elapsed_ms
+    timings["total_ms"] = (time.perf_counter() - started) * 1000
+    diagnostics.append(_timing_diagnostic(timings))
     return FormationResult(candidates=candidates, admitted_ids=admitted,
-                           held_ids=held, diagnostics=diagnostics, model_calls=1)
+                           held_ids=held, diagnostics=diagnostics, model_calls=1,
+                           timings_ms=timings)
+
+
+def _timing_diagnostic(timings: dict[str, float]) -> str:
+    return "typed_formation_timing: " + " ".join(
+        f"{key}={value:.2f}ms" for key, value in sorted(timings.items())
+    )
 

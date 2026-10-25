@@ -162,7 +162,9 @@ class MemoryV2Console:
             {
                 "sources": ["preferences", "facts", "experiences"],
                 "query": query,
-                "result_count": 30,
+                # Leave the count unset so the typed intent parser honors
+                # wording such as "last three" instead of forcing 30.
+                "result_count": None,
                 "order": "recent",
                 "temporal_scope": "current",
             },

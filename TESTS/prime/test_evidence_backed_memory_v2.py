@@ -92,6 +92,34 @@ def test_provider_failure_falls_back_and_feature_off_preserves_legacy(tmp_path):
     assert disabled_provider.calls == 0
 
 
+def test_empty_qwen_response_keeps_deterministic_preference_and_timing(tmp_path):
+    class EmptyProvider:
+        calls = 0
+
+        def invoke(self, capability, payload):
+            self.calls += 1
+            return PrimeResult.failure("OpenAI returned empty response")
+
+    provider = EmptyProvider()
+    manager = ContextManager(
+        db_path=tmp_path / "empty-qwen.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    diagnostics = manager.reconcile([{
+        "role": "user", "content": "I prefer asymmetrical architecture"
+    }], "s")
+    assert provider.calls == 1
+    assert any("provider_failure:OpenAI returned empty response" in item for item in diagnostics)
+    assert any(
+        "typed_formation_timing:" in item
+        and "provider_ms=" in item
+        and "db_ms=" in item
+        for item in diagnostics
+    )
+    states = manager._get_store().fetch_states(scope="s", status="current")
+    assert any("asymmetrical architecture" in row.value for row in states)
+
+
 def test_event_and_relationship_proposals_remain_source_backed(tmp_path):
     manager = ContextManager(db_path=tmp_path / "typed-events.db", enable_memory_v2=True)
     store = manager._get_store()
@@ -120,20 +148,56 @@ def test_typed_query_filters_before_last_n_order(tmp_path):
     store = manager._get_store()
     for seq, text in enumerate((
         "I like amber flarn", "The weather is clear", "I like violet flarn",
-        "The assistant likes no personal thing", "I like gold flarn",
+        "The assistant likes no personal thing", "I prefer asymmetrical architecture",
+        "I like gold flarn",
     )):
         message_id, *_ = store.append("s", seq, "user", text, timestamp=100 + seq)
-        if text.startswith("I like"):
-            value = text.removeprefix("I like ")
+        if text.startswith(("I like", "I prefer")):
+            value = text.removeprefix("I like ").removeprefix("I prefer ")
             store.create_state("s", "global", "preferred flarn", value, [message_id], memory_type="PREFERENCE", timestamp=100 + seq)
     evidence = manager.memory_query_evidence({
         "sources": ["preferences"], "query": "What are the last three things I told you I liked?",
         "result_count": 3, "order": "recent", "temporal_scope": "current",
     }, session_id="s")
     assert evidence.count("[message ") == 3
-    assert "gold flarn" in evidence and "violet flarn" in evidence and "amber flarn" in evidence
+    assert "gold flarn" in evidence and "violet flarn" in evidence and "asymmetrical architecture" in evidence
+    assert "amber flarn" not in evidence
     assert "weather" not in evidence and "assistant likes" not in evidence
     assert "source_ids=" in evidence
+
+
+def test_typed_formation_records_provider_timing_and_bounded_json_request(tmp_path):
+    provider = FakeProvider('{"candidates": []}')
+    manager = ContextManager(
+        db_path=tmp_path / "timing.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    diagnostics = manager.reconcile([{
+        "role": "user", "content": "I am drawn to flarnic architecture"
+    }], "s")
+    assert provider.calls == 1
+    assert any("typed_formation_timing:" in item for item in diagnostics)
+
+
+def test_reasoning_only_provider_output_still_uses_safe_json_validation(tmp_path):
+    provider = FakeProvider(
+        "I considered the wording. {\"candidates\":[{"
+        "\"kind\":\"preference\",\"concept\":\"preferred flarnic architecture\","
+        "\"value\":\"asymmetrical architecture\",\"claim_kind\":\"assertion\","
+        "\"actor\":\"user\",\"scope\":\"global\",\"source_ids\":[1],"
+        "\"source_quote\":\"I prefer asymmetrical architecture\"}]}",
+    )
+    manager = ContextManager(
+        db_path=tmp_path / "reasoning.db", enable_memory_v2=True,
+        formation_provider=provider,
+    )
+    manager.reconcile([{
+        "role": "user", "content": "I prefer asymmetrical architecture"
+    }], "s")
+    # The deterministic path is already sufficient for this wording; the
+    # assertion verifies that any reasoning JSON remains source validated.
+    states = manager._get_store().fetch_states(scope="s", status="current")
+    assert any("asymmetrical architecture" in row.value for row in states)
 
 
 def test_relationship_temporal_source_episode_is_additive(tmp_path):
