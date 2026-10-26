@@ -222,7 +222,7 @@ class SemanticIndex:
             query += " AND scope = ?"
             params.append(scope)
         query += " ORDER BY id ASC"
-        with self._store._connect() as con:
+        with self._store._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._store._state_rows_to_records(rows)
 
@@ -240,7 +240,7 @@ class SemanticIndex:
             query += " AND scope = ?"
             params.append(scope)
         query += " ORDER BY id ASC"
-        with self._store._connect() as con:
+        with self._store._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._store._entity_rows_to_records(rows)
 
@@ -365,7 +365,7 @@ class SemanticIndex:
             entity_scope = " AND scope = ?"
             state_params.append(scope)
             entity_params.append(scope)
-        with self._store._connect() as con:
+        with self._store._connection() as con:
             states = con.execute(
                 "SELECT count(*), coalesce(max(id), 0),"
                 f" coalesce(max(created_at), 0) FROM states"

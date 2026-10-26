@@ -13,6 +13,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Optional
+from contextlib import contextmanager
 
 from .entities import (
     ENTITY_AUTHORITIES,
@@ -350,8 +351,24 @@ class ContextStore:
         con.execute("PRAGMA synchronous=NORMAL;")
         return con
 
+    @contextmanager
+    def _connection(self):
+        """Yield one SQLite connection and always close it.
+
+        ``sqlite3.Connection.__exit__`` commits or rolls back a transaction,
+        but it deliberately does not close the connection.  The store opens
+        short-lived connections for every operation, so the ownership wrapper
+        must close them on both normal and exceptional exits.
+        """
+        con = self._connect()
+        try:
+            with con:
+                yield con
+        finally:
+            con.close()
+
     def _init_db(self) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.executescript(_SCHEMA)
             # Migrate pre-existing databases that lack newer columns.
             cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -422,10 +439,10 @@ class ContextStore:
             )
         # Probe FTS5 support; never claim it without verifying.
         try:
-            with self._connect() as con:
+            with self._connection() as con:
                 con.executescript(_FTS_SCHEMA)
             # Backfill any rows written before the virtual table existed.
-            with self._connect() as con:
+            with self._connection() as con:
                 con.execute(
                     "INSERT OR IGNORE INTO messages_fts(rowid, content) "
                     "SELECT id, content FROM messages "
@@ -437,7 +454,7 @@ class ContextStore:
 
     def _probe_fts(self) -> bool:
         try:
-            with self._connect() as con:
+            with self._connection() as con:
                 con.execute(
                     "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?",
                     ("probeunlikelytermxyz",),
@@ -465,7 +482,7 @@ class ContextStore:
         ts = timestamp if timestamp is not None else time.time()
         fp = fingerprint(session_id, seq, role, content)
         diagnostic: Optional[str] = None
-        with self._connect() as con:
+        with self._connection() as con:
             existing = con.execute(
                 "SELECT id, fingerprint FROM messages"
                 " WHERE session_id = ? AND seq = ?",
@@ -500,7 +517,7 @@ class ContextStore:
         if status not in ("processing", "complete", "incomplete"):
             raise ValueError("invalid formation status")
         payload = json.dumps(list(diagnostics or []), ensure_ascii=False)
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "INSERT INTO formation_status"
                 "(message_id, session_id, status, attempts, diagnostics, updated_at)"
@@ -533,7 +550,7 @@ class ContextStore:
             query += " AND status = ?"
             params.append(status)
         query += " ORDER BY message_id ASC"
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         out = []
         for row in rows:
@@ -569,7 +586,7 @@ class ContextStore:
             raise ValueError("invalid occurred_precision")
         if occurred_at is not None:
             occurred_at = self._normalize_timestamp(occurred_at, "occurred_at")
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT session_id, role, content, timestamp FROM messages WHERE id = ?",
                 (source_message_id,),
@@ -622,7 +639,7 @@ class ContextStore:
             params.append(kind)
         query += " ORDER BY e.reported_at DESC, e.id DESC LIMIT ?"
         params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [ExperienceEvent(*row) for row in reversed(rows)]
 
@@ -635,7 +652,7 @@ class ContextStore:
         from .episodes import extract_experience_claim
         if not 1 <= limit <= 10000:
             raise ValueError("invalid legacy experience scan limit")
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT m.id, m.session_id, m.content, m.timestamp "
                 "FROM messages m WHERE m.role = 'user' "
@@ -663,7 +680,7 @@ class ContextStore:
         reaction was independently resolved. No changes to memory are made.
         """
         import re
-        with self._connect() as con:
+        with self._connection() as con:
             source = con.execute(
                 "SELECT session_id FROM messages "
                 "WHERE id = ? AND role = 'user'", (source_message_id,)
@@ -684,7 +701,7 @@ class ContextStore:
         return StoredMessage(*row)
 
     def count(self, session_id: str) -> int:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT count(*) FROM messages WHERE session_id = ?",
                 (session_id,),
@@ -711,13 +728,13 @@ class ContextStore:
         if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [StoredMessage(*r) for r in rows]
 
     def fetch_message(self, message_id: int) -> Optional[StoredMessage]:
         """One stored message by id. Used by the live hybrid admission path."""
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages WHERE id = ?",
@@ -736,7 +753,7 @@ class ContextStore:
         if not message_ids:
             return []
         unique = list(dict.fromkeys(int(v) for v in message_ids))
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages"
@@ -749,7 +766,7 @@ class ContextStore:
     def fetch_latest(
         self, session_id: str, limit: int
     ) -> list[StoredMessage]:
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages"
@@ -772,7 +789,7 @@ class ContextStore:
         """
         if limit <= 0:
             return []
-        with self._connect() as con:
+        with self._connection() as con:
             marker = con.execute(
                 "SELECT id FROM messages"
                 " WHERE session_id = ? AND role = 'system' AND content = ?"
@@ -793,7 +810,7 @@ class ContextStore:
 
     def max_seq(self, session_id: str) -> int:
         """Highest stored sequence in this session, or -1 when there is none."""
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT COALESCE(MAX(seq), -1) FROM messages"
                 " WHERE session_id = ?",
@@ -854,7 +871,7 @@ class ContextStore:
                 params.append(session_id)
             sql += " ORDER BY session_id ASC, seq ASC LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(sql, params).fetchall()
         return [StoredMessage(*r) for r in rows]
 
@@ -886,7 +903,7 @@ class ContextStore:
                           .replace("_", "\\_") + "%" for term in terms)
         order = "ASC" if oldest_first else "DESC"
         params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp, "
                 "fingerprint, importance FROM messages WHERE " +
@@ -901,7 +918,7 @@ class ContextStore:
         Bound to one session and a two-hour interval. These rows are *context*,
         not proof that a later reaction referred to the earlier subject.
         """
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp, "
                 "fingerprint, importance FROM messages "
@@ -923,7 +940,7 @@ class ContextStore:
         digest_type: str,
         content: str,
     ) -> int:
-        with self._connect() as con:
+        with self._connection() as con:
             cur = con.execute(
                 "INSERT INTO digests"
                 "(session_id, source_ids, seq_start, seq_end,"
@@ -966,7 +983,7 @@ class ContextStore:
     ) -> SessionRecord:
         """Create the session row if absent; always touch activity time."""
         ts = timestamp if timestamp is not None else time.time()
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "INSERT OR IGNORE INTO sessions"
                 "(session_id, created_at, last_activity_at, title, status)"
@@ -986,7 +1003,7 @@ class ContextStore:
         return self._row_to_session(row)
 
     def get_session(self, session_id: str) -> Optional[SessionRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT session_id, created_at, last_activity_at, title,"
                 " status, previous_titles"
@@ -998,7 +1015,7 @@ class ContextStore:
         return self._row_to_session(row)
 
     def list_sessions(self) -> list[SessionRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT session_id, created_at, last_activity_at, title,"
                 " status, previous_titles"
@@ -1014,7 +1031,7 @@ class ContextStore:
         """
         import json as _json
 
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT session_id, created_at, last_activity_at, title,"
                 " status, previous_titles"
@@ -1043,7 +1060,7 @@ class ContextStore:
         return self._row_to_session(updated)
 
     def set_session_status(self, session_id: str, status: str) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "UPDATE sessions SET status = ?, last_activity_at = ?"
                 " WHERE session_id = ?",
@@ -1156,7 +1173,7 @@ class ContextStore:
             self._normalize_timestamp(superseded_at, "superseded_at")
             if superseded_at is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             observed = self._resolve_observed_at(
                 con, source_ids, created_at, observed_at
             )
@@ -1202,7 +1219,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             explained = con.execute(
                 "SELECT scope, status, authority FROM states WHERE id = ?",
@@ -1278,7 +1295,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             current_rows = con.execute(
                 "SELECT id FROM states"
@@ -1334,7 +1351,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else transition
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             for state_id in ids:
                 row = con.execute(
@@ -1356,7 +1373,7 @@ class ContextStore:
 
     def set_state_status(self, state_id: int, status: str) -> None:
         """Transition a state row (e.g. current -> superseded). Raw kept."""
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "UPDATE states SET status = ? WHERE id = ?",
                 (status, state_id),
@@ -1453,7 +1470,7 @@ class ContextStore:
         occurred_end = self._normalize_timestamp(occurred_until, "occurred_until") if occurred_until is not None else None
         self._validate_interval(normalized_from, normalized_until)
         self._validate_interval(occurred_start, occurred_end)
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             for source_id in ids:
                 row = con.execute(
@@ -1522,12 +1539,12 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [self._observation_row_to_record(row) for row in rows]
 
     def fetch_observation_history(self, observation_id: int) -> list[ObservationHistoryRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, observation_id, snapshot_json, reason, changed_at,"
                 " superseded_by_id FROM observation_history"
@@ -1540,7 +1557,7 @@ class ContextStore:
 
     def fetch_observation_sources(self, observation_id: int) -> list[dict[str, Any]]:
         """Return the immutable evidence links used to derive proof_count."""
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, observation_id, source_message_id, source_episode_id,"
                 " source_quote, source_role, linked_at FROM observation_sources"
@@ -1572,7 +1589,7 @@ class ContextStore:
         ))
         if not ids and not episodes:
             raise ValueError("observation evidence requires a source")
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT scope, status, authority FROM observations WHERE id = ?",
@@ -1624,7 +1641,7 @@ class ContextStore:
     ) -> ObservationRecord:
         transition = self._normalize_timestamp(transition_time, "transition_time") if transition_time is not None else time.time()
         end = self._normalize_timestamp(valid_until, "valid_until") if valid_until is not None else transition
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(self._observation_select() + " WHERE o.id = ?", (int(observation_id),)).fetchone()
             if row is None:
@@ -1687,7 +1704,7 @@ class ContextStore:
         """
         if isinstance(state_id, bool) or isinstance(message_id, bool):
             raise ValueError("state_id and message_id must be integers")
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT source_ids, status, authority FROM states WHERE id = ?",
@@ -1757,7 +1774,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._state_rows_to_records(rows)
 
@@ -1776,7 +1793,7 @@ class ContextStore:
         timestamp: Optional[float] = None,
         expires_at: Optional[float] = None,
     ) -> int:
-        with self._connect() as con:
+        with self._connection() as con:
             cur = con.execute(
                 "INSERT INTO candidates"
                 "(session_id, scope, source_ids, proposed_type,"
@@ -1834,12 +1851,12 @@ class ContextStore:
             query += " AND id = ?"
             params.append(candidate_id)
         query += " ORDER BY id ASC"
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._candidate_rows_to_records(rows)
 
     def set_candidate_status(self, candidate_id: int, status: str) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "UPDATE candidates SET status = ? WHERE id = ?",
                 (status, candidate_id),
@@ -1871,7 +1888,7 @@ class ContextStore:
         )
 
     def fetch_entity(self, entity_id: int) -> Optional[EntityRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 self._entity_select() + " WHERE id = ?", (entity_id,)
             ).fetchone()
@@ -1921,7 +1938,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._entity_rows_to_records(rows)
 
@@ -1981,7 +1998,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         self._validate_interval(normalized_from, normalized_until)
-        with self._connect() as con:
+        with self._connection() as con:
             observed = self._resolve_observed_at(
                 con, sources, created_at, observed_at
             )
@@ -2006,7 +2023,7 @@ class ContextStore:
     def confirm_entity(
         self, entity_id: int, confidence: float = 1.0
     ) -> Optional[EntityRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status, authority, source_ids FROM entities"
@@ -2034,7 +2051,7 @@ class ContextStore:
         return self._entity_row_to_record(updated)
 
     def archive_entity(self, entity_id: int) -> Optional[EntityRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM entities WHERE id = ?", (entity_id,)
@@ -2064,7 +2081,7 @@ class ContextStore:
         transition = self._normalize_timestamp(merged_at, "merged_at")
         if losing_entity_id == canonical_entity_id:
             raise ValueError("entity cannot be merged into itself")
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             losing = con.execute(
                 self._entity_select() + " WHERE id = ?",
@@ -2128,7 +2145,7 @@ class ContextStore:
     def fetch_entity_alias(
         self, alias_id: int
     ) -> Optional[EntityAliasRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 self._alias_select() + " WHERE id = ?", (alias_id,)
             ).fetchone()
@@ -2174,7 +2191,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [self._alias_row_to_record(row) for row in rows]
 
@@ -2217,7 +2234,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             entity = con.execute(
                 "SELECT scope, status, source_ids FROM entities"
                 " WHERE id = ?",
@@ -2268,7 +2285,7 @@ class ContextStore:
         valid_from: Optional[float] = None,
         valid_until: Optional[float] = None,
     ) -> Optional[EntityAliasRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 self._alias_select() + " WHERE id = ?", (alias_id,)
@@ -2437,7 +2454,7 @@ class ContextStore:
     def fetch_relationship(
         self, relationship_id: int
     ) -> Optional[RelationshipRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 self._relationship_select() + " WHERE id = ?",
                 (relationship_id,),
@@ -2483,7 +2500,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [self._relationship_row_to_record(row) for row in rows]
 
@@ -2529,7 +2546,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             self._validate_relationship_endpoints(
                 con, scope, relationship_type, subject_kind, subject_id,
                 object_kind, object_id, False,
@@ -2558,7 +2575,7 @@ class ContextStore:
             self._normalize_timestamp(transition_time, "transition_time")
             if transition_time is not None else time.time()
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 self._relationship_select() + " WHERE id = ?",
@@ -2652,7 +2669,7 @@ class ContextStore:
     def reject_relationship(
         self, relationship_id: int
     ) -> Optional[RelationshipRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM relationships WHERE id = ?",
@@ -2683,7 +2700,7 @@ class ContextStore:
         transition = self._normalize_timestamp(
             transition_time, "transition_time"
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM relationships WHERE id = ?",
@@ -2724,7 +2741,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else transition
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM relationships WHERE id = ?",
@@ -2774,7 +2791,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else transition
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             for state_id in ids:
                 row = con.execute(
@@ -2863,7 +2880,7 @@ class ContextStore:
             self._normalize_timestamp(timestamp, "timestamp")
             if timestamp is not None else time.time()
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "DELETE FROM retrieval_vectors"
@@ -2894,7 +2911,7 @@ class ContextStore:
             if value is not None:
                 query += f" AND {column} = ?"
                 params.append(value)
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             cur = con.execute(query, params)
             return int(cur.rowcount)
@@ -2930,7 +2947,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             return con.execute(query, params).fetchall()
 
     def count_vectors(
@@ -2944,11 +2961,11 @@ class ContextStore:
             if value is not None:
                 query += f" AND {column} = ?"
                 params.append(value)
-        with self._connect() as con:
+        with self._connection() as con:
             return int(con.execute(query, params).fetchone()[0])
 
     def set_index_meta(self, key: str, value: str) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "INSERT INTO retrieval_index_meta(key, value) VALUES (?, ?)"
@@ -2957,7 +2974,7 @@ class ContextStore:
             )
 
     def get_index_meta(self, key: str) -> Optional[str]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT value FROM retrieval_index_meta WHERE key = ?", (key,)
             ).fetchone()
@@ -2967,7 +2984,7 @@ class ContextStore:
     def fetch_digests(
         self, session_id: str, limit: int = 5
     ) -> list[dict[str, Any]]:
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, source_ids, seq_start, seq_end,"
                 " created_at, digest_type, content FROM digests"
