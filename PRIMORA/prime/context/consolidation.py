@@ -221,22 +221,9 @@ class ConsolidationService:
         )
         applied: list[int] = []
         if not dry_run:
-            service = ObservationService(self.store, enabled=True)
             for proposal in proposals:
                 try:
-                    row = service.create(session_id, ObservationProposal(
-                        proposal.concept, proposal.value, proposal.source_ids,
-                        scope=proposal.scope, observation_type="derived",
-                        actor="derived", subject=proposal.concept,
-                        predicate=proposal.predicate,
-                        source_quotes=proposal.source_quotes,
-                        source_episode_ids=proposal.source_episode_ids,
-                        occurred_from=proposal.occurred_from,
-                        occurred_until=proposal.occurred_until,
-                        valid_from=proposal.observed_at,
-                        status="candidate", confidence=proposal.confidence,
-                        authority="user",
-                    ))
+                    row = self.apply_proposal(proposal, session_id=session_id)
                     applied.append(row.observation_id)
                 except (ValueError, RuntimeError) as exc:
                     diagnostics.append(f"consolidation_skipped:{type(exc).__name__}:{exc}")
@@ -249,6 +236,26 @@ class ConsolidationService:
                 *diagnostics,
             ],
         )
+
+    def apply_proposal(self, proposal: ConsolidationProposal, *, session_id: Optional[str] = None):
+        """Apply one explicitly selected proposal through Prime admission."""
+        self._require_enabled()
+        if not isinstance(proposal, ConsolidationProposal):
+            raise TypeError("proposal must be a ConsolidationProposal")
+        service = ObservationService(self.store, enabled=True)
+        return service.create(session_id or proposal.session_id, ObservationProposal(
+            proposal.concept, proposal.value, proposal.source_ids,
+            scope=proposal.scope, observation_type="derived",
+            actor="derived", subject=proposal.concept,
+            predicate=proposal.predicate,
+            source_quotes=proposal.source_quotes,
+            source_episode_ids=proposal.source_episode_ids,
+            occurred_from=proposal.occurred_from,
+            occurred_until=proposal.occurred_until,
+            valid_from=proposal.observed_at,
+            status="candidate", confidence=proposal.confidence,
+            authority="user",
+        ))
 
     def replay(self, session_id: str, source_ids: Iterable[int], **kwargs: Any) -> ConsolidationReport:
         """Replay only explicitly named evidence; no implicit backfill occurs."""
