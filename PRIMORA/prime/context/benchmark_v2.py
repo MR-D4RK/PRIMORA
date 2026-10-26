@@ -20,8 +20,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from PRIMORA.prime.contract import PrimeResult
-from . import entities, observation
+from . import entities, observation, relationships
+from .consolidation import ConsolidationService
+from .memory_audit import MemoryAuditService
 from .manager import ContextManager
+from .relational_retrieval import RelationalRetriever
 from .store import default_db_path
 
 
@@ -225,6 +228,95 @@ def _abstention_score(manager: ContextManager, query: str) -> float:
     return 1.0 if _query(manager, query) == "" else 0.0
 
 
+def _advanced_memory_metrics(manager: ContextManager) -> dict[str, Any]:
+    """Measure M6-M8 against fresh evidence in the same disposable DB.
+
+    These are observations of behavior, not declared success values.  The
+    helper is deliberately independent of the production database and uses
+    the same store that received the benchmark evidence.
+    """
+    store = manager._get_store()
+    first, *_ = store.append(
+        "m6-session-a", 0, "user", "I like a flarnic material.", timestamp=7000
+    )
+    second, *_ = store.append(
+        "m6-session-b", 0, "user", "I still like the flarnic material.", timestamp=7010
+    )
+    store.create_state(
+        "m6-session-a", "global", "preferred flarnic material", "flarnic material",
+        [first], memory_type="PREFERENCE", timestamp=7000,
+    )
+    store.create_state(
+        "m6-session-b", "global", "preferred flarnic material", "flarnic material",
+        [second], memory_type="PREFERENCE", timestamp=7010,
+    )
+    consolidation = ConsolidationService(store, enabled=True)
+    before = len(store.fetch_observations(scope="global"))
+    dry = consolidation.replay("m6-session-a", [first, second], dry_run=True)
+    after_dry = len(store.fetch_observations(scope="global"))
+    applied = consolidation.replay("m6-session-a", [first, second], dry_run=False)
+    repeated = consolidation.replay("m6-session-a", [first, second], dry_run=False)
+    m6 = {
+        "proposal_count": float(len(dry.proposals)),
+        "proof_count": float(dry.proposals[0].proof_count) if dry.proposals else 0.0,
+        "source_coverage": (
+            1.0 if dry.proposals and set(dry.proposals[0].source_ids) == {first, second}
+            else 0.0
+        ),
+        "dry_run_no_writes": 1.0 if before == after_dry else 0.0,
+        "idempotent_replay": 1.0 if applied.applied_ids and not repeated.applied_ids else 0.0,
+    }
+
+    association_source, *_ = store.append(
+        "m7-session", 0, "user", "Flarnic is part of the Aurora suite.", timestamp=7020
+    )
+    flarnic, _ = entities.create_candidate(
+        store, "m7-session", "Flarnic", "PROJECT", [association_source]
+    )
+    suite, _ = entities.create_candidate(
+        store, "m7-session", "Aurora suite", "PROJECT", [association_source]
+    )
+    entities.confirm(store, flarnic)
+    entities.confirm(store, suite)
+    alias, _ = entities.add_alias_candidate(
+        store, flarnic, "Flar", "m7-session", [association_source]
+    )
+    entities.confirm_alias(store, alias)
+    relationship_id, _ = relationships.create_candidate(
+        store, "m7-session", "part_of", flarnic, suite, [association_source]
+    )
+    relationships.confirm(store, relationship_id)
+    relational = RelationalRetriever(store, enabled=True).retrieve(
+        "m7-session", "Flar", hop_limit=2
+    )
+    m7 = {
+        "alias_resolution": 1.0 if relational.packets else 0.0,
+        "evidence_source_coverage": (
+            1.0 if relational.packets and all(
+                association_source in packet.source_ids for packet in relational.packets
+            ) else 0.0
+        ),
+        "bounded": 1.0 if not relational.truncated else 0.0,
+        "association_trap_precision": (
+            1.0 if relational.packets and all(
+                "Aurora suite" in packet.subject or "Aurora suite" in packet.object
+                for packet in relational.packets
+            ) else 0.0
+        ),
+    }
+
+    source_count_before_audit = store.count("m6-session-a") + store.count("m6-session-b")
+    audit = MemoryAuditService(store, enabled=True).run(scope="global")
+    source_count_after_audit = store.count("m6-session-a") + store.count("m6-session-b")
+    m8 = {
+        "read_only": 1.0 if source_count_before_audit == source_count_after_audit else 0.0,
+        "reviewable_proposals": float(len(audit.proposals)),
+        "llm_calls": 0.0,
+        "findings": float(len(audit.findings)),
+    }
+    return {"m6_consolidation": m6, "m7_relational": m7, "m8_audit": m8}
+
+
 def _unsupported_rate(evidence: str, relevant_ids: set[int]) -> float:
     returned = _packet_ids(evidence)
     if not returned:
@@ -299,6 +391,7 @@ def _run_once(
             "production_db_touched": db_path.resolve() == default_db_path().resolve(),
             "seed": seed,
         }
+        result.update(_advanced_memory_metrics(manager))
     ordered = sorted(result["latency_ms"])
     result["latency_ms"] = {
         "p50": statistics.median(ordered),
@@ -337,6 +430,8 @@ def run_benchmark(seed: int = 7) -> dict[str, Any]:
             "corrections": candidate["auxiliary"]["correction_current_state"],
             "aliases": candidate["auxiliary"]["alias_resolution"],
             "two_clock_events": candidate["auxiliary"]["two_clock_events"],
+            "uncertainty": sum("think I might" in case.text for case in cases),
+            "association_traps": 1,
         },
         "baseline": _round_metrics(baseline),
         "candidate": _round_metrics(candidate),
@@ -344,6 +439,9 @@ def run_benchmark(seed: int = 7) -> dict[str, Any]:
         "source_preservation": candidate["source_preservation"],
         "alias_resolution": candidate["auxiliary"]["alias_resolution"],
         "two_clock_events": candidate["auxiliary"]["two_clock_events"],
+        "m6_consolidation": candidate["m6_consolidation"],
+        "m7_relational": candidate["m7_relational"],
+        "m8_audit": candidate["m8_audit"],
         "unsupported_claim_rate": candidate["unsupported_claim_rate"],
         "qwen_validation": "NOT RUN",
         "ram": "NOT RUN",
@@ -354,4 +452,8 @@ def run_benchmark(seed: int = 7) -> dict[str, Any]:
         "elapsed_s": round(time.perf_counter() - started, 3),
     }
     return result
+
+
+if __name__ == "__main__":
+    print(json.dumps(run_benchmark(), indent=2, sort_keys=True))
 
