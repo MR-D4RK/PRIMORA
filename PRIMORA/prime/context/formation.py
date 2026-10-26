@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,29 @@ CLAIM_KINDS = frozenset({
 ADMITTABLE_CLAIMS = frozenset({"assertion"})
 MAX_CANDIDATES = 8
 MAX_TEXT = 1000
+
+
+def _positive_int_env(name: str, default: int, maximum: int = 2048) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, maximum))
+
+
+def _temperature_env(name: str, default: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(value, 2.0))
+
+
+def _thinking_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 PREFERENCE_PREDICATES = frozenset({
     "like", "likes", "liked", "love", "loves", "loved", "prefer",
     "prefers", "preferred", "enjoy", "enjoys", "enjoyed", "favorite",
@@ -300,11 +324,17 @@ def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[li
         "session_id": session_id,
         "source_message_id": message.message_id,
         "options": {
-            "temperature": 0,
-            "max_tokens": 256,
+            "temperature": _temperature_env(
+                "PRIMORA_MEMORY_FORMATION_TEMPERATURE"
+            ),
+            "max_tokens": _positive_int_env(
+                "PRIMORA_MEMORY_FORMATION_MAX_TOKENS", 256
+            ),
             # Qwen3 chat templates otherwise spend a local model's budget in
             # reasoning_content before emitting the requested JSON.
-            "chat_template_kwargs": {"enable_thinking": False},
+            "chat_template_kwargs": {"enable_thinking": _thinking_env(
+                "PRIMORA_MEMORY_FORMATION_ENABLE_THINKING", False
+            )},
         },
         "response_format": {"type": "json_object"},
     }

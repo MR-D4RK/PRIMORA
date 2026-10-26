@@ -37,8 +37,10 @@ Nothing here writes to memory. Jev only ever returns a decision.
 from __future__ import annotations
 
 import json
+import os
+import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from PRIMORA.prime.contract import RequestStatus
@@ -84,6 +86,30 @@ CONFIDENCE = {
 # Bounds. Learning is not an essay.
 MAX_TEXT_CHARS = 2000
 MAX_CANDIDATES = 4
+
+
+def _positive_int_env(name: str, default: int, maximum: int = 2048) -> int:
+    """Read a bounded internal-generation limit without trusting the env."""
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(1, min(value, maximum))
+
+
+def _temperature_env(name: str, default: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, min(value, 2.0))
+
+
+def _thinking_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
 
 MEMORY_TYPES = ("FACT", "PREFERENCE", "DECISION", "INSTRUCTION", "RATIONALE")
 
@@ -141,18 +167,22 @@ class LearningOutcome:
     candidates: list[StructuredCandidate] = field(default_factory=list)
     reason: str = ""
     diagnostics: list[str] = field(default_factory=list)
+    timings_ms: dict[str, float] = field(default_factory=dict)
 
     @classmethod
-    def confirmed(cls, candidates, reason="", diagnostics=None):
-        return cls("confirm", list(candidates), reason, list(diagnostics or []))
+    def confirmed(cls, candidates, reason="", diagnostics=None, timings_ms=None):
+        return cls("confirm", list(candidates), reason, list(diagnostics or []),
+                   dict(timings_ms or {}))
 
     @classmethod
-    def held(cls, candidates, reason, diagnostics=None):
-        return cls("hold", list(candidates), reason, list(diagnostics or []))
+    def held(cls, candidates, reason, diagnostics=None, timings_ms=None):
+        return cls("hold", list(candidates), reason, list(diagnostics or []),
+                   dict(timings_ms or {}))
 
     @classmethod
-    def rejected(cls, reason, diagnostics=None):
-        return cls("reject", [], reason, list(diagnostics or []))
+    def rejected(cls, reason, diagnostics=None, timings_ms=None):
+        return cls("reject", [], reason, list(diagnostics or []),
+                   dict(timings_ms or {}))
 
 
 class Jev(ABC):
@@ -220,39 +250,89 @@ class ModelJev(Jev):
         self._provider = provider
 
     def evaluate(self, request: LearningRequest) -> LearningOutcome:
+        started = time.perf_counter()
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": request.text},
         ]
+        options = {
+            "temperature": _temperature_env("PRIMORA_JEV_TEMPERATURE"),
+            "max_tokens": _positive_int_env("PRIMORA_JEV_MAX_TOKENS", 256),
+            # Scoped to this strict internal JSON operation. Aurora's normal
+            # conversational generation retains its configured reasoning.
+            "chat_template_kwargs": {
+                "enable_thinking": _thinking_env(
+                    "PRIMORA_JEV_ENABLE_THINKING", False
+                )
+            },
+        }
+
+        def finish(outcome: LearningOutcome, provider_ms: float = 0.0,
+                   parse_ms: float = 0.0) -> LearningOutcome:
+            timings = dict(outcome.timings_ms)
+            timings.update({
+                "provider_ms": provider_ms,
+                "parse_ms": parse_ms,
+                "total_ms": (time.perf_counter() - started) * 1000,
+            })
+            timing_note = "jev_timing: " + " ".join(
+                f"{key}={value:.2f}ms" for key, value in sorted(timings.items())
+            )
+            return replace(
+                outcome,
+                diagnostics=[*outcome.diagnostics, timing_note],
+                timings_ms=timings,
+            )
+
+        provider_started = time.perf_counter()
         try:
-            result = self._provider.invoke("jev", {"messages": messages})
+            result = self._provider.invoke("jev", {
+                "messages": messages,
+                "options": options,
+                "response_format": {"type": "json_object"},
+            })
         except Exception as exc:
-            return LearningOutcome.rejected(f"jev_failed: {exc}")
+            return finish(
+                LearningOutcome.rejected(f"jev_failed: {exc}"),
+                (time.perf_counter() - provider_started) * 1000,
+            )
+        provider_ms = (time.perf_counter() - provider_started) * 1000
         # A provider that reports a failure never yields memory structure.
         if result is None:
-            return LearningOutcome.rejected("jev_failed: no result")
+            return finish(LearningOutcome.rejected("jev_failed: no result"), provider_ms)
         if result.status is not RequestStatus.SUCCESS:
-            return LearningOutcome.rejected(
+            return finish(LearningOutcome.rejected(
                 f"jev_failed: {getattr(result, 'error', None) or 'provider error'}"
-            )
+            ), provider_ms)
         output = getattr(result, "output", None)
-        text = output.get("content") if isinstance(output, dict) else output
+        if isinstance(output, dict):
+            text = (
+                output.get("content")
+                or output.get("reasoning_content")
+                or output.get("reasoning")
+            )
+        else:
+            text = output
         if not isinstance(text, str) or not text.strip():
-            return LearningOutcome.rejected("jev_returned_nothing")
+            return finish(LearningOutcome.rejected("jev_returned_nothing"), provider_ms)
 
+        parse_started = time.perf_counter()
         candidates, diagnostics = self._parse(
             text, CONFIDENCE.get(request.provenance, 0.3))
+        parse_ms = (time.perf_counter() - parse_started) * 1000
         if not candidates:
-            return LearningOutcome.rejected(
-                "jev_found_nothing_structurable", diagnostics)
+            return finish(LearningOutcome.rejected(
+                "jev_found_nothing_structurable", diagnostics
+            ), provider_ms, parse_ms)
         if request.provenance in HOLDS:
-            return LearningOutcome.held(
+            return finish(LearningOutcome.held(
                 candidates,
                 f"provenance={request.provenance} is never auto-admitted",
                 diagnostics,
-            )
-        return LearningOutcome.confirmed(
-            candidates, f"provenance={request.provenance}", diagnostics)
+            ), provider_ms, parse_ms)
+        return finish(LearningOutcome.confirmed(
+            candidates, f"provenance={request.provenance}", diagnostics
+        ), provider_ms, parse_ms)
 
     def _parse(
         self, text: str, confidence: float

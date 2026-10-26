@@ -46,6 +46,11 @@ $env:PRIMORA_MEMORY_V2 = "1"
 $env:PRIMORA_MEMORY_V2_FORMATION = "1"
 $env:PRIMORA_MEMORY_V2_RETRIEVAL = "1"
 $env:PRIMORA_MEMORY_V2_DB = $db
+# Internal JSON operations only; Aurora's normal response settings are unchanged.
+$env:PRIMORA_JEV_MAX_TOKENS = "256"
+$env:PRIMORA_JEV_ENABLE_THINKING = "0"
+$env:PRIMORA_MEMORY_FORMATION_MAX_TOKENS = "256"
+$env:PRIMORA_MEMORY_FORMATION_ENABLE_THINKING = "0"
 
 python -m PRIMORA.main --cli
 ```
@@ -108,3 +113,30 @@ No test uses the production database. Live Qwen latency is measured by the
 formation diagnostics (`provider_ms`, `db_ms`, `admission_ms`, and
 `total_ms`); this repository test suite uses fake providers and cannot claim
 the local model's wall-clock performance.
+
+## Internal JSON latency controls
+
+The strict internal `jev` and typed `memory_formation` calls use bounded
+generation settings. They do not change Aurora's normal response generation.
+
+| Operation | Environment variable | Default | Purpose |
+|---|---|---:|---|
+| Jev | `PRIMORA_JEV_MAX_TOKENS` | `256` | Maximum structured proposal output |
+| Jev | `PRIMORA_JEV_TEMPERATURE` | `0` | Deterministic proposal generation |
+| Jev | `PRIMORA_JEV_ENABLE_THINKING` | `0` | Qwen/llama.cpp chat-template thinking switch |
+| Typed formation | `PRIMORA_MEMORY_FORMATION_MAX_TOKENS` | `256` | Maximum typed proposal output |
+| Typed formation | `PRIMORA_MEMORY_FORMATION_TEMPERATURE` | `0` | Deterministic proposal generation |
+| Typed formation | `PRIMORA_MEMORY_FORMATION_ENABLE_THINKING` | `0` | Qwen/llama.cpp chat-template thinking switch |
+
+Values are bounded and invalid values fall back to defaults. The provider
+still performs strict JSON parsing, source quote/source ID checks, and Prime
+admission checks. If a compatible server puts JSON in `reasoning_content`,
+only these two internal capabilities may use that channel; ordinary chat still
+fails closed on an empty content channel.
+
+`Aurora.loop.last_trace.to_dict()["timings_ms"]` reports `planning_ms`,
+`response_generation_ms`, `formation_ms` (and formation sub-phases), and
+capability call timings. A `learn` result includes `timings_ms` with separate
+`jev_ms`, `jev_provider_ms`, `jev_parse_ms`, persistence, admission, and total
+latencies. Formation diagnostics retain the existing
+`typed_formation_timing` record.

@@ -282,6 +282,10 @@ class ContextManager:
         self._semantic_index = semantic_index
         self._shadow_records: list[ShadowComparison] = []
         self._retrieval_traces: list[RetrievalTrace] = []
+        # The latest typed-formation timings are consumed by the cognitive
+        # loop for per-turn diagnostics. They are observability only and never
+        # influence admission or retrieval.
+        self._last_formation_timings: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # M6 live-switch surface
@@ -340,6 +344,12 @@ class ContextManager:
     def set_formation_provider(self, provider) -> None:
         self._formation_provider = provider
 
+    def consume_formation_timings(self) -> dict[str, float]:
+        """Return and clear the latest typed-formation timing sample."""
+        timings = dict(self._last_formation_timings)
+        self._last_formation_timings.clear()
+        return timings
+
     def retrieval_traces(self) -> list[RetrievalTrace]:
         return list(self._retrieval_traces)
 
@@ -368,24 +378,33 @@ class ContextManager:
 
         Returns a summary for Aurora. Never raises for a bad request.
         """
+        started = time.perf_counter()
+        timings: dict[str, float] = {}
+
+        def finish(summary: dict[str, Any]) -> dict[str, Any]:
+            timings["total_ms"] = (time.perf_counter() - started) * 1000
+            summary["timings_ms"] = dict(timings)
+            return summary
+
         if jev is None:
-            return {"status": "rejected", "reason": "no_jev_configured"}
+            return finish({"status": "rejected", "reason": "no_jev_configured"})
 
         request_provenance = provenance
         from PRIMORA.learning.jev import LearningRequest, PROVENANCE
 
         if provenance not in PROVENANCE:
-            return {
+            return finish({
                 "status": "rejected",
                 "reason": (
                     f"unknown_provenance: {provenance!r}. "
                     f"Use one of: {', '.join(PROVENANCE)}"
                 ),
-            }
+            })
         if not isinstance(text, str) or not text.strip():
-            return {"status": "rejected", "reason": "empty_text"}
+            return finish({"status": "rejected", "reason": "empty_text"})
 
         statement = text.strip()
+        persist_started = time.perf_counter()
         try:
             store = self._get_store()
             seq = store.count(session_id) + 1
@@ -393,8 +412,11 @@ class ContextManager:
                 session_id, seq, "assistant", statement
             )
         except Exception as exc:
-            return {"status": "rejected", "reason": f"persist_failed: {exc}"}
+            timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
+            return finish({"status": "rejected", "reason": f"persist_failed: {exc}"})
+        timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
 
+        jev_started = time.perf_counter()
         try:
             outcome = jev.evaluate(
                 LearningRequest(
@@ -404,19 +426,23 @@ class ContextManager:
                 )
             )
         except Exception as exc:
-            return {
+            timings["jev_ms"] = (time.perf_counter() - jev_started) * 1000
+            return finish({
                 "status": "rejected",
                 "reason": f"jev_failed: {exc}",
                 "source_id": message_id,
-            }
+            })
+        timings["jev_ms"] = (time.perf_counter() - jev_started) * 1000
+        for key, value in getattr(outcome, "timings_ms", {}).items():
+            timings[f"jev_{key}"] = value
 
         if outcome.disposition == "reject":
-            return {
+            return finish({
                 "status": "rejected",
                 "reason": outcome.reason or "jev_rejected",
                 "diagnostics": list(outcome.diagnostics),
                 "source_id": message_id,
-            }
+            })
 
         # The provenance policy is enforced HERE, not trusted from Jev.
         # Jev is a pluggable, model-driven component and a buggy or
@@ -441,6 +467,7 @@ class ContextManager:
             list(outcome.diagnostics) + diagnostics_note
         )
 
+        admission_started = time.perf_counter()
         for candidate in outcome.candidates:
             if not candidate.is_wellformed():
                 diagnostics.append("learn_rejected: candidate not wellformed")
@@ -484,20 +511,22 @@ class ContextManager:
                 record["memory_type"] = candidate.memory_type
                 learned.append(record)
 
+        timings["admission_ms"] = (time.perf_counter() - admission_started) * 1000
+
         if learned:
             status = "learned"
         elif held:
             status = "held"
         else:
             status = "rejected"
-        return {
+        return finish({
             "status": status,
             "reason": outcome.reason,
             "learned": learned,
             "held": held,
             "diagnostics": diagnostics,
             "source_id": message_id,
-        }
+        })
 
     def recall(
         self,
@@ -2405,6 +2434,7 @@ class ContextManager:
                             store, session_id, store.fetch_message(message_id),
                             self._formation_provider,
                         )
+                        self._last_formation_timings = dict(typed.timings_ms)
                         formation_diags.extend(
                             [f"typed_formation:{item}" for item in typed.diagnostics]
                         )
@@ -2491,6 +2521,7 @@ class ContextManager:
                 typed = formation_mod.apply_proposals(
                     store, session_id, message, self._formation_provider,
                 )
+                self._last_formation_timings = dict(typed.timings_ms)
                 diagnostics.extend(
                     [f"typed_formation:{item}" for item in typed.diagnostics]
                 )

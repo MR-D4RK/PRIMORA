@@ -71,6 +71,17 @@ class OllamaProvider(Provider):
         try:
             message = response_data.get("message", {})
             content = message.get("content", "")
+            reasoning = message.get("reasoning_content") or message.get("reasoning")
+            if not content and reasoning and capability in {"memory_formation", "jev"}:
+                # Qwen/llama.cpp may place a strict internal JSON reply in a
+                # reasoning channel even when thinking was disabled. The
+                # caller still performs full JSON, provenance, and admission
+                # validation; this transport fallback never turns prose into
+                # memory.
+                return PrimeResult.success({
+                    "content": reasoning, "model": model,
+                    "reasoning_fallback": True,
+                }, metadata={"reasoning_fallback": True})
             if not content:
                 return PrimeResult.failure("Ollama returned empty response")
             return PrimeResult.success({"content": content, "model": model})
@@ -196,10 +207,11 @@ class OpenAICompatibleProvider(Provider):
             )
             if not content:
                 # Qwen/llama.cpp may spend the whole generation budget in its
-                # reasoning channel. Formation is already strict JSON-only
-                # and validates every proposal, so using that channel here is
-                # safe and preserves deterministic fallback on parse failure.
-                if capability == "memory_formation" and reasoning:
+                # reasoning channel. Both internal consumers are strict
+                # JSON-only and validate every proposal, so using that channel
+                # here is safe and preserves deterministic fallback on parse
+                # failure.
+                if capability in {"memory_formation", "jev"} and reasoning:
                     return PrimeResult.success(
                         {"content": reasoning, "model": model,
                          "reasoning_fallback": True},

@@ -308,6 +308,7 @@ class LoopTrace:
     stop_reason: str = ""
     max_cycles: int = DEFAULT_MAX_CYCLES
     total_s: float = 0.0
+    timings_ms: dict[str, float] = field(default_factory=dict)
 
     @property
     def count(self) -> int:
@@ -320,6 +321,9 @@ class LoopTrace:
             "max_cycles": self.max_cycles,
             "segment_count": self.count,
             "total_s": round(self.total_s, 3),
+            "timings_ms": {
+                key: round(value, 3) for key, value in self.timings_ms.items()
+            },
         }
 
 
@@ -344,6 +348,7 @@ class CapabilityExecutor:
         self.max_calls = int(max_calls)
         self.calls: list[tuple[str, Any]] = []
         self.evidence: list[tuple[str, Any]] = []
+        self.timings_ms: dict[str, float] = {}
         self._evidence_session: str = ""
         self.exhausted = False
 
@@ -366,6 +371,7 @@ class CapabilityExecutor:
         """
         self._used = 0
         self.exhausted = False
+        self.timings_ms = {}
         # Actions that actually ran, as opposed to those merely attempted.
         # A refused attempt is not evidence that anything happened, so the
         # loop needs the difference before it can tell Aurora that a claim of
@@ -435,7 +441,27 @@ class CapabilityExecutor:
             })
 
         self._used = self.used + 1
-        result = self._prime.handle(request)
+        operation_started = time.perf_counter()
+        try:
+            result = self._prime.handle(request)
+        finally:
+            elapsed_ms = (time.perf_counter() - operation_started) * 1000
+            self.timings_ms[f"capability_{action}_ms"] = (
+                self.timings_ms.get(f"capability_{action}_ms", 0.0) + elapsed_ms
+            )
+        # Prime capabilities may expose finer-grained timings (for example
+        # learn's Jev provider/parse/admission phases). Carry those samples to
+        # the loop trace without making the loop depend on any capability's
+        # schema.
+        nested = getattr(result, "output", None)
+        nested_timings = nested.get("timings_ms") if isinstance(nested, dict) else None
+        if isinstance(nested_timings, dict):
+            for key, value in nested_timings.items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                self.timings_ms[key] = self.timings_ms.get(key, 0.0) + number
         rendered = json.dumps(
             {
                 "status": result.status.value,
@@ -565,6 +591,11 @@ class CognitiveLoop:
         extract = self._request_extractor
         trace = LoopTrace(max_cycles=self.max_cycles)
         started = time.perf_counter()
+        trace.timings_ms.update({
+            "planning_ms": 0.0,
+            "response_generation_ms": 0.0,
+            "formation_ms": 0.0,
+        })
         self._last_trace = trace
         # The capability budget is per turn. The executor owns the counter and
         # resets itself; the loop does not track it. Guarded, because any
@@ -643,12 +674,16 @@ class CognitiveLoop:
                                for m in instructed[:-1]
                                if m.get("role") in ("user", "assistant"))
         plan = None
+        planning_started = time.perf_counter()
         if self._enable_memory_interpreter:
             try:
                 plan = memory_coordinator.interpret(
                     self._brain, user_text, prior_dialogue)
             except Exception:
                 plan = None  # Ordinary cognition if the live planner fails.
+        trace.timings_ms["planning_ms"] = (
+            time.perf_counter() - planning_started
+        ) * 1000
         if (isinstance(plan, memory_coordinator.MemoryPlan)
                 and plan.operation == "recall"):
             if plan.clarify:
@@ -785,6 +820,28 @@ class CognitiveLoop:
                     self._brain.get_model_name(),
                 )
 
+            # Formation is owned by Prime's ContextManager. Consume its
+            # latest sample once so repeated cognitive segments do not count
+            # the same provider call twice.
+            consume_formation = getattr(
+                getattr(self._mind, "mechanisms", None),
+                "consume_formation_timings", None,
+            )
+            if callable(consume_formation):
+                try:
+                    formation_timings = consume_formation()
+                except Exception:
+                    formation_timings = {}
+                if formation_timings:
+                    for key, value in formation_timings.items():
+                        if key == "total_ms":
+                            name = "formation_ms"
+                        else:
+                            name = f"formation_{key}"
+                        trace.timings_ms[name] = (
+                            trace.timings_ms.get(name, 0.0) + float(value)
+                        )
+
             built_len = len(messages)
 
             seg_started = time.perf_counter()
@@ -821,6 +878,7 @@ class CognitiveLoop:
                 latency_s=time.perf_counter() - seg_started,
             )
             trace.segments.append(segment)
+            trace.timings_ms["response_generation_ms"] += segment.latency_s * 1000
             result = generated
 
             if not generated.success:
@@ -1119,6 +1177,10 @@ class CognitiveLoop:
         else:
             trace.stop_reason = trace.stop_reason or "max_cycles"
 
+        executor_timings = getattr(self._executor, "timings_ms", {})
+        if isinstance(executor_timings, dict):
+            for key, value in executor_timings.items():
+                trace.timings_ms[key] = trace.timings_ms.get(key, 0.0) + float(value)
         trace.total_s = time.perf_counter() - started
         # The turn is over: write its closing state before returning so a
         # caller that exits right after respond() cannot lose it.
