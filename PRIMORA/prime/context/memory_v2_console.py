@@ -539,7 +539,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             if temporary is not None:
                 temporary.cleanup()
         return 0
-    except (IsolationError, ValueError) as exc:
+    # IsolationError is a RuntimeError. Catch the base class as well because
+    # the isolation module can be reloaded by long-running test/harness
+    # processes, leaving this module with an older class object.
+    except (RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
