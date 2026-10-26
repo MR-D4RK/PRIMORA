@@ -662,6 +662,10 @@ class MemoryRestoreService:
         try:
             try:
                 with target:
+                    # Serialize destination writers for the whole import. A
+                    # preflight conflict can otherwise appear between the
+                    # read-only preview and the first INSERT.
+                    target.execute("BEGIN IMMEDIATE")
                     self._import_sessions(source, target, maps, imported, already)
                     self._import_messages(source, target, maps, imported, already, conflicts)
                     self._import_events(source, target, maps, imported, already, unsupported)
