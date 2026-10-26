@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from PRIMORA.aurora.brain import Brain, BrainResult
@@ -161,7 +161,43 @@ def interpret(brain: Brain, user_text: str, previous: tuple[dict[str, str], ...]
     ], max_output_tokens=300)
     if not response.success:
         return None
-    return validate_plan(_json_object(response.content or ""))
+    plan = validate_plan(_json_object(response.content or ""))
+    if isinstance(plan, MemoryPlan) and plan.clarify:
+        # A model may conservatively ask for clarification on a clear
+        # inventory question such as "What is my favorite color?".  Keep
+        # clarification for genuinely unresolved pronouns/referents, while
+        # letting explicit noun phrases use Prime's verified evidence path.
+        if not _needs_referent_clarification(user_text, previous):
+            plan = replace(plan, clarify=False)
+    return plan
+
+
+_UNRESOLVED_REFERENT = re.compile(
+    r"\b(?:it|this|that|them|these|those|one|ones)\b", re.IGNORECASE
+)
+_VAGUE_MEMORY_TAIL = re.compile(
+    r"\b(?:about|regarding|concerning|for)\s*(?:\?|$)", re.IGNORECASE
+)
+
+
+def _needs_referent_clarification(
+    user_text: str, previous: tuple[dict[str, str], ...] = ()
+) -> bool:
+    """Keep clarification only when the latest question lacks a referent.
+
+    This is grammatical rather than domain-specific: explicit noun phrases
+    (including arbitrary user-created subjects) are safe to route to Prime;
+    unresolved pronouns and bare trailing ``about`` questions remain gated.
+    """
+    text = " ".join(str(user_text or "").split())
+    if _VAGUE_MEMORY_TAIL.search(text):
+        return True
+    if not _UNRESOLVED_REFERENT.search(text):
+        return False
+    # The planner may resolve a pronoun itself and set clarify=false. If it
+    # still requests clarification, retain that safe stop rather than guessing
+    # which prior subject the pronoun names.
+    return True
 
 
 def grounded_answer(brain: Brain, question: str, plan: MemoryPlan,

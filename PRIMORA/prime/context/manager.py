@@ -463,16 +463,68 @@ class ContextManager:
 
         learned: list[dict[str, Any]] = []
         held: list[dict[str, Any]] = []
+        already_known: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
         diagnostics: list[str] = (
             list(outcome.diagnostics) + diagnostics_note
         )
+
+        def _normalized_memory_text(value: Any) -> str:
+            return " ".join(
+                re.findall(r"[\w]+", str(value or "").casefold())
+            )
+
+        def _known_state(candidate, scope: str):
+            """Find an equivalent current user state without creating a row."""
+            scopes = [scope]
+            if scope != "global":
+                scopes.append("global")
+            concept = _normalized_memory_text(candidate.concept)
+            value = _normalized_memory_text(candidate.value)
+            for candidate_scope in scopes:
+                for state in store.fetch_states(
+                    scope=candidate_scope, status="current"
+                ):
+                    if state.authority != "user":
+                        continue
+                    if _normalized_memory_text(state.concept) != concept:
+                        continue
+                    if _normalized_memory_text(state.value) != value:
+                        continue
+                    if (candidate.memory_type and state.memory_type
+                            and candidate.memory_type != state.memory_type):
+                        continue
+                    return state
+            return None
 
         admission_started = time.perf_counter()
         for candidate in outcome.candidates:
             if not candidate.is_wellformed():
                 diagnostics.append("learn_rejected: candidate not wellformed")
+                rejected.append({
+                    "concept": candidate.concept,
+                    "provenance": request_provenance,
+                    "reason": "candidate_not_wellformed",
+                })
                 continue
             scope = "global" if candidate.scope == "global" else "session"
+            try:
+                existing = _known_state(candidate, scope)
+            except Exception as exc:
+                diagnostics.append(f"learn_failed: duplicate check: {exc}")
+                existing = None
+            if existing is not None:
+                record = {
+                    "concept": candidate.concept,
+                    "state_id": existing.state_id,
+                    "provenance": request_provenance,
+                }
+                already_known.append(record)
+                diagnostics.append(
+                    f"learn_already_known: {candidate.concept}"
+                    f" (state {existing.state_id})"
+                )
+                continue
             try:
                 candidate_id = store.create_candidate(
                     session_id,
@@ -517,6 +569,8 @@ class ContextManager:
             status = "learned"
         elif held:
             status = "held"
+        elif already_known:
+            status = "already_known"
         else:
             status = "rejected"
         return finish({
@@ -524,6 +578,8 @@ class ContextManager:
             "reason": outcome.reason,
             "learned": learned,
             "held": held,
+            "already_known": already_known,
+            "rejected": rejected,
             "diagnostics": diagnostics,
             "source_id": message_id,
         })
