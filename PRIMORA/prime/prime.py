@@ -1,3 +1,5 @@
+import os
+
 from .context import ContextManager
 from .context.mind import Mind
 from .contract import PrimeRequest, PrimeResult
@@ -9,11 +11,30 @@ from PRIMORA.research.sources import SourceRegistry
 from PRIMORA.toolbox.base import ToolRegistry
 
 
+def _configured_memory_db_path():
+    """Return an explicitly configured runtime database path, if supplied.
+
+    The default remains ContextStore's normal production path.  Acceptance
+    runs can point the shared Prime/Mind/ContextManager boundary at a
+    disposable file without creating a second memory system.
+    """
+    for name in ("PRIMORA_MEMORY_V2_DB", "PRIMORA_MEMORY_DB_PATH"):
+        value = str(os.environ.get(name) or "").strip()
+        if value:
+            return value
+    return None
+
+
 class Prime:
     def __init__(self, provider, research_provider=None, specialists=None,
                  jev=None, tools=None, context_manager=None, mind=None):
         if provider is None:
             raise ValueError("Prime requires a Provider")
+        # One provider is shared by capability execution and opt-in Memory V2
+        # typed formation.  Formation remains dormant while the existing
+        # ContextManager V2 flags are off, so disabled runtime behavior is
+        # unchanged and no second model/provider is constructed.
+        self._provider = provider
         self._registry = CapabilityRegistry()
         if mind is not None and not isinstance(mind, Mind):
             raise TypeError("mind must be a Mind")
@@ -29,8 +50,18 @@ class Prime:
             self._mind = mind
             self._context = mechanisms
         else:
-            self._context = context_manager or ContextManager()
+            db_path = _configured_memory_db_path()
+            if context_manager is not None:
+                self._context = context_manager
+            elif db_path is None:
+                # Keep the no-argument construction seam compatible with
+                # lightweight test/runtime ContextManager factories.  The
+                # provider is attached by _wire_formation_provider below.
+                self._context = ContextManager()
+            else:
+                self._context = ContextManager(db_path=db_path)
             self._mind = Mind(self._context)
+        self._wire_formation_provider()
         self._orchestrator = Orchestrator(provider, self._registry)
         # The recall capability answers from the Mind, and the registry is
         # built before the Mind exists, so bind it here. Every other
@@ -103,12 +134,28 @@ class Prime:
             raise ValueError("mind and context_manager must share mechanisms")
         self._mind = mind
         self._context = mind.mechanisms
+        self._wire_formation_provider()
         for name in ("recall", "learn"):
             specialist = self._registry.get_specialist(name)
             binder = getattr(specialist, "bind", None)
             if callable(binder):
                 binder(mind)
         return mind
+
+    def _wire_formation_provider(self) -> None:
+        """Attach this Prime's provider to the one shared ContextManager.
+
+        A caller may provide a ContextManager or Mind after Prime was built
+        (Aurora's supported boundary-binding path).  Wire only when that
+        manager has no formation provider, preserving an explicitly supplied
+        test or specialist provider while making the configured runtime
+        provider available to opt-in Memory V2 formation.
+        """
+        setter = getattr(self._context, "set_formation_provider", None)
+        if not callable(setter):
+            return
+        if getattr(self._context, "_formation_provider", None) is None:
+            setter(self._provider)
 
     @property
     def tools(self) -> ToolRegistry:
