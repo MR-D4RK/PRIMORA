@@ -59,6 +59,50 @@ enable the existing V2 flags, and run the normal CLI. The original production
 path is never a destination. No migration or recall path requires a second
 model or external memory framework.
 
+## Windows PowerShell contextual-recall acceptance
+
+Use a disposable database and one session for the dialogue below; then repeat
+the final two turns after restarting the CLI with a different
+`PRIMORA_SESSION_ID`. The question and answer turns are context pointers only;
+Prime's response must cite the original user message as the evidence source.
+
+```powershell
+$db = Join-Path $env:TEMP "primora-m9-contextual-recall.db"
+Remove-Item -LiteralPath $db -Force -ErrorAction SilentlyContinue
+$env:PRIMORA_AURORA_BACKEND = "openai"
+$env:PRIMORA_PROVIDER = "openai"
+$env:PRIMORA_OPENAI_URL = "http://127.0.0.1:8080/v1"
+$env:PRIMORA_OPENAI_MODEL = "Qwen3.5-9B-Q4_K_M"
+$env:PRIMORA_OPENAI_TIMEOUT = "300"
+$env:PRIMORA_MEMORY_V2 = "1"
+$env:PRIMORA_MEMORY_V2_FORMATION = "1"
+$env:PRIMORA_MEMORY_V2_RETRIEVAL = "1"
+$env:PRIMORA_MEMORY_V2_DB = $db
+$env:PRIMORA_SESSION_ID = "m9-context-a"
+python -m PRIMORA.main --cli
+```
+
+Enter these turns in the first process:
+
+```text
+I enjoy techno music when working. It helps me stay focused and calm.
+What music do I listen to when working?
+Why?
+I think I have told you.
+```
+
+Aurora should answer the last two turns from the verified original reason. It
+must abstain when the original statement has no reason, and it must not cite or
+repeat an assistant reply as a user fact. Check the same topic from a fresh
+session, then remove the disposable database:
+
+```powershell
+$env:PRIMORA_SESSION_ID = "m9-context-b"
+python -m PRIMORA.main --cli
+# Ask: What music do I listen to when working? / Why? / I already told you
+Remove-Item -LiteralPath $db -Force
+```
+
 ## Tests
 
 ```powershell
@@ -66,7 +110,8 @@ python -m pytest -q `
   TESTS/prime/test_m9_batch2.py `
   TESTS/prime/test_memory_v2_runtime_integration.py `
   TESTS/prime/test_unified_memory_intelligence.py `
-  TESTS/prime/test_learn_capability.py
+  TESTS/prime/test_learn_capability.py `
+  TESTS/prime/test_m9_contextual_recall.py
 ```
 
 The repository tests use temporary databases and fake providers. Live Qwen

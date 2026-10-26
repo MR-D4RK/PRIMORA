@@ -693,7 +693,13 @@ class CognitiveLoop:
             else:
                 try:
                     evidence = self._mind.memory_query_evidence(
-                        {**plan.as_dict(), "query": user_text},
+                        {
+                            **plan.as_dict(),
+                            # Contextual follow-ups keep their literal
+                            # wording for Aurora's answer but use a bounded,
+                            # predicate-bearing query for typed retrieval.
+                            "query": plan.retrieval_query or user_text,
+                        },
                         session_id=session_id)
                 except Exception:
                     response = BrainResult.success(
