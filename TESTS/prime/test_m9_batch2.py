@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from PRIMORA.aurora.brain import BrainResult
 from PRIMORA.aurora.memory_coordinator import interpret
 from PRIMORA.learning import Jev, LearningOutcome, StructuredCandidate
@@ -98,15 +100,129 @@ def test_restore_preview_reports_conflicting_sequence_without_overwriting(tmp_pa
     source_store = ContextStore(source)
     target_store = ContextStore(target)
     _message(source_store, "s", 0, "user", "I like amber", 1)
+    _message(source_store, "s", 1, "user", "I like quiet galleries", 1.5)
     _message(target_store, "s", 0, "user", "I like violet", 2)
+    source_before = [row.content for row in source_store.fetch_range("s")]
     preview = MemoryRestoreService(source, target).preview()
     assert any(item.table == "messages" and item.severity == "conflict"
                for item in preview.conflicts)
     result = MemoryRestoreService(source, target).import_into()
     assert result.conflicts
-    assert {row.content for row in target_store.fetch_range("s")} == {
-        "I like violet", "I like amber",
+    assert result.changed is False
+    assert [row.content for row in target_store.fetch_range("s")] == [
+        "I like violet",
+    ]
+    assert [row.content for row in source_store.fetch_range("s")] == source_before
+
+
+def test_conflict_does_not_create_a_new_destination_file(tmp_path):
+    source = tmp_path / "source-blocked.db"
+    target = tmp_path / "never-created.db"
+    source_store = ContextStore(source)
+    target_store = ContextStore(tmp_path / "occupied.db")
+    _message(source_store, "s", 0, "user", "I like amber", 1)
+    _message(target_store, "s", 0, "user", "I like violet", 2)
+    result = MemoryRestoreService(source, tmp_path / "occupied.db").import_into()
+    assert result.changed is False
+    assert result.conflicts
+    assert not target.exists()
+
+
+def test_source_internal_sequence_conflict_is_blocked_before_destination_creation(tmp_path):
+    source = tmp_path / "source-internal-conflict.db"
+    target = tmp_path / "new-destination.db"
+    source_store = ContextStore(source)
+    _message(source_store, "s", 0, "user", "I like amber", 1)
+    _message(source_store, "s", 0, "user", "I like violet", 2)
+    preview = MemoryRestoreService(source, target).preview()
+    assert any(item.table == "messages" and item.severity == "conflict"
+               for item in preview.conflicts)
+    result = MemoryRestoreService(source, target).import_into()
+    assert result.changed is False
+    assert result.conflicts
+    assert not target.exists()
+
+
+def test_conflicting_event_evidence_is_blocked_when_message_is_equivalent(tmp_path):
+    source = tmp_path / "source-event-conflict.db"
+    target = tmp_path / "target-event-conflict.db"
+    source_store = ContextStore(source)
+    target_store = ContextStore(target)
+    source_message = _message(source_store, "s", 0, "user", "I finished the atlas", 10)
+    target_message = _message(target_store, "s", 0, "user", "I finished the atlas", 20)
+    source_store.save_experience_event(
+        "s", source_message, "completion", "i", "I finished the atlas",
+        occurred_at=9, occurred_precision="day", occurred_timezone="UTC",
+    )
+    target_store.save_experience_event(
+        "s", target_message, "completion", "i", "I finished the atlas",
+        occurred_at=19, occurred_precision="day", occurred_timezone="UTC",
+    )
+    preview = MemoryRestoreService(source, target).preview()
+    assert any(item.table == "experience_events" and item.severity == "conflict"
+               for item in preview.conflicts)
+    result = MemoryRestoreService(source, target).import_into()
+    assert result.changed is False
+    assert len(target_store.fetch_experience_events()) == 1
+
+
+def test_equivalent_state_import_merges_all_remapped_supporting_sources(tmp_path):
+    source = tmp_path / "source-evidence.db"
+    target = tmp_path / "target-evidence.db"
+    source_store = ContextStore(source)
+    target_store = ContextStore(target)
+    source_message = _message(source_store, "source", 0, "user", "I like amber", 10)
+    target_message = _message(target_store, "existing", 0, "user", "I still like amber", 20)
+    target_store.create_state(
+        "existing", "global", "favorite color", "amber", [target_message],
+        memory_type="PREFERENCE",
+    )
+    source_store.create_state(
+        "source", "global", "favorite color", "amber", [source_message],
+        memory_type="PREFERENCE",
+    )
+    result = MemoryRestoreService(source, target).import_into()
+    states = target_store.fetch_states(scope="global", status="current")
+    assert result.changed is True
+    assert len(states) == 1
+    assert set(states[0].source_ids) == {
+        target_message, result.id_maps["messages"][source_message],
     }
+
+
+def test_interrupted_import_rolls_back_every_prior_write(tmp_path, monkeypatch):
+    source = tmp_path / "source-interrupted.db"
+    target = tmp_path / "target-interrupted.db"
+    source_store = ContextStore(source)
+    _message(source_store, "s", 0, "user", "I like amber", 1)
+    source_store.create_state("s", "global", "favorite color", "amber", [1])
+    target_store = ContextStore(target)
+    before = target_store.fetch_range("s")
+
+    def interrupted(*args, **kwargs):
+        raise RuntimeError("simulated interruption")
+
+    monkeypatch.setattr(MemoryRestoreService, "_import_states", interrupted)
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        MemoryRestoreService(source, target).import_into()
+    assert target_store.fetch_range("s") == before
+    assert target_store.fetch_states() == []
+
+
+def test_preview_marks_derived_indexes_nonblocking(tmp_path):
+    source = tmp_path / "source-index.db"
+    target = tmp_path / "target-index.db"
+    store = ContextStore(source)
+    with store._connection() as connection:
+        connection.execute(
+            "INSERT INTO retrieval_vectors(kind,ref_id,scope,session_id,model_id,dim,content_hash,vector,created_at) "
+            "VALUES('state',1,'global','s','test',1,'hash',?,1)",
+            (b"x",),
+        )
+    preview = MemoryRestoreService(source, target).preview()
+    assert preview.safe_to_import is True
+    assert preview.derived
+    assert preview.unsupported == []
 
 
 def test_restore_preserves_temporal_history_and_observation_sources(tmp_path):

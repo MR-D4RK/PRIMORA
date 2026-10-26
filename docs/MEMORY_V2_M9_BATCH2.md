@@ -12,6 +12,10 @@ for safe copying are reported as unsupported. Existing destination rows are
 never overwritten; same-session sequence and current-state disagreements are
 reported as conflicts. Existing files are checked for hard-link aliases
 before any destination connection is opened.
+`blocking_issues` contains conflicts and unsupported primary-memory records;
+the derived-index list is informational, because vectors and index metadata
+are rebuilt. The CLI exits with code 2 when blocking issues are found and
+performs no destination import in that case.
 
 Current state learning now checks current user states before creating a pending
 candidate. An equivalent current state returns `status=already_known`; a
@@ -37,7 +41,7 @@ python -m PRIMORA.prime.context.memory_restore preview `
   --source $source `
   --target $target
 
-# Review conflicts and unsupported records before this explicit write.
+# Continue only when the JSON report has no blocking_issues.
 python -m PRIMORA.prime.context.memory_restore import `
   --source $source `
   --target $target
