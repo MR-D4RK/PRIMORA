@@ -49,8 +49,18 @@ _PREFERENCE_FILLER_WORDS = frozenset({
     "liked", "love", "loves", "loved", "prefer", "prefers", "preferred",
     "enjoy", "enjoys", "enjoyed", "favorite", "favourite",
     "dislike", "dislikes", "disliked", "hate", "hates", "hated", "don",
-    "dont", "do", "not",
+    "dont", "do", "not", "no", "longer", "anymore", "currently", "now",
 })
+
+_NEGATIVE_PREFERENCE_RE = re.compile(
+    r"\b(?:dislike|dislikes|disliked|hate|hates|hated)\b|"
+    r"\b(?:no longer|not anymore|don't|do not|never)\s+(?:really\s+)?"
+    r"(?:like|love|enjoy|prefer)\b", re.I,
+)
+_POSITIVE_PREFERENCE_RE = re.compile(
+    r"\b(?:like|likes|liked|love|loves|loved|enjoy|enjoys|enjoyed|"
+    r"prefer|prefers|preferred|favorite|favourite)\b", re.I,
+)
 
 
 def _preference_terms(text: str) -> set[str]:
@@ -68,6 +78,16 @@ def _preference_terms(text: str) -> set[str]:
 
 def _preference_fingerprint(concept: str, value: str) -> set[str]:
     return _preference_terms(f"{concept} {value}")
+
+
+def _preference_polarity(concept: str, value: str, source: str = "") -> Optional[str]:
+    """Return a typed preference polarity, independent of subject vocabulary."""
+    corpus = f"{concept} {value} {source}"
+    if _NEGATIVE_PREFERENCE_RE.search(corpus):
+        return "negative"
+    if _POSITIVE_PREFERENCE_RE.search(corpus):
+        return "positive"
+    return None
 
 
 @dataclass(frozen=True)
@@ -412,12 +432,35 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             candidate_terms = _preference_fingerprint(
                 candidate.concept, candidate.value
             )
+            def _source_text(source_ids: list[int]) -> str:
+                texts = []
+                for source_id in source_ids:
+                    source = store.fetch_message(source_id)
+                    if source is not None:
+                        texts.append(source.content)
+                return " ".join(texts)
+
+            candidate_source = _source_text(candidate.source_ids)
+            candidate_polarity = _preference_polarity(
+                candidate.concept, candidate.value, candidate_source
+            )
             deduplicated = False
             for state in store.fetch_states(scope=scope, status="current"):
                 if not set(candidate.source_ids).intersection(state.source_ids):
                     continue
                 state_terms = _preference_fingerprint(state.concept, state.value)
-                if candidate_terms and candidate_terms.issubset(state_terms):
+                state_sources = _source_text(state.source_ids)
+                state_polarity = _preference_polarity(
+                    state.concept, state.value, state_sources
+                )
+                # Different wording for the same subject is one semantic
+                # claim only when polarity also agrees.  Exact subject terms
+                # avoid collapsing distinct claims such as "ceramics" and
+                # "ceramics workshops" while still merging "no longer like"
+                # with the canonical dislike state from the same source.
+                if (candidate_terms and candidate_terms == state_terms
+                        and candidate_polarity is not None
+                        and candidate_polarity == state_polarity):
                     for source_id in candidate.source_ids:
                         if source_id not in state.source_ids:
                             store.add_state_evidence(state.state_id, source_id)

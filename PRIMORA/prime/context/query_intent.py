@@ -21,6 +21,11 @@ _POSITIVE_PREFERENCE_WORDS = re.compile(
     r"\b(?:like|liked|likes|love|loved|loves|enjoy|enjoyed|enjoys|"
     r"prefer|preferred|prefers|favorite|favourite)\b", re.I,
 )
+_NEGATIVE_PREFERENCE_WORDS = re.compile(
+    r"\b(?:dislike|dislikes|disliked|hate|hates|hated)\b|"
+    r"\b(?:no longer|not anymore|don't|do not|never)\s+(?:really\s+)?"
+    r"(?:like|love|enjoy|prefer)\b", re.I,
+)
 _PREDICATE_WORDS = re.compile(
     r"\b(liked|loved|enjoyed|preferred|like|love|enjoy|prefer|favorite|favourite|dislike|hate)s?\b", re.I,
 )
@@ -33,6 +38,7 @@ _EXPLICIT_USER_PREFERENCE = re.compile(
     r"(?:like|love|enjoy|prefer|favor|favour|hate|dislike|favorite|favourite)\b",
     re.I,
 )
+_EXPLANATION_MARKERS = re.compile(r"\b(?:why|reason|because|explain)\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,7 @@ class QueryIntent:
     temporal_scope: str = "current"
     subject: Optional[str] = None
     positive_only: bool = False
+    explanation: bool = False
 
 
 def interpret(text: str, plan: Optional[dict[str, Any]] = None) -> Optional[QueryIntent]:
@@ -90,18 +97,45 @@ def interpret(text: str, plan: Optional[dict[str, Any]] = None) -> Optional[Quer
         match = re.search(r"\b(?:about|for|in)\s+([a-z][a-z0-9 _-]{1,80})", text)
         if match and not re.search(r"\b(?:the last|recent)", match.group(1)):
             subject = match.group(1).strip(" ?.! ")
+    explanation = bool(_EXPLANATION_MARKERS.search(text))
+    if explanation and not subject:
+        # Explanation questions name their object directly after the
+        # preference predicate ("Why did I like X?").  Treat that phrase as
+        # a strict subject filter so another preference cannot answer the
+        # question by lexical accident.
+        match = re.search(
+            r"\b(?:like|liked|love|loved|enjoy|enjoyed|prefer|preferred|"
+            r"favorite|favourite|dislike|hate|hates|dislikes)\s+"
+            r"(.+?)(?:\?|$)", text,
+        )
+        if match:
+            subject = match.group(1).strip(" ?.! ")
     positive_only = bool(re.search(
         r"\b(?:like|liked|love|loved|enjoy|enjoyed|prefer|preferred)\b", text
     )) and "preference" not in text
-    return QueryIntent("preference", predicate, "global", count, order, temporal, subject, positive_only)
+    return QueryIntent("preference", predicate, "global", count, order, temporal, subject, positive_only, explanation)
+
+
+def _preference_polarity(*texts: str) -> Optional[str]:
+    """Classify a preference claim from its source and typed representation.
+
+    The result is intentionally conservative: an unrecognised predicate is
+    neither positive nor negative, so it cannot satisfy a polarity-specific
+    query.  This protects historical positive inventories from current
+    negative corrections while retaining both source records.
+    """
+    corpus = " ".join(str(text or "") for text in texts)
+    if _NEGATIVE_PREFERENCE_WORDS.search(corpus):
+        return "negative"
+    if _POSITIVE_PREFERENCE_WORDS.search(corpus):
+        return "positive"
+    return None
 
 
 def _predicate_match(intent: QueryIntent, text: str, concept: str, value: str) -> bool:
     corpus = f"{text} {concept} {value}".casefold()
-    if intent.positive_only and re.search(
-        r"\b(?:do not|don't|never)\s+(?:really\s+)?(?:like|love|enjoy|prefer)\b"
-        r"|\b(?:dislike|hate)\b", text.casefold()
-    ):
+    polarity = _preference_polarity(text, concept, value)
+    if intent.positive_only and polarity != "positive":
         return False
     if intent.predicate == "preference":
         return bool(_PREFERENCE_WORDS.search(corpus))
@@ -109,10 +143,47 @@ def _predicate_match(intent: QueryIntent, text: str, concept: str, value: str) -
         # A positive preference query is intentionally predicate-family
         # based. "I prefer asymmetrical architecture" is the same kind of
         # user preference as "I like blue architecture".
-        return bool(_POSITIVE_PREFERENCE_WORDS.search(corpus))
+        return polarity == "positive"
     if intent.predicate == "favorite":
         return bool(re.search(r"\bfavo(?:u)?rite\b", corpus)) or concept.casefold().startswith("favorite ")
+    if intent.predicate in {"dislike", "hate"}:
+        # Hate and dislike are one negative preference family.  The typed
+        # state and immutable source carry the distinction in their wording;
+        # retrieval must not lose either member of the family.
+        return polarity == "negative"
     return bool(re.search(rf"\b{re.escape(intent.predicate)}(?:s|ed)?\b", corpus))
+
+
+def _verified_rationale(store: Any, state: Any, *, now: float,
+                        temporal_scope: str) -> Optional[dict[str, Any]]:
+    """Return a user-source-backed reason linked to a preference state."""
+    if not state.source_ids or state.authority != "user":
+        return None
+    allowed = {"current", "superseded"} if temporal_scope == "historical" else {"current"}
+    scopes = [state.scope]
+    if state.scope != "global":
+        scopes.append("global")
+    for scope in scopes:
+        for rationale in store.fetch_states(
+                scope=scope, concept="rationale for " + state.concept):
+            if rationale.status not in allowed or rationale.authority != "user":
+                continue
+            if not rationale.source_ids or not rationale.value.strip():
+                continue
+            sources = store.fetch_messages_by_ids(rationale.source_ids)
+            for source in sources:
+                if source.role != "user" or source.timestamp > now + 300:
+                    continue
+                content = source.content.casefold()
+                reason = rationale.value.casefold().strip()
+                if reason in content or ("because " + reason) in content:
+                    return {
+                        "value": rationale.value.strip(),
+                        "source_ids": list(rationale.source_ids),
+                        "message_id": source.message_id,
+                        "timestamp": source.timestamp,
+                    }
+    return None
 
 
 def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
@@ -145,10 +216,17 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
                 continue
             if intent.subject and intent.subject.casefold() not in f"{state.concept} {state.value} {msg.content}".casefold():
                 continue
+            rationale = (_verified_rationale(
+                store, state, now=now,
+                temporal_scope=intent.temporal_scope,
+            ) if intent.explanation else None)
+            if intent.explanation and rationale is None:
+                continue
             candidates.append({"id": msg.message_id, "timestamp": msg.timestamp,
                                "text": msg.content[:500], "concept": state.concept,
                                "value": state.value, "source_ids": state.source_ids,
-                               "score": 1.0 + (0.25 if intent.subject else 0.0)})
+                               "score": 1.0 + (0.25 if intent.subject else 0.0),
+                               "rationale": rationale})
     # Observations are an additive channel and obey the same source gates.
     try:
         observations = store.fetch_observations(scope="global") + store.fetch_observations(scope=session_id)
@@ -168,6 +246,8 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
                 continue
             if intent.subject and intent.subject.casefold() not in f"{observation.concept} {observation.value} {msg.content}".casefold():
                 continue
+            if intent.explanation:
+                continue
             candidates.append({"id": msg.message_id, "timestamp": msg.timestamp,
                                "text": msg.content[:500], "concept": observation.concept,
                                "value": observation.value, "source_ids": observation.source_ids,
@@ -177,7 +257,8 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
     # a third-party statement from becoming a personal preference.
     try:
         raw_messages = store.search_user_evidence(
-            ("like", "love", "enjoy", "prefer", "favorite", "favourite"),
+            ("like", "love", "enjoy", "prefer", "favorite", "favourite",
+             "dislike", "hate"),
             limit=240,
         )
     except (AttributeError, RuntimeError):
@@ -191,10 +272,23 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
             continue
         if intent.subject and intent.subject.casefold() not in msg.content.casefold():
             continue
+        if intent.explanation:
+            # A raw message is eligible for an explanation only when it
+            # contains an explicit, user-authored reason.  The ordinary
+            # preference quote is never a substitute for rationale evidence.
+            reason_match = re.search(r"\bbecause\s+(.{12,})", msg.content, re.I)
+            if reason_match is None or re.match(
+                    r"(?:you|someone|people|they)\b", reason_match.group(1).strip(), re.I):
+                continue
         candidates.append({"id": msg.message_id, "timestamp": msg.timestamp,
                            "text": msg.content[:500], "concept": "lexical preference",
                            "value": msg.content[:240], "source_ids": [msg.message_id],
-                           "score": 0.5})
+                           "score": 0.5, "rationale": {
+                               "value": reason_match.group(1).strip(),
+                               "source_ids": [msg.message_id],
+                               "message_id": msg.message_id,
+                               "timestamp": msg.timestamp,
+                           } if intent.explanation and reason_match else None})
     # Deduplicate by canonical concept/value and shared source evidence.
     unique: dict[tuple[str, str, tuple[int, ...]], dict[str, Any]] = {}
     for candidate in candidates:
@@ -210,7 +304,20 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
     deduped: list[dict[str, Any]] = []
     for candidate in sorted(candidates, key=lambda row: row["score"], reverse=True):
         source_set = set(candidate["source_ids"])
-        if any(source_set & set(existing["source_ids"]) for existing in deduped):
+        if any(
+            source_set & set(existing["source_ids"])
+            and (
+                candidate["concept"] == "lexical preference"
+                or existing["concept"] == "lexical preference"
+                or (
+                    normalize_concept(candidate["concept"])
+                    == normalize_concept(existing["concept"])
+                    and normalize_concept(candidate["value"])
+                    == normalize_concept(existing["value"])
+                )
+            )
+            for existing in deduped
+        ):
             continue
         deduped.append(candidate)
     candidates = deduped
@@ -218,14 +325,23 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
     if intent.count is not None:
         candidates = candidates[:intent.count]
     if not candidates:
+        if intent.explanation:
+            return "I couldn't verify a user-stated reason for that preference, so I won't invent one."
         return ""
     lines = [
-        "Verified preference evidence. Only direct user-source records are included.",
+        ("Verified user-stated rationale evidence."
+         if intent.explanation else
+         "Verified preference evidence. Only direct user-source records are included."),
         f"Predicate: {intent.predicate}; order: {intent.order}; requested count: {intent.count or 'all'}.",
     ]
     for row in candidates:
         stamp = datetime.fromtimestamp(row["timestamp"], timezone.utc)
         source_ids = ",".join(str(i) for i in row["source_ids"])
-        lines.append(f"[message {row['id']}; source_ids={source_ids}; {stamp:%Y-%m-%d %H:%M} UTC] {row['text']!r} | stored: {row['concept']}: {row['value']}")
+        line = (f"[message {row['id']}; source_ids={source_ids}; "
+                f"{stamp:%Y-%m-%d %H:%M} UTC] {row['text']!r} | stored: "
+                f"{row['concept']}: {row['value']}")
+        if intent.explanation and row.get("rationale"):
+            line += f" | user-stated reason: {row['rationale']['value']!r}"
+        lines.append(line)
     return "\n".join(lines)
 
