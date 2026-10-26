@@ -61,6 +61,9 @@ class ObservationProposal:
     occurred_until: float | None = None
     valid_from: float | None = None
     valid_until: float | None = None
+    status: str = "current"
+    confidence: float = 1.0
+    authority: str = "user"
 
 
 class ObservationService:
@@ -111,9 +114,22 @@ class ObservationService:
         scope = _scope(session_id, proposal.scope if proposal.scope != "session" else session_id)
         concept = _clean(proposal.concept, "concept")
         value = _clean(proposal.value, "value", 1000)
-        if proposal.actor != "user":
-            raise ValueError("only user observations may be admitted as current")
-        if proposal.observation_type not in {"observation", "preference", "state", "event", "relationship"}:
+        if proposal.actor not in {"user", "derived"}:
+            raise ValueError("observation actor is not admitted by Prime")
+        if proposal.status not in {
+            "current", "candidate", "unresolved", "superseded", "rejected",
+        }:
+            raise ValueError("invalid observation status")
+        # A derived interpretation is useful for review and retrieval
+        # diagnostics, but it must never become a current personal fact
+        # without an explicit Prime confirmation path.
+        if proposal.actor == "derived" and proposal.status == "current":
+            raise ValueError("derived observations require review before current status")
+        if proposal.authority != "user" and proposal.status == "current":
+            raise ValueError("only user authority may be current")
+        if proposal.observation_type not in {
+            "observation", "preference", "state", "event", "relationship", "derived",
+        }:
             raise ValueError("unsupported observation type")
         ids = self._validate_sources(session_id, scope, proposal.source_ids, proposal.source_quotes)
         observation_id = self.store.create_observation(
@@ -124,17 +140,42 @@ class ObservationService:
             actor=proposal.actor,
             subject=proposal.subject,
             predicate=proposal.predicate,
-            authority="user", status="current", confidence=1.0,
+            authority=proposal.authority, status=proposal.status,
+            confidence=proposal.confidence,
             occurred_from=proposal.occurred_from,
             occurred_until=proposal.occurred_until,
             valid_from=proposal.valid_from,
             valid_until=proposal.valid_until,
         )
-        record = self.store.fetch_observations(scope=scope, status="current")
+        record = self.store.fetch_observations(scope=scope)
         for item in reversed(record):
             if item.observation_id == observation_id:
                 return item
         raise RuntimeError("observation was inserted but could not be read")
+
+    def add_support(
+        self,
+        observation_id: int,
+        source_ids: list[int],
+        *,
+        source_quotes: dict[int, str] | None = None,
+        source_episode_ids: list[str] | None = None,
+    ) -> int:
+        """Attach additional immutable evidence without rewriting an observation."""
+        self._require_enabled()
+        observation = self.store.fetch_observations(
+            status=None, limit=None
+        )
+        match = next((item for item in observation if item.observation_id == int(observation_id)), None)
+        if match is None:
+            raise ValueError("observation not found")
+        if match.status not in {"current", "candidate", "unresolved"}:
+            raise ValueError("evidence can only support an active observation")
+        return self.store.add_observation_evidence(
+            int(observation_id), source_ids,
+            source_quotes=source_quotes,
+            source_episode_ids=source_episode_ids,
+        )
 
     def read(self, **filters: Any) -> list[ObservationRecord]:
         self._require_enabled()

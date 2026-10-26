@@ -1551,6 +1551,72 @@ class ContextStore:
                  "source_quote": row[4], "source_role": row[5],
                  "linked_at": row[6]} for row in rows]
 
+    def add_observation_evidence(
+        self,
+        observation_id: int,
+        source_ids: list[int],
+        *,
+        source_quotes: Optional[dict[int, str]] = None,
+        source_episode_ids: Optional[list[str]] = None,
+    ) -> int:
+        """Add source links atomically while leaving the observation immutable.
+
+        The observation value and lifecycle are never edited here.  Every
+        message link is checked against the same authority and scope gates as
+        initial admission; duplicate links are harmless and idempotent.
+        """
+        ids = list(dict.fromkeys(int(value) for value in (source_ids or [])))
+        episodes = list(dict.fromkeys(
+            str(value).strip() for value in (source_episode_ids or [])
+            if str(value).strip()
+        ))
+        if not ids and not episodes:
+            raise ValueError("observation evidence requires a source")
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT scope, status, authority FROM observations WHERE id = ?",
+                (int(observation_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("observation not found")
+            if row[1] not in ("current", "candidate", "unresolved"):
+                raise ValueError("observation is not supportable")
+            scope = row[0]
+            linked = 0
+            for source_id in ids:
+                source = con.execute(
+                    "SELECT session_id, role, content FROM messages WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                if source is None or source[1] != "user":
+                    raise ValueError("observation sources must be user messages")
+                if scope != "global" and source[0] != scope:
+                    raise ValueError("observation source crosses scope")
+                quote = (source_quotes or {}).get(source_id, "")
+                if not isinstance(quote, str) or len(quote) > 1000:
+                    raise ValueError("source quote is invalid")
+                if quote and quote.casefold() not in source[2].casefold():
+                    raise ValueError("source quote is not supported by source message")
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at)"
+                    " VALUES (?, ?, NULL, ?, 'user', ?)",
+                    (int(observation_id), source_id, quote[:1000], time.time()),
+                )
+                linked += int(cur.rowcount > 0)
+            for episode_id in episodes:
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at)"
+                    " VALUES (?, NULL, ?, '', 'user', ?)",
+                    (int(observation_id), episode_id, time.time()),
+                )
+                linked += int(cur.rowcount > 0)
+            return linked
+
     def supersede_observation(
         self, observation_id: int, *, reason: str = "superseded",
         replacement_id: Optional[int] = None, transition_time: Optional[float] = None,

@@ -208,6 +208,107 @@ class ObservationHistoryRecord:
 
 
 @dataclass(frozen=True)
+class ConsolidationProposal:
+    """A reviewable, source-backed derived observation proposal.
+
+    Consolidation never treats a model score as truth.  ``proof_count`` is
+    derived from distinct immutable user source links and proposals remain
+    ``candidate`` until an explicit Prime review admits them.
+    """
+
+    scope: str
+    session_id: str
+    concept: str
+    value: str
+    source_ids: list[int] = field(default_factory=list)
+    source_quotes: dict[int, str] = field(default_factory=dict)
+    source_episode_ids: list[str] = field(default_factory=list)
+    proof_count: int = 0
+    observation_type: str = "derived"
+    predicate: str = ""
+    observed_at: Optional[float] = None
+    occurred_from: Optional[float] = None
+    occurred_until: Optional[float] = None
+    confidence: float = 1.0
+    uncertainty: str = ""
+    reason: str = ""
+    status: str = "candidate"
+
+
+@dataclass(frozen=True)
+class ConsolidationReport:
+    """Progress and results from one bounded consolidation/replay run."""
+
+    run_id: str
+    dry_run: bool
+    scanned: int
+    grouped: int
+    proposals: list[ConsolidationProposal] = field(default_factory=list)
+    applied_ids: list[int] = field(default_factory=list)
+    skipped: int = 0
+    diagnostics: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RelationEvidencePacket:
+    """One bounded, source-cited relationship traversal result."""
+
+    packet_type: str
+    scope: str
+    relationship_id: int
+    relationship_type: str
+    subject: str
+    object: str
+    source_ids: list[int] = field(default_factory=list)
+    source_episode_ids: list[str] = field(default_factory=list)
+    status: str = "current"
+    authority: str = "user"
+    valid_from: Optional[float] = None
+    valid_until: Optional[float] = None
+    reason: str = ""
+    inferred: bool = False
+    hop: int = 1
+    related_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RelationalRetrievalResult:
+    """Bounded relational results plus fail-closed diagnostics."""
+
+    query: str
+    scope: str
+    packets: list[RelationEvidencePacket] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class AuditFinding:
+    """A reviewable integrity finding; it never mutates memory."""
+
+    kind: str
+    severity: str
+    record_kind: str
+    record_id: int
+    concept: str = ""
+    value: str = ""
+    source_ids: list[int] = field(default_factory=list)
+    message: str = ""
+    recommendation: str = "review"
+
+
+@dataclass(frozen=True)
+class AuditReport:
+    """Read-only metamemory report over one disposable database."""
+
+    run_id: str
+    scanned: int
+    findings: list[AuditFinding] = field(default_factory=list)
+    proposals: list[dict[str, Any]] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class CandidateRecord:
     """One proposed memory awaiting confirmation.
 
