@@ -75,6 +75,69 @@ def test_explanation_query_abstains_without_verified_user_reason(tmp_path):
     assert "flarnic ceramics" not in with_reason
 
 
+def test_preference_inventory_excludes_mistyped_reason_state_but_keeps_rationale(tmp_path):
+    provider = TypedProvider([{
+        # This is the failure shape observed from local Qwen: the reason is
+        # proposed as a second preference with the same source message.
+        "kind": "preference", "concept": "quiet libraries",
+        "value": "help me focus", "claim_kind": "assertion", "actor": "user",
+        "scope": "global",
+    }])
+    manager = ContextManager(
+        db_path=tmp_path / "reason-state.db", enable_memory_v2=True,
+        hybrid_retrieval=False, formation_provider=provider,
+    )
+    manager.reconcile([{
+        "role": "user",
+        "content": "I like quiet libraries because they help me focus",
+        "timestamp": 100,
+    }], "s")
+    evidence = _evidence(manager, "What did I previously like?", session="other")
+    assert evidence.count("[message ") == 1
+    assert "likes for quiet libraries" in evidence
+    assert "stored: quiet libraries: help me focus" not in evidence
+    # The rationale and the model-produced secondary state remain available
+    # to source/audit paths; retrieval alone does not delete evidence.
+    states = manager._get_store().fetch_states(scope="global")
+    assert any(row.memory_type == "RATIONALE" and "help me focus" in row.value
+               for row in states)
+    assert any(row.concept == "quiet libraries" and row.value == "help me focus"
+               for row in states)
+    assert manager._get_store().fetch_relationships(
+        scope="global", relationship_type="explains", status="current"
+    )
+    assert all(row.source_ids == [1] for row in states if row.source_ids)
+
+
+def test_same_message_keeps_two_preferences_but_excludes_unrelated_fact(tmp_path):
+    manager = ContextManager(
+        db_path=tmp_path / "multi-preference-inventory.db", enable_memory_v2=True,
+        hybrid_retrieval=False,
+    )
+    store = manager._get_store()
+    source, *_ = store.append(
+        "s", 0, "user",
+        "I like quiet libraries and prefer urban gardens.", timestamp=100,
+    )
+    store.create_state(
+        "s", "global", "likes for quiet libraries", "loves quiet libraries",
+        [source], memory_type="PREFERENCE", timestamp=100,
+    )
+    store.create_state(
+        "s", "global", "preferred urban gardens", "urban gardens",
+        [source], memory_type="PREFERENCE", timestamp=100,
+    )
+    store.create_state(
+        "s", "global", "weather", "sunny", [source],
+        memory_type="FACT", timestamp=100,
+    )
+    evidence = _evidence(manager, "What did I previously like?", session="other")
+    assert evidence.count("[message ") == 2
+    assert "quiet libraries" in evidence
+    assert "urban gardens" in evidence
+    assert "sunny" not in evidence
+
+
 def test_typed_no_longer_like_deduplicates_canonical_dislike_without_losing_source(tmp_path):
     provider = TypedProvider([{
         "kind": "preference", "concept": "flarnic ceramics",

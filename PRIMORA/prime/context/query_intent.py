@@ -132,6 +132,56 @@ def _preference_polarity(*texts: str) -> Optional[str]:
     return None
 
 
+_SECONDARY_FACT_FILLERS = frozenset({
+    "a", "an", "and", "as", "because", "for", "i", "is", "it",
+    "me", "my", "of", "that", "the", "they", "them", "this", "to",
+    "we", "what", "which",
+})
+
+
+def _semantic_terms(text: str) -> set[str]:
+    terms = set()
+    for raw in re.findall(r"[a-z0-9]+", str(text or "").casefold()):
+        if raw in _SECONDARY_FACT_FILLERS or len(raw) < 3:
+            continue
+        if raw.endswith("ies") and len(raw) > 4:
+            raw = raw[:-3] + "y"
+        elif raw.endswith("s") and len(raw) > 4:
+            raw = raw[:-1]
+        terms.add(raw)
+    return terms
+
+
+def _has_preference_label(concept: str, value: str) -> bool:
+    corpus = f"{concept} {value}"
+    return (
+        concept.casefold().startswith(("likes for ", "favorite ", "favourite "))
+        or bool(_PREFERENCE_WORDS.search(corpus))
+    )
+
+
+def _is_explanation_secondary(state: Any, source_text: str) -> bool:
+    """Reject a mis-typed explanatory clause from preference inventories.
+
+    Some local model responses label the reason after ``because`` as another
+    preference.  Keep that source-backed state available to fact/audit paths,
+    but do not count it as a liked item.  A real preference value remains
+    eligible because it appears before the explanatory clause or carries its
+    own preference predicate.
+    """
+    if _has_preference_label(state.concept, state.value):
+        return False
+    match = re.search(r"\b(?:because|since|as)\b(?P<reason>.+)$", source_text, re.I)
+    if not match:
+        return False
+    value_terms = _semantic_terms(state.value)
+    reason_terms = _semantic_terms(match.group("reason"))
+    head_terms = _semantic_terms(source_text[:match.start()])
+    return bool(value_terms) and value_terms.issubset(reason_terms) and bool(
+        _semantic_terms(state.concept) & head_terms
+    )
+
+
 def _predicate_match(intent: QueryIntent, text: str, concept: str, value: str) -> bool:
     corpus = f"{text} {concept} {value}".casefold()
     polarity = _preference_polarity(text, concept, value)
@@ -212,6 +262,8 @@ def preference_evidence(store: Any, intent: QueryIntent, *, session_id: str,
         messages = [m for m in store.fetch_messages_by_ids(state.source_ids)
                     if m.role == "user" and 0 <= m.timestamp <= now + 300]
         for msg in messages:
+            if _is_explanation_secondary(state, msg.content):
+                continue
             if not _predicate_match(intent, msg.content, state.concept, state.value):
                 continue
             if intent.subject and intent.subject.casefold() not in f"{state.concept} {state.value} {msg.content}".casefold():
