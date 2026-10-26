@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -23,7 +24,11 @@ from typing import Callable, Optional, TextIO
 from PRIMORA.prime.providers import OpenAICompatibleProvider
 
 from .isolation import IsolationError, require_isolated
+from . import entities, relationships
+from .consolidation import ConsolidationService
+from .memory_audit import MemoryAuditService
 from .manager import ContextManager
+from .relational_retrieval import RelationalRetriever
 
 
 HELP = """Commands:
@@ -34,6 +39,19 @@ HELP = """Commands:
   :memory              show current states, observations, and source ids
   :history [NAME]      show raw turns from a session
   :diagnostics         show formation status and the latest diagnostics
+  :m6 preview [SCOPE]  preview evidence-backed consolidation candidates
+  :m6 sources N        inspect sources supporting preview candidate N
+  :m6 apply N          explicitly apply preview candidate N as a Prime candidate
+  :m6 apply-all        explicitly apply every preview candidate
+  :m7 entity NAME TYPE SOURCE_ID
+                        create a source-backed entity candidate
+  :m7 alias ENTITY_ID ALIAS SOURCE_ID
+                        create a source-backed alias candidate
+  :m7 relationship TYPE SUBJECT_ID OBJECT_ID SOURCE_ID
+                        create a source-backed relationship candidate
+  :m7 approve KIND ID  approve entity, alias, or relationship through Prime
+  :m7 query NAME [HOPS] query bounded relational evidence by name or alias
+  :m8 audit [SCOPE]    run the read-only metamemory audit
   :help                show this help
   :quit                 leave the console
 
@@ -68,6 +86,8 @@ class MemoryV2Console:
         self.session_id = self._validate_session(session_id)
         self.output = output or print
         self.last_diagnostics: list[str] = []
+        self._m6_report = None
+        self._m6_applied: set[int] = set()
 
     @staticmethod
     def _validate_session(value: str) -> str:
@@ -153,6 +173,229 @@ class MemoryV2Console:
                 f"last_activity={row.last_activity_at:.3f}"
             )
 
+    def _m6(self, argument: str) -> None:
+        """Preview, inspect, and explicitly apply M6 proposals."""
+        tokens = shlex.split(argument)
+        action = tokens[0].casefold() if tokens else "preview"
+        service = ConsolidationService(self.manager._get_store(), enabled=True)
+        if action == "preview":
+            scope = tokens[1] if len(tokens) > 1 else "global"
+            if scope == "session":
+                scope = self.session_id
+            if scope not in {"global", self.session_id}:
+                self._write("Usage: :m6 preview [global|session]")
+                return
+            self._m6_report = service.run(self.session_id, scope=scope, dry_run=True)
+            self._m6_applied.clear()
+            self._write(
+                f"M6 preview run={self._m6_report.run_id} scanned={self._m6_report.scanned} "
+                f"groups={self._m6_report.grouped} proposals={len(self._m6_report.proposals)}"
+            )
+            if not self._m6_report.proposals:
+                self._write("  (no repeated source-backed candidates)")
+            for index, proposal in enumerate(self._m6_report.proposals, 1):
+                self._write(
+                    f"  [{index}] {proposal.concept} = {proposal.value} "
+                    f"proof_count={proposal.proof_count} sources={proposal.source_ids} "
+                    f"status={proposal.status} uncertainty={proposal.uncertainty}"
+                )
+                if proposal.occurred_from is not None or proposal.occurred_until is not None:
+                    self._write(
+                        f"      occurred_from={proposal.occurred_from} "
+                        f"occurred_until={proposal.occurred_until}"
+                    )
+            return
+        if action == "sources":
+            if self._m6_report is None:
+                self._write("Run :m6 preview before inspecting sources.")
+                return
+            if len(tokens) != 2 or not tokens[1].isdigit():
+                self._write("Usage: :m6 sources N")
+                return
+            index = int(tokens[1]) - 1
+            if not 0 <= index < len(self._m6_report.proposals):
+                self._write("M6 candidate number is out of range.")
+                return
+            proposal = self._m6_report.proposals[index]
+            self._write(f"M6 supporting sources for candidate {index + 1}:")
+            for source_id in proposal.source_ids:
+                message = self.manager._get_store().fetch_message(source_id)
+                if message is None:
+                    self._write(f"  source_id={source_id} (missing; admission will fail closed)")
+                    continue
+                self._write(
+                    f"  source_id={source_id} session={message.session_id} "
+                    f"role={message.role} reported_at={message.timestamp}: {message.content}"
+                )
+                self._write(f"    quote={proposal.source_quotes.get(source_id, '')}")
+            return
+        if action in {"apply", "apply-all"}:
+            if self._m6_report is None:
+                self._write("Run :m6 preview before applying candidates.")
+                return
+            if action == "apply-all":
+                indices = range(len(self._m6_report.proposals))
+            elif len(tokens) == 2 and tokens[1].isdigit():
+                indices = [int(tokens[1]) - 1]
+            else:
+                self._write("Usage: :m6 apply N | :m6 apply-all")
+                return
+            for index in indices:
+                if not 0 <= index < len(self._m6_report.proposals):
+                    self._write(f"M6 candidate {index + 1} is out of range.")
+                    continue
+                if index in self._m6_applied:
+                    self._write(f"M6 candidate {index + 1} was already applied in this preview.")
+                    continue
+                proposal = self._m6_report.proposals[index]
+                try:
+                    row = service.apply_proposal(proposal, session_id=self.session_id)
+                except (ValueError, RuntimeError) as exc:
+                    self._write(f"M6 candidate {index + 1} rejected by Prime: {exc}")
+                    continue
+                self._m6_applied.add(index)
+                self._write(
+                    f"M6 candidate {index + 1} admitted as observation {row.observation_id} "
+                    f"status={row.status} sources={row.source_ids} proof_count={row.proof_count}"
+                )
+            return
+        self._write("Usage: :m6 preview [global|session] | :m6 sources N | :m6 apply N | :m6 apply-all")
+
+    def _source_id(self, value: str) -> Optional[int]:
+        try:
+            source_id = int(value)
+        except (TypeError, ValueError):
+            self._write("SOURCE_ID must be an integer user message ID in the current session.")
+            return None
+        message = self.manager._get_store().fetch_message(source_id)
+        if message is None or message.role != "user" or message.session_id != self.session_id:
+            self._write("Prime source validation failed: source must be a user message in the current session.")
+            return None
+        return source_id
+
+    def _m7(self, argument: str) -> None:
+        """Create/approve/query M7 records through existing Prime APIs."""
+        try:
+            tokens = shlex.split(argument)
+        except ValueError as exc:
+            self._write(f"M7 argument error: {exc}")
+            return
+        if not tokens:
+            self._write("Usage: :m7 entity|alias|relationship|approve|query ...")
+            return
+        action = tokens[0].casefold()
+        store = self.manager._get_store()
+        try:
+            if action == "entity" and len(tokens) == 4:
+                source_id = self._source_id(tokens[3])
+                if source_id is None:
+                    return
+                entity_id, diagnostics = entities.create_candidate(
+                    store, self.session_id, tokens[1], tokens[2].upper(), [source_id]
+                )
+                self._write(f"M7 entity candidate={entity_id} status=candidate sources={[source_id]}")
+                for item in diagnostics:
+                    self._write(f"  {item}")
+                return
+            if action == "alias" and len(tokens) == 4:
+                source_id = self._source_id(tokens[3])
+                if source_id is None:
+                    return
+                alias_id, diagnostics = entities.add_alias_candidate(
+                    store, int(tokens[1]), tokens[2], self.session_id, [source_id]
+                )
+                self._write(f"M7 alias candidate={alias_id} status=candidate sources={[source_id]}")
+                for item in diagnostics:
+                    self._write(f"  {item}")
+                return
+            if action == "relationship" and len(tokens) == 5:
+                source_id = self._source_id(tokens[4])
+                if source_id is None:
+                    return
+                relationship_id, diagnostics = relationships.create_candidate(
+                    store, self.session_id, tokens[1].casefold(), int(tokens[2]),
+                    int(tokens[3]), [source_id]
+                )
+                self._write(
+                    f"M7 relationship candidate={relationship_id} status=candidate "
+                    f"sources={[source_id]}"
+                )
+                for item in diagnostics:
+                    self._write(f"  {item}")
+                return
+            if action == "approve" and len(tokens) == 3:
+                kind, record_id = tokens[1].casefold(), int(tokens[2])
+                if kind == "entity":
+                    row, diagnostics = entities.confirm(store, record_id)
+                    status = row.status
+                elif kind == "alias":
+                    row, diagnostics = entities.confirm_alias(store, record_id)
+                    status = row.status
+                elif kind == "relationship":
+                    row, diagnostics = relationships.confirm(store, record_id)
+                    status = row.status
+                else:
+                    self._write("Usage: :m7 approve entity|alias|relationship ID")
+                    return
+                self._write(f"M7 {kind} {record_id} approved by Prime; status={status}")
+                for item in diagnostics:
+                    self._write(f"  {item}")
+                return
+            if action == "query" and len(tokens) in {2, 3}:
+                hops = int(tokens[2]) if len(tokens) == 3 else 2
+                result = RelationalRetriever(store, enabled=True).retrieve(
+                    self.session_id, tokens[1], hop_limit=hops
+                )
+                self._write(
+                    f"M7 relational evidence packets={len(result.packets)} "
+                    f"truncated={result.truncated}"
+                )
+                for packet in result.packets:
+                    self._write(
+                        f"  {packet.packet_type} {packet.subject} -> {packet.object} "
+                        f"type={packet.relationship_type} hop={packet.hop} "
+                        f"inferred={packet.inferred} sources={packet.source_ids}"
+                    )
+                    self._write(f"    reason={packet.reason}")
+                for item in result.diagnostics:
+                    self._write(f"  diagnostic={item}")
+                return
+        except (ValueError, RuntimeError) as exc:
+            self._write(f"M7 Prime validation failed: {exc}")
+            return
+        self._write(
+            "Usage: :m7 entity NAME TYPE SOURCE_ID | :m7 alias ENTITY_ID ALIAS SOURCE_ID | "
+            ":m7 relationship TYPE SUBJECT_ID OBJECT_ID SOURCE_ID | "
+            ":m7 approve KIND ID | :m7 query NAME [HOPS]"
+        )
+
+    def _m8(self, argument: str) -> None:
+        tokens = shlex.split(argument)
+        if tokens and tokens[0].casefold() not in {"audit", "run"}:
+            self._write("Usage: :m8 audit [global|SESSION]")
+            return
+        scope = tokens[1] if len(tokens) > 1 else None
+        if scope == "session":
+            scope = self.session_id
+        if scope is not None and scope not in {"global", self.session_id}:
+            self._write("Usage: :m8 audit [global|session]")
+            return
+        report = MemoryAuditService(self.manager._get_store(), enabled=True).run(scope=scope)
+        self._write(
+            f"M8 read-only audit run={report.run_id} scanned={report.scanned} "
+            f"findings={len(report.findings)} proposals={len(report.proposals)}"
+        )
+        if not report.findings:
+            self._write("  (no integrity findings)")
+        for finding in report.findings:
+            self._write(
+                f"  {finding.severity} {finding.kind} {finding.record_kind}#{finding.record_id} "
+                f"{finding.concept} = {finding.value} sources={finding.source_ids}"
+            )
+            self._write(f"    {finding.message}; recommendation={finding.recommendation}")
+        for item in report.diagnostics:
+            self._write(f"  diagnostic={item}")
+
     def _evidence(self, query: str) -> None:
         query = query.strip()
         if not query:
@@ -221,6 +464,12 @@ class MemoryV2Console:
             self._show_history(argument or None)
         elif command in {"diagnostics", "diag"}:
             self._show_diagnostics()
+        elif command == "m6":
+            self._m6(argument)
+        elif command == "m7":
+            self._m7(argument)
+        elif command == "m8":
+            self._m8(argument)
         else:
             self._write(f"Unknown command :{command}. Use :help.")
         return True

@@ -134,6 +134,30 @@ timestamp and `PRIMORA_USER_TIMEZONE`.  Inspect the provider diagnostics for
 empty content, reasoning fallback, JSON parsing, and timing.  Delete the
 temporary database after the run.
 
+The console also exposes the M6–M8 review controls.  These operate only on the
+isolated database printed at startup:
+
+```text
+:m6 preview                 # build a dry-run proposal list
+:m6 sources 1               # show source messages and exact quotes
+:m6 apply 1                 # explicitly admit one derived candidate
+:m6 apply-all               # explicitly admit every displayed candidate
+:m7 entity Flarnic PROJECT SOURCE_ID
+:m7 approve entity ENTITY_ID
+:m7 alias ENTITY_ID Flar SOURCE_ID
+:m7 approve alias ALIAS_ID
+:m7 relationship part_of SUBJECT_ID OBJECT_ID SOURCE_ID
+:m7 approve relationship RELATIONSHIP_ID
+:m7 query Flar              # bounded, source-cited connections
+:m8 audit session           # read-only integrity findings
+```
+
+`SOURCE_ID` must identify a user message in the current session.  Entity,
+alias and relationship creation first checks that constraint, then delegates
+candidate creation and approval to Prime's existing validation APIs.  M6
+application remains candidate status and displays the supporting sources;
+M8 produces findings and recommendations without modifying rows.
+
 ## Limitations and next step
 
 M6 does not invent aliases, merge unlike concepts, or infer causes and
