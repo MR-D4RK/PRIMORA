@@ -6,24 +6,25 @@ Aurora any PRIMORA architecture facts or provide hardcoded dialogue responses.
 
 ## Setup (Windows PowerShell)
 
-Start your existing llama.cpp Qwen server on \`http://127.0.0.1:8080/v1\`.
+Start your existing llama.cpp Qwen server on `http://127.0.0.1:8080/v1`.
 Do **not** point the runner at production databases. The runner overrides
 PRIMORA_MEMORY_V2_DB and creates a **fresh synthetic-only SQLite file for each
 case**; no legacy migration takes place. It also disables outbound research.
 
-\`\`\`powershell
+```powershell
 git fetch origin
 git switch validation/memory-v2-final-gate
 git pull --ff-only
 $env:PRIMORA_OPENAI_URL = "http://127.0.0.1:8080/v1"
 $env:PRIMORA_OPENAI_MODEL = "Qwen3.5-9B-Q4_K_M"
 python BENCHMARKS/memory_gate/runner.py --dry-run
+python -m unittest discover -s BENCHMARKS/memory_gate -p "test_*.py"
 python BENCHMARKS/memory_gate/runner.py --seed 20261027
 python BENCHMARKS/memory_gate/runner.py --seed 20261028
-\`\`\`
+```
 
 Each run writes logs, a separate disposable DB for each case, and a
-\`results.json\` under \`memory-gate-runs/\`. Keep this output out of Git. Each
+`results.json` under `BENCHMARKS/memory_gate/runs/`. Keep this output out of Git. Each
 test's second session is a fresh Aurora process with the **same test DB**, so
 cross-session recall and persistence are exercised. The CLI logs timing
 breakdowns and Prime capability calls.
@@ -41,7 +42,7 @@ the entire memory milestone.
 
 ## Human adjudication
 
-Review every answer in \`results.json\` plus the SQLite states and source rows.
+Review every answer in `results.json` plus the SQLite states and source rows.
 For each answered turn, record in a separate review sheet:
 - Supported / unsupported / partially supported, with user source IDs
 - Did Aurora invent an association between separate facts?
@@ -68,7 +69,7 @@ Any of these unmeasured criteria remains **PENDING**, not PASS. Record actual
 hardware, local model hash, prompt/config, DB path for the synthetic test,
 provider calls, and performance.
 
-The independent comparison methodology is in \`COMPETITORS.md\`.
+The independent comparison methodology is in `COMPETITORS.md`.
 After this gate passes, freeze Memory V2 expansion and resume Phase 2 on
-\`milestone/cognition-foundation\`; that phase must inspect **actual repository
+`milestone/cognition-foundation`; that phase must inspect **actual repository
 files** rather than receive a hardcoded PRIMORA map.

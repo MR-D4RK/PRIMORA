@@ -12,7 +12,6 @@ from pathlib import Path
 import random
 import re
 import sqlite3
-import statistics
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -182,7 +181,7 @@ def percentile(numbers, fraction):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cases", type=Path, default=DEFAULT_CASES)
-    parser.add_argument("--out", type=Path, default=Path("memory-gate-runs"))
+    parser.add_argument("--out", type=Path, default=Path("BENCHMARKS/memory_gate/runs"))
     parser.add_argument("--seed", type=int, default=20261027)
     parser.add_argument("--timeout", type=int, default=900,
                         help="Maximum seconds per CLI session")
