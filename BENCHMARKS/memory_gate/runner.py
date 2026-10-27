@@ -134,9 +134,18 @@ def source_audit(db_path):
             integrity = con.execute("PRAGMA quick_check").fetchone()[0]
             source_roles = dict(con.execute("SELECT id, role FROM messages"))
             rows = con.execute(
-                "SELECT id, authority, source_ids FROM states").fetchall()
+                "SELECT id, authority, source_ids, concept, value, "
+                "status, supersedes_id FROM states ORDER BY id").fetchall()
             violations = []
-            for state_id, authority, source_json in rows:
+            state_summary = []
+            for (state_id, authority, source_json, concept, value,
+                 status, supersedes_id) in rows:
+                state_summary.append({
+                    "id": state_id, "authority": authority,
+                    "source_ids": source_json, "concept": concept,
+                    "value": value, "status": status,
+                    "supersedes_id": supersedes_id,
+                })
                 if authority != "user":
                     continue
                 try:
@@ -170,8 +179,9 @@ def source_audit(db_path):
                 })
             return {
                 "sqlite_quick_check": integrity, "message_count": len(source_roles),
-                "state_count": len(rows), "episode_integrity_violations":
-                len(episodes), "violations": violations,
+                "state_count": len(rows), "state_summary": state_summary,
+                "episode_integrity_violations": len(episodes),
+                "violations": violations,
             }
     except (OSError, sqlite3.DatabaseError) as exc:
         return {"error": type(exc).__name__ + ": " + str(exc)}
