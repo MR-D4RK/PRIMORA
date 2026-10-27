@@ -101,6 +101,40 @@ def _preference_terms(text: str) -> set[str]:
     return terms
 
 
+# This is linguistic evidence checking, not an object/topic vocabulary.
+# A model cannot promote "enjoy" to "love", or "like" to "favorite",
+# merely because both have positive sentiment.
+_PREFERENCE_VERBS = {
+    "like": r"\b(?:like|likes|liked|liking)\b",
+    "love": r"\b(?:love|loves|loved|loving)\b",
+    "adore": r"\b(?:adore|adores|adored|adoring)\b",
+    "enjoy": r"\b(?:enjoy|enjoys|enjoyed|enjoying)\b",
+    "prefer": r"\b(?:prefer|prefers|preferred|preferring)\b",
+    "favorite": r"\b(?:favorite|favourite|favorites|favourites)\b",
+    "hate": r"\b(?:hate|hates|hated|hating)\b",
+    "dislike": r"\b(?:dislike|dislikes|disliked|disliking)\b",
+    "admire": r"\b(?:admire|admires|admired|admiring)\b",
+}
+_NEGATED_LIKE_CLAUSE = re.compile(
+    r"\b(?:do not|don't|no longer|never)\s+(?:really\s+)?like\b",
+    re.IGNORECASE,
+)
+
+
+def _source_preference_verbs(text: str) -> set[str]:
+    """Normalize inflection without conflating different preference strengths."""
+    text = text or ""
+    has_negated_like = bool(_NEGATED_LIKE_CLAUSE.search(text))
+    text = _NEGATED_LIKE_CLAUSE.sub(" ", text)
+    modes = {
+        label for label, pattern in _PREFERENCE_VERBS.items()
+        if re.search(pattern, text, flags=re.IGNORECASE)
+    }
+    if has_negated_like:
+        modes.add("dislike")
+    return modes
+
+
 def _preference_fingerprint(concept: str, value: str) -> set[str]:
     return _preference_terms(f"{concept} {value}")
 
@@ -294,6 +328,18 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
             return False, "rationale_not_source_supported"
         if re.match(r"^(?:you|someone|people|they)\b", rationale, re.I):
             return False, "rationale_not_user_authored"
+    if candidate.kind in {"preference", "state"}:
+        # Derivative statements with explicit affinity verbs must preserve the
+        # user's stated predicate. Neutral summaries without a verb continue
+        # through the existing evidence gates unchanged.
+        proposed_verbs = _source_preference_verbs(candidate.value)
+        if proposed_verbs:
+            source_verbs = set().union(*(
+                _source_preference_verbs(source.content)
+                for source in sources
+            ))
+            if not proposed_verbs.issubset(source_verbs):
+                return False, "preference_strength_not_source_supported"
     if candidate.kind == "preference":
         candidate_terms = _preference_fingerprint(
             candidate.concept, candidate.value
