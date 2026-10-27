@@ -60,6 +60,9 @@ class MemoryAdmissionGateway:
     def create_relationship(self, *args: Any, **kwargs: Any) -> int:
         return self.store.create_relationship(*args, **kwargs)
 
+    def create_observation(self, *args: Any, **kwargs: Any) -> int:
+        return self.store.create_observation(*args, **kwargs)
+
     def admit_user_candidates(
         self, session_id: str, message_id: int, candidates: list[Any]
     ) -> list[str]:
