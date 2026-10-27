@@ -1,0 +1,148 @@
+[
+  {
+    "id": "separated_preference_and_reason",
+    "sessions": [
+      {
+        "turns": [
+          {
+            "prompt": "I keep the {{object_a}} in my studio. I use it to sketch routes because drawing them helps me relax."
+          },
+          {
+            "prompt": "I also enjoy ambient music while editing photos."
+          }
+        ]
+      },
+      {
+        "turns": [
+          {
+            "prompt": "What do I use to sketch routes?",
+            "expect_contains": [
+              "{{object_a}}"
+            ]
+          },
+          {
+            "prompt": "And why do I use it?",
+            "expect_contains": [
+              "relax"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "correction_and_current_state",
+    "sessions": [
+      {
+        "turns": [
+          {
+            "prompt": "For travel notes I prefer the {{object_a}}."
+          },
+          {
+            "prompt": "I've changed my mind. I now prefer the {{object_b}} for travel notes. The {{object_a}} was my old choice."
+          }
+        ]
+      },
+      {
+        "turns": [
+          {
+            "prompt": "What's my current choice for travel notes?",
+            "expect_contains": [
+              "{{object_b}}"
+            ]
+          },
+          {
+            "prompt": "Which one did I prefer before?",
+            "expect_contains": [
+              "{{object_a}}"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "unrelated_reasons",
+    "sessions": [
+      {
+        "turns": [
+          {
+            "prompt": "I admire the {{object_a}} for its unusual shape and design."
+          },
+          {
+            "prompt": "I use the {{object_b}} because it helps me concentrate."
+          },
+          {
+            "prompt": "Why do I admire the first one?",
+            "expect_contains": [
+              "design"
+            ],
+            "expect_not_contains": [
+              "concentrate"
+            ]
+          }
+        ]
+      },
+      {
+        "turns": [
+          {
+            "prompt": "Why do I use the {{object_b}}?",
+            "expect_contains": [
+              "concentrate"
+            ],
+            "expect_not_contains": [
+              "design"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "hypothetical_vs_asserted",
+    "sessions": [
+      {
+        "turns": [
+          {
+            "prompt": "If I ever owned a {{object_a}}, I might keep it on my desk. I don't own one."
+          }
+        ]
+      },
+      {
+        "turns": [
+          {
+            "prompt": "Do I actually own the {{object_a}}?"
+          },
+          {
+            "prompt": "What was the plan I mentioned?"
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "unknown_and_source_integrity",
+    "sessions": [
+      {
+        "turns": [
+          {
+            "prompt": "I enjoy the sound of rainfall when I read."
+          }
+        ]
+      },
+      {
+        "turns": [
+          {
+            "prompt": "Do you know my favorite soup?"
+          },
+          {
+            "prompt": "Tell me what sound I enjoy during reading.",
+            "expect_contains": [
+              "rain"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+]
