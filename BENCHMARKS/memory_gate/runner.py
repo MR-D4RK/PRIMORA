@@ -133,6 +133,11 @@ def source_audit(db_path):
         with closing(sqlite3.connect(uri, uri=True)) as con:
             integrity = con.execute("PRAGMA quick_check").fetchone()[0]
             source_roles = dict(con.execute("SELECT id, role FROM messages"))
+            tables = {
+                row[0] for row in con.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()
+            }
             rows = con.execute(
                 "SELECT id, authority, source_ids, concept, value, "
                 "status, supersedes_id FROM states ORDER BY id").fetchall()
@@ -168,6 +173,41 @@ def source_audit(db_path):
                     violations.append({
                         "state_id": state_id, "error": "unparseable source IDs",
                     })
+
+            # Every durable user-authority table shares the same provenance
+            # invariant. Keep the audit schema-aware so old disposable
+            # fixtures without a newer table remain readable.
+            authority_tables = (
+                ("candidates", "candidate_id"),
+                ("entities", "entity_id"),
+                ("entity_aliases", "alias_id"),
+                ("relationships", "relationship_id"),
+                ("observations", "observation_id"),
+            )
+            authority_violations = 0
+            for table, id_name in authority_tables:
+                if table not in tables:
+                    continue
+                table_rows = con.execute(
+                    f"SELECT id, authority, source_ids FROM {table}"
+                ).fetchall()
+                for record_id, authority, source_json in table_rows:
+                    if authority != "user":
+                        continue
+                    try:
+                        pieces = str(source_json or "").split(",")
+                        ids = [int(piece.strip()) for piece in pieces
+                               if piece.strip()]
+                        if not ids or any(
+                                source_roles.get(item) != "user" for item in ids):
+                            raise ValueError("source is not a user message")
+                    except (ValueError, TypeError):
+                        authority_violations += 1
+                        violations.append({
+                            id_name: record_id,
+                            "table": table,
+                            "error": "user-authority record lacks user source",
+                        })
             episodes = con.execute(
                 "SELECT e.id FROM experience_events e LEFT JOIN messages m "
                 "ON e.source_message_id=m.id WHERE e.authority='user' "
@@ -181,6 +221,7 @@ def source_audit(db_path):
                 "sqlite_quick_check": integrity, "message_count": len(source_roles),
                 "state_count": len(rows), "state_summary": state_summary,
                 "episode_integrity_violations": len(episodes),
+                "authority_table_violations": authority_violations,
                 "violations": violations,
             }
     except (OSError, sqlite3.DatabaseError) as exc:

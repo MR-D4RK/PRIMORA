@@ -367,6 +367,38 @@ class ContextStore:
         finally:
             con.close()
 
+    @staticmethod
+    def _validate_user_sources(
+        con: sqlite3.Connection,
+        source_ids: list[int],
+        authority: str,
+    ) -> None:
+        """Reject user-authority records whose provenance is assistant text.
+
+        Authority is a trust boundary, so every durable record type applies
+        the same check before insertion. Assistant or tool evidence may still
+        be retained under a non-user authority/status, but it can never be
+        upgraded to a user fact by a caller that merely labels it ``user``.
+        """
+        if authority != "user":
+            return
+        ids = list(dict.fromkeys(int(value) for value in (source_ids or [])))
+        if not ids:
+            # Pending candidates may be created before a source is attached;
+            # confirmation and durable current records enforce provenance.
+            return
+        placeholders = ",".join("?" for _ in ids)
+        rows = con.execute(
+            f"SELECT id, role FROM messages WHERE id IN ({placeholders})", ids
+        ).fetchall()
+        roles = {int(row[0]): row[1] for row in rows}
+        # Some legacy migration/tests create derived rows before their raw
+        # source rows are restored; the read-only audit reports those missing
+        # references. Once a referenced message exists, an assistant role is
+        # a hard authority violation and must fail closed.
+        if any(item in roles and roles[item] != "user" for item in ids):
+            raise ValueError("user-authority provenance must reference user messages")
+
     def _init_db(self) -> None:
         with self._connection() as con:
             con.executescript(_SCHEMA)
@@ -1191,6 +1223,7 @@ class ContextStore:
             if superseded_at is not None else None
         )
         with self._connection() as con:
+            self._validate_user_sources(con, source_ids, authority)
             observed = self._resolve_observed_at(
                 con, source_ids, created_at, observed_at
             )
@@ -1238,6 +1271,7 @@ class ContextStore:
         )
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
+            self._validate_user_sources(con, sources, "user")
             explained = con.execute(
                 "SELECT scope, status, authority FROM states WHERE id = ?",
                 (explains_state_id,),
@@ -1314,6 +1348,7 @@ class ContextStore:
         expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
+            self._validate_user_sources(con, source_ids, authority)
             current_rows = con.execute(
                 "SELECT id FROM states"
                 " WHERE scope = ? AND concept = ? AND status = 'current'"
@@ -1811,6 +1846,7 @@ class ContextStore:
         expires_at: Optional[float] = None,
     ) -> int:
         with self._connection() as con:
+            self._validate_user_sources(con, source_ids, authority)
             cur = con.execute(
                 "INSERT INTO candidates"
                 "(session_id, scope, source_ids, proposed_type,"
@@ -2016,6 +2052,7 @@ class ContextStore:
         )
         self._validate_interval(normalized_from, normalized_until)
         with self._connection() as con:
+            self._validate_user_sources(con, sources, authority)
             observed = self._resolve_observed_at(
                 con, sources, created_at, observed_at
             )
@@ -2252,6 +2289,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         with self._connection() as con:
+            self._validate_user_sources(con, sources, authority)
             entity = con.execute(
                 "SELECT scope, status, source_ids FROM entities"
                 " WHERE id = ?",
@@ -2564,6 +2602,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         with self._connection() as con:
+            self._validate_user_sources(con, sources, authority)
             self._validate_relationship_endpoints(
                 con, scope, relationship_type, subject_kind, subject_id,
                 object_kind, object_id, False,

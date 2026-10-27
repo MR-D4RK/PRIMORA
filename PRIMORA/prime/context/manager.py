@@ -406,10 +406,30 @@ class ContextManager:
         persist_started = time.perf_counter()
         try:
             store = self._get_store()
-            seq = store.count(session_id) + 1
-            message_id, _is_new, _diag = store.append(
-                session_id, seq, "assistant", statement
-            )
+            message_id = None
+            if request_provenance == "user":
+                normalized = " ".join(statement.casefold().split())
+                user_sources = [
+                    row for row in store.fetch_range(session_id, 0, 500)
+                    if row.role == "user"
+                    and " ".join(row.content.casefold().split()) == normalized
+                ]
+                if not user_sources:
+                    timings["persist_ms"] = (
+                        time.perf_counter() - persist_started
+                    ) * 1000
+                    return finish({
+                        "status": "rejected",
+                        "reason": "user_provenance_requires_matching_user_source",
+                    })
+                # User-authority learning reuses the immutable user source;
+                # it never creates an assistant row as the evidence anchor.
+                message_id = user_sources[-1].message_id
+            else:
+                seq = store.count(session_id) + 1
+                message_id, _is_new, _diag = store.append(
+                    session_id, seq, "assistant", statement
+                )
         except Exception as exc:
             timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
             return finish({"status": "rejected", "reason": f"persist_failed: {exc}"})

@@ -80,7 +80,9 @@ def test_learn_result_reports_jev_and_admission_latency(tmp_path):
     from PRIMORA.prime.context.manager import ContextManager
 
     provider = _JevProvider(_jev_json())
-    summary = ContextManager(db_path=tmp_path / "learn.db").learn(
+    manager = ContextManager(db_path=tmp_path / "learn.db")
+    manager._get_store().append("s", 0, "user", "I like amber")
+    summary = manager.learn(
         "I like amber", "user", ModelJev(provider), session_id="s")
     assert summary["status"] == "learned"
     assert summary["timings_ms"].keys() >= {

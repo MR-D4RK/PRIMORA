@@ -48,6 +48,31 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(report["state_count"], 4)
             self.assertEqual(len(report["state_summary"]), 4)
 
+    def test_source_roles_cover_all_user_authority_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "test.db"
+            with closing(sqlite3.connect(db)) as con:
+                con.executescript(
+                    "CREATE TABLE messages(id INTEGER, role TEXT);"
+                    "CREATE TABLE candidates(id INTEGER, authority TEXT, source_ids TEXT);"
+                    "CREATE TABLE entities(id INTEGER, authority TEXT, source_ids TEXT);"
+                    "CREATE TABLE entity_aliases(id INTEGER, authority TEXT, source_ids TEXT);"
+                    "CREATE TABLE relationships(id INTEGER, authority TEXT, source_ids TEXT);"
+                    "CREATE TABLE observations(id INTEGER, authority TEXT, source_ids TEXT);"
+                    "CREATE TABLE states(id INTEGER, authority TEXT, source_ids TEXT, "
+                    "concept TEXT, value TEXT, status TEXT, supersedes_id INTEGER);"
+                    "CREATE TABLE experience_events(id INTEGER, authority TEXT, source_message_id INTEGER);"
+                )
+                con.execute("INSERT INTO messages VALUES(1, 'user')")
+                con.execute("INSERT INTO messages VALUES(2, 'assistant')")
+                for table in ("candidates", "entities", "entity_aliases",
+                              "relationships", "observations"):
+                    con.execute(f"INSERT INTO {table} VALUES(1, 'user', '2')")
+                con.commit()
+            report = source_audit(db)
+            self.assertEqual(report["authority_table_violations"], 5)
+            self.assertEqual(len(report["violations"]), 5)
+
     def test_isolation_overrides_operator_memory_db(self):
         with tempfile.TemporaryDirectory() as tmp:
             synthetic = Path(tmp) / "synthetic.db"

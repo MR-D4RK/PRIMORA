@@ -30,8 +30,10 @@ cross-session recall and persistence are exercised. The CLI logs timing
 breakdowns and Prime capability calls.
 
 **What the runner actually verifies:** answer-text smoke probes; DB quick
-check; that source IDs on user-authority states and episodes point to real
-user messages; restart and persistence; observed total latency p50/p95.
+check; that source IDs on every present user-authority memory table (states,
+candidates, entities, aliases, relationships, observations, and episodes)
+point to real user messages; restart and persistence; observed total latency
+p50/p95.
 
 **What it does NOT establish:** semantic accuracy from equivalent paraphrases,
 absence of every invented claim, perfect correction semantics, model call

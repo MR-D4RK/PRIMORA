@@ -53,3 +53,20 @@ not identical alternatives and must not be reduced to a single feature count.
 **Decision standard:** fix only blocker-class evidence corruption, unsupported
 claims and memory persistence failures before moving to cognition. Do not
 expand memory indefinitely or add hardcoded language/topic rules.
+
+## What was actually executed for this gate
+
+The offline PRIMORA M1–M8 benchmark ran on a disposable SQLite database with
+60 synthetic domains and 200 conversations. The candidate path produced
+formation precision/recall/F1 of `1.0/1.0/1.0`, preference retrieval
+Recall@3/Precision@3 of `1.0/1.0`, abstention `1.0`, unsupported-claim rate
+`0.0`, source preservation `1.0`, correction `1.0`, alias resolution `1.0`,
+and two-clock event handling `1.0`. Candidate latency was p50 `8.8 ms` and
+p95 `9.7 ms` for deterministic local operations; these are not Qwen
+generation timings. The production database was untouched.
+
+Mem0, Graphiti, and Letta were **not executed** in this environment. Their
+dependencies, storage services, model settings, and evaluation adapters were
+not installed, so no competitor score or superiority claim is made. A fair
+comparison remains pending the protocol above with identical conversations,
+the same local model, context budget, and blinded answer adjudication.

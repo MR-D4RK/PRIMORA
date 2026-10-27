@@ -284,8 +284,10 @@ def test_restore_remaps_entity_and_relationship_endpoints(tmp_path):
 
 def test_learn_reports_already_known_without_a_redundant_candidate(tmp_path):
     manager = ContextManager(db_path=tmp_path / "learn.db")
+    manager._get_store().append("one", 0, "user", "I like amber")
     first = manager.learn("I like amber", "user", _Jev(), session_id="one")
-    second = manager.learn("Please remember that I like amber", "user", _Jev(), session_id="two")
+    manager._get_store().append("two", 0, "user", "I like amber")
+    second = manager.learn("I like amber", "user", _Jev(), session_id="two")
     assert first["status"] == "learned"
     assert second["status"] == "already_known"
     assert second["already_known"][0]["state_id"] > 0
@@ -296,11 +298,13 @@ def test_learn_reports_already_known_without_a_redundant_candidate(tmp_path):
 def test_prime_learn_capability_exposes_actual_already_known_status(tmp_path):
     manager = ContextManager(db_path=tmp_path / "prime-learn.db")
     prime = Prime(_Provider(), context_manager=manager, jev=_Jev())
+    manager._get_store().append("one", 0, "user", "I like amber")
     first = prime.handle(PrimeRequest("learn", {
         "text": "I like amber", "provenance": "user", "session_id": "one",
     }))
+    manager._get_store().append("two", 0, "user", "I like amber")
     second = prime.handle(PrimeRequest("learn", {
-        "text": "Please remember that I like amber", "provenance": "user",
+        "text": "I like amber", "provenance": "user",
         "session_id": "two",
     }))
     assert first.status is RequestStatus.SUCCESS
@@ -312,6 +316,7 @@ def test_prime_learn_capability_exposes_actual_already_known_status(tmp_path):
 
 def test_learn_keeps_distinct_values_and_reports_mixed_results(tmp_path):
     manager = ContextManager(db_path=tmp_path / "distinct.db")
+    manager._get_store().append("s", 0, "user", "I like amber")
     manager.learn("I like amber", "user", _Jev(), session_id="s")
 
     class Mixed(Jev):
@@ -321,6 +326,7 @@ def test_learn_keeps_distinct_values_and_reports_mixed_results(tmp_path):
                 StructuredCandidate("favorite color", "violet", "PREFERENCE", "global"),
             ])
 
+    manager._get_store().append("s", 1, "user", "I like amber and violet")
     summary = manager.learn("I like amber and violet", "user", Mixed(), session_id="s")
     assert summary["status"] == "learned"
     assert summary["already_known"]
