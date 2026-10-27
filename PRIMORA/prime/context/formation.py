@@ -19,6 +19,7 @@ from typing import Any, Optional
 
 from PRIMORA.prime.contract import RequestStatus
 from .episodes import extract_experience_claim
+from .admission import MemoryAdmissionGateway
 
 MEMORY_KINDS = frozenset({"preference", "state", "event", "relationship", "observation"})
 CLAIM_KINDS = frozenset({
@@ -385,6 +386,7 @@ def _admit_rationale(
     preference_state_id: int,
     candidate: TypedMemoryCandidate,
     message: Any,
+    admission: Optional[MemoryAdmissionGateway] = None,
 ) -> list[str]:
     """Persist a provider rationale only after source validation.
 
@@ -409,7 +411,8 @@ def _admit_rationale(
             [row.state_id for row in current],
             transition_time=transition,
         )
-    rationale_id, relationship_id = store.create_state_with_explains(
+    admission = admission or MemoryAdmissionGateway(store)
+    rationale_id, relationship_id = admission.create_state_with_explains(
         session_id, scope, concept, rationale, candidate.source_ids,
         preference_state_id, memory_type="RATIONALE", confidence=candidate.confidence,
         observed_at=getattr(message, "timestamp", None),
@@ -446,6 +449,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
     """Validate and admit proposals; deterministic extraction remains separate."""
     timed_store = _TimingStore(store)
     store = timed_store
+    admission = MemoryAdmissionGateway(store)
     started = time.perf_counter()
     provider_started = time.perf_counter()
     candidates, diagnostic = provider_proposals(provider, message, session_id)
@@ -497,7 +501,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
         # Relationships and observations are reviewable proposals until an
         # entity endpoint or explicit observation admission is available.
         if candidate.kind in {"relationship", "observation"}:
-            held.append(store.create_candidate(
+            held.append(admission.create_pending(
                 session_id, "global" if candidate.scope == "global" else session_id,
                 candidate.source_ids, candidate.kind, candidate.concept,
                 candidate.value, candidate.rationale, "user", candidate.confidence,
@@ -526,7 +530,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
                 )
             except Exception as exc:
                 diagnostics.append(f"event_proposal_held:{exc}")
-                held.append(store.create_candidate(
+                held.append(admission.create_pending(
                     session_id, session_id, candidate.source_ids, candidate.kind,
                     candidate.concept, candidate.value, candidate.rationale,
                     "user", candidate.confidence,
@@ -591,10 +595,11 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
                 admitted.append(same.state_id)
                 diagnostics.extend(_admit_rationale(
                     store, session_id, scope, same.state_id, candidate, message,
+                    admission=admission,
                 ))
                 continue
             if predecessor_ids:
-                state_id = store.create_state_successor(
+                state_id = admission.create_state_successor(
                     session_id, scope, candidate.concept, candidate.value,
                     candidate.source_ids, predecessor_ids, memory_type=(
                         "PREFERENCE" if candidate.kind == "preference" else "FACT"
@@ -603,7 +608,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
                     valid_until=candidate.valid_until,
                 )
             else:
-                state_id = store.create_state(
+                state_id = admission.create_state(
                     session_id, scope, candidate.concept, candidate.value,
                     candidate.source_ids, memory_type=(
                         "PREFERENCE" if candidate.kind == "preference" else "FACT"
@@ -614,6 +619,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             admitted.append(state_id)
             diagnostics.extend(_admit_rationale(
                 store, session_id, scope, state_id, candidate, message,
+                admission=admission,
             ))
         except Exception as exc:
             diagnostics.append(f"proposal_write_failed:{exc}")

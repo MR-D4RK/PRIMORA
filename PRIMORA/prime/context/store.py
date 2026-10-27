@@ -314,6 +314,18 @@ CREATE TABLE IF NOT EXISTS formation_status (
 );
 CREATE INDEX IF NOT EXISTS idx_formation_status_session
     ON formation_status(session_id, status);
+CREATE TABLE IF NOT EXISTS formation_jobs (
+    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_formation_jobs_status
+    ON formation_jobs(status, updated_at, job_id);
 """
 
 _FTS_SCHEMA = """
@@ -350,6 +362,32 @@ class ContextStore:
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("PRAGMA synchronous=NORMAL;")
         return con
+
+    @staticmethod
+    def _validate_user_source_roles(
+        con: sqlite3.Connection,
+        source_ids: list[int],
+        authority: str,
+    ) -> None:
+        """Reject user-authority writes backed by non-user rows.
+
+        Old imported fixtures can contain references whose raw message is no
+        longer present, so missing rows remain tolerated here and are reported
+        by migration/audit code.  When a referenced row exists, however, its
+        role is authoritative: non-user output can never be promoted to a
+        user-authority memory record.
+        """
+        if authority != "user":
+            return
+        for source_id in dict.fromkeys(int(value) for value in (source_ids or [])):
+            row = con.execute(
+                "SELECT role FROM messages WHERE id = ?", (source_id,)
+            ).fetchone()
+            if row is not None and str(row[0]).casefold() != "user":
+                raise ValueError(
+                    "user-authority memory requires a user source "
+                    f"(source_id={source_id}, role={row[0]!r})"
+                )
 
     @contextmanager
     def _connection(self):
@@ -564,6 +602,85 @@ class ContextStore:
                 "diagnostics": details, "updated_at": row[5],
             })
         return out
+
+    def enqueue_formation_job(self, message_id: int, session_id: str) -> bool:
+        """Queue one typed-formation job idempotently."""
+        now = time.time()
+        with self._connection() as con:
+            cur = con.execute(
+                "INSERT OR IGNORE INTO formation_jobs"
+                "(message_id, session_id, status, attempts, last_error, created_at, updated_at)"
+                " VALUES (?, ?, 'pending', 0, '', ?, ?)",
+                (int(message_id), session_id, now, now),
+            )
+            return bool(cur.rowcount)
+
+    def claim_formation_jobs(self, limit: int = 8) -> list[dict[str, Any]]:
+        """Claim pending/stale jobs transactionally for restart-safe draining."""
+        limit = max(1, min(int(limit), 100))
+        now = time.time()
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            # A crashed worker leaves processing behind. Requeue it on the
+            # next drain; jobs are idempotent by message_id.
+            con.execute(
+                "UPDATE formation_jobs SET status='pending', updated_at=? "
+                "WHERE status='processing'", (now,)
+            )
+            rows = con.execute(
+                "SELECT job_id, message_id, session_id, attempts FROM formation_jobs "
+                "WHERE status IN ('pending', 'failed') AND attempts < 5 "
+                "ORDER BY job_id LIMIT ?", (limit,)
+            ).fetchall()
+            jobs = []
+            for job_id, message_id, session_id, attempts in rows:
+                con.execute(
+                    "UPDATE formation_jobs SET status='processing', attempts=?, updated_at=? "
+                    "WHERE job_id=? AND status IN ('pending', 'failed')",
+                    (int(attempts) + 1, now, int(job_id)),
+                )
+                jobs.append({
+                    "job_id": int(job_id), "message_id": int(message_id),
+                    "session_id": session_id, "attempts": int(attempts) + 1,
+                })
+            return jobs
+
+    def finish_formation_job(
+        self, job_id: int, status: str, error: str = "",
+    ) -> None:
+        if status not in ("complete", "failed", "pending"):
+            raise ValueError("invalid formation job status")
+        with self._connection() as con:
+            con.execute(
+                "UPDATE formation_jobs SET status=?, last_error=?, updated_at=? "
+                "WHERE job_id=?",
+                (status, str(error or ""), time.time(), int(job_id)),
+            )
+
+    def formation_jobs(
+        self, session_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        query = (
+            "SELECT job_id, message_id, session_id, status, attempts, "
+            "last_error, created_at, updated_at FROM formation_jobs WHERE 1=1"
+        )
+        params: list[Any] = []
+        if session_id is not None:
+            query += " AND session_id=?"
+            params.append(session_id)
+        if status is not None:
+            query += " AND status=?"
+            params.append(status)
+        query += " ORDER BY job_id"
+        with self._connection() as con:
+            rows = con.execute(query, params).fetchall()
+        return [
+            {"job_id": r[0], "message_id": r[1], "session_id": r[2],
+             "status": r[3], "attempts": r[4], "last_error": r[5],
+             "created_at": r[6], "updated_at": r[7]}
+            for r in rows
+        ]
 
     def save_experience_event(
         self, session_id: str, source_message_id: int,
@@ -1191,6 +1308,7 @@ class ContextStore:
             if superseded_at is not None else None
         )
         with self._connection() as con:
+            self._validate_user_source_roles(con, source_ids, authority)
             observed = self._resolve_observed_at(
                 con, source_ids, created_at, observed_at
             )
@@ -1238,6 +1356,7 @@ class ContextStore:
         )
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
+            self._validate_user_source_roles(con, sources, "user")
             explained = con.execute(
                 "SELECT scope, status, authority FROM states WHERE id = ?",
                 (explains_state_id,),
@@ -1314,6 +1433,7 @@ class ContextStore:
         expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
+            self._validate_user_source_roles(con, source_ids, authority)
             current_rows = con.execute(
                 "SELECT id FROM states"
                 " WHERE scope = ? AND concept = ? AND status = 'current'"
@@ -1811,6 +1931,7 @@ class ContextStore:
         expires_at: Optional[float] = None,
     ) -> int:
         with self._connection() as con:
+            self._validate_user_source_roles(con, source_ids, authority)
             cur = con.execute(
                 "INSERT INTO candidates"
                 "(session_id, scope, source_ids, proposed_type,"
@@ -2016,6 +2137,7 @@ class ContextStore:
         )
         self._validate_interval(normalized_from, normalized_until)
         with self._connection() as con:
+            self._validate_user_source_roles(con, sources, authority)
             observed = self._resolve_observed_at(
                 con, sources, created_at, observed_at
             )
@@ -2252,6 +2374,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         with self._connection() as con:
+            self._validate_user_source_roles(con, sources, authority)
             entity = con.execute(
                 "SELECT scope, status, source_ids FROM entities"
                 " WHERE id = ?",
@@ -2564,6 +2687,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         with self._connection() as con:
+            self._validate_user_source_roles(con, sources, authority)
             self._validate_relationship_endpoints(
                 con, scope, relationship_type, subject_kind, subject_id,
                 object_kind, object_id, False,

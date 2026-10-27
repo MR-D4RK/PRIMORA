@@ -44,6 +44,7 @@ from .models import (
     noop_memory,
 )
 from .working import WorkingMemory
+from .admission import MemoryAdmissionGateway
 
 __all__ = [
     "COMPACT_AFTER_MESSAGES",
@@ -86,6 +87,7 @@ __all__ = [
     "AuditReport",
     "StoredMessage",
     "WorkingMemory",
+    "MemoryAdmissionGateway",
     "estimate_tokens",
     "noop_memory",
 ]

@@ -49,6 +49,7 @@ from .models import (
     noop_memory,
 )
 from .store import ContextStore
+from .admission import MemoryAdmissionGateway
 
 DEFAULT_SESSION_ID = "default"
 
@@ -257,6 +258,11 @@ class ContextManager:
             )
         self._memory_v2_enabled = bool(enable_memory_v2)
         self._store: Optional[ContextStore] = None
+        self._admission: Optional[MemoryAdmissionGateway] = None
+        self._formation_deferred = (
+            os.environ.get("PRIMORA_MEMORY_FORMATION_DEFERRED", "0")
+            .strip().lower() in ("1", "true", "yes", "on")
+        )
         # M6 LIVE. Hybrid retrieval is the returned result. Defaults on;
         # set hybrid_retrieval=False (or PRIMORA_HYBRID_RETRIEVAL=0) to roll
         # back to the lexical-only path, which is retained unchanged.
@@ -285,6 +291,20 @@ class ContextManager:
         # loop for per-turn diagnostics. They are observability only and never
         # influence admission or retrieval.
         self._last_formation_timings: dict[str, float] = {}
+
+    @property
+    def admission(self) -> MemoryAdmissionGateway:
+        """The one Prime memory write gateway for this store."""
+        if self._admission is None:
+            self._admission = MemoryAdmissionGateway(self._get_store())
+        return self._admission
+
+    @property
+    def formation_deferred(self) -> bool:
+        return self._formation_deferred
+
+    def set_formation_deferred(self, enabled: bool) -> None:
+        self._formation_deferred = bool(enabled)
 
     # ------------------------------------------------------------------
     # M6 live-switch surface
@@ -365,10 +385,9 @@ class ContextManager:
         invents no schema of its own. It calls three existing mechanisms, in
         the order the memory system already uses:
 
-        1. ``store.append`` persists Aurora's sentence as an *assistant*
-           message. Assistant-authored statements are not auto-admitted by
-           formation, so the sentence cannot become memory merely by being
-           written down, and its id is the provenance anchor.
+        1. A ``user`` provenance request must resolve to an existing immutable
+           user message. Other provenance classes are anchored to a newly
+           appended assistant row and remain held/reviewable.
         2. ``store.create_candidate`` records Jev's structured reading as a
            pending candidate carrying the provenance as its ``authority``.
         3. ``state.confirm_pending`` promotes it, and only if the lifecycle
@@ -406,10 +425,37 @@ class ContextManager:
         persist_started = time.perf_counter()
         try:
             store = self._get_store()
-            seq = store.count(session_id) + 1
-            message_id, _is_new, _diag = store.append(
-                session_id, seq, "assistant", statement
-            )
+            if request_provenance == "user":
+                # ``learn`` is invoked after Aurora interprets a turn.  The
+                # interpreted sentence is assistant-authored and therefore
+                # cannot serve as user evidence.  User authority is accepted
+                # only when the exact claim already exists in an immutable
+                # user message for this session.
+                normalized = " ".join(statement.casefold().split())
+                source = next(
+                    (
+                        item for item in reversed(
+                            store.fetch_range(session_id, 0, None, limit=5000)
+                        )
+                        if item.role == "user"
+                        and " ".join(item.content.casefold().split()) == normalized
+                    ),
+                    None,
+                )
+                if source is None:
+                    timings["persist_ms"] = (
+                        time.perf_counter() - persist_started
+                    ) * 1000
+                    return finish({
+                        "status": "rejected",
+                        "reason": "user_provenance_requires_matching_user_source",
+                    })
+                message_id = source.message_id
+            else:
+                seq = store.count(session_id) + 1
+                message_id, _is_new, _diag = store.append(
+                    session_id, seq, "assistant", statement
+                )
         except Exception as exc:
             timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
             return finish({"status": "rejected", "reason": f"persist_failed: {exc}"})
@@ -525,17 +571,12 @@ class ContextManager:
                 )
                 continue
             try:
-                candidate_id = store.create_candidate(
-                    session_id,
-                    scope,
-                    [message_id],
-                    proposed_type=candidate.memory_type or "FACT",
-                    proposed_concept=candidate.concept,
-                    proposed_value=candidate.value,
-                    proposed_rationale=candidate.rationale,
+                candidate_id = self.admission.create_pending(
+                    session_id, scope, [message_id],
+                    candidate.memory_type or "FACT", candidate.concept,
+                    candidate.value, candidate.rationale,
                     authority=request_provenance,
                     confidence=candidate.confidence,
-                    status="pending",
                 )
             except Exception as exc:
                 diagnostics.append(f"learn_failed: candidate write: {exc}")
@@ -552,9 +593,7 @@ class ContextManager:
 
             # The existing admission gate. It re-validates the candidate and
             # refuses anything without a concept, a type, or provenance.
-            from PRIMORA.prime.context import state as state_mod
-
-            confirm = state_mod.confirm_pending(store, session_id, candidate_id)
+            confirm = self.admission.confirm_pending(session_id, candidate_id)
             diagnostics.extend(confirm)
             if any(d.startswith("state_failed") for d in confirm):
                 held.append(record)
@@ -1867,11 +1906,10 @@ class ContextManager:
         scope_key = "global" if scope == "global" else session_id
         if not candidates:
             try:
-                cid = store.create_candidate(
+                cid = self.admission.create_pending(
                     session_id, scope_key, list(source_ids or []),
-                    proposed_type="UNCERTAIN", proposed_concept="",
-                    proposed_value=text.strip()[:200], authority="user",
-                    confidence=0.3, status="pending",
+                    "UNCERTAIN", "", text.strip()[:200],
+                    authority="user", confidence=0.3,
                 )
                 ids.append(cid)
                 diagnostics.append("candidate_pending: uncertain promotion")
@@ -1894,13 +1932,10 @@ class ContextManager:
                 # Legacy X-is-Y shapes carry no type; they assert a plain
                 # fact. Genuinely structureless promotions stay UNCERTAIN
                 # via the branch above, never here.
-                cid = store.create_candidate(
+                cid = self.admission.create_pending(
                     session_id, cand_scope_key, list(source_ids or []),
-                    proposed_type=cand.mtype or "FACT",
-                    proposed_concept=cand.concept,
-                    proposed_value=cand.value,
-                    proposed_rationale=cand.rationale, authority="user",
-                    confidence=0.3, status="pending",
+                    cand.mtype or "FACT", cand.concept, cand.value,
+                    cand.rationale, authority="user", confidence=0.3,
                 )
                 ids.append(cid)
                 diagnostics.append(
@@ -2487,6 +2522,7 @@ class ContextManager:
                     # deterministic extractor above always runs first, so a
                     # provider timeout or malformed response cannot remove
                     # legacy behavior or admit an unsupported claim.
+                    formation_pending = False
                     if (
                         role == "user"
                         and self._memory_v2_enabled
@@ -2497,15 +2533,11 @@ class ContextManager:
                                 "typed_formation:skipped_already_processed_source"
                             )
                         else:
-                            typed = formation_mod.apply_proposals(
-                                store, session_id, store.fetch_message(message_id),
-                                self._formation_provider,
-                            )
-                            self._last_formation_timings = dict(typed.timings_ms)
-                            formation_diags.extend(
-                                [f"typed_formation:{item}"
-                                 for item in typed.diagnostics]
-                            )
+                            store.enqueue_formation_job(message_id, session_id)
+                            formation_pending = True
+                            formation_diags.append("typed_formation:queued")
+                            if not self._formation_deferred:
+                                formation_diags.extend(self.drain_formation())
                     if role == "user":
                         formation_diags.extend(
                             self._extract_entities(
@@ -2521,10 +2553,13 @@ class ContextManager:
                         )) for item in formation_diags
                     )
                     try:
+                        final_status = (
+                            "processing" if formation_pending and
+                            self._formation_deferred else
+                            ("incomplete" if failed else "complete")
+                        )
                         store.set_formation_status(
-                            message_id, session_id,
-                            "incomplete" if failed else "complete",
-                            formation_diags,
+                            message_id, session_id, final_status, formation_diags,
                         )
                     except Exception as e:
                         diagnostics.append(f"formation_status_failed: {e}")
@@ -2547,6 +2582,63 @@ class ContextManager:
                 session_id=session_id, status=status)
         except Exception:
             return []
+
+    def formation_jobs(self, session_id: Optional[str] = None,
+                       status: Optional[str] = None) -> list[dict[str, Any]]:
+        """Read durable formation work without mutating the queue."""
+        try:
+            return self._get_store().formation_jobs(session_id, status)
+        except Exception:
+            return []
+
+    def drain_formation(self, limit: int = 8) -> list[str]:
+        """Resume queued typed formation exactly once per source message.
+
+        Raw history and deterministic formation are already durable. This
+        worker only handles model-backed proposals; a crash leaves a job that
+        the next drain can safely reclaim because admission is idempotent.
+        """
+        if not self._memory_v2_enabled or self._formation_provider is None:
+            return ["formation_drain:provider_not_configured"]
+        store = self._get_store()
+        diagnostics: list[str] = []
+        for job in store.claim_formation_jobs(limit):
+            message = store.fetch_message(job["message_id"])
+            if message is None or message.role != "user":
+                error = "source_message_not_found_or_not_user"
+                store.finish_formation_job(job["job_id"], "failed", error)
+                diagnostics.append(f"formation_job_failed:{job['job_id']}:{error}")
+                continue
+            try:
+                typed = formation_mod.apply_proposals(
+                    store, job["session_id"], message, self._formation_provider,
+                )
+                self._last_formation_timings = dict(typed.timings_ms)
+                items = [f"typed_formation:{item}" for item in typed.diagnostics]
+                failed = any(item.startswith("typed_formation:provider_")
+                             or item.startswith("typed_formation:malformed")
+                             for item in items)
+                store.finish_formation_job(
+                    job["job_id"], "failed" if failed else "complete",
+                    "provider_or_parse_failure" if failed else "",
+                )
+                # Provider/JSON failures are observable job failures, but the
+                # raw user turn and deterministic formation completed safely;
+                # preserve the historical "complete" conversation status so
+                # an unavailable model never breaks ordinary replies.
+                store.set_formation_status(
+                    message.message_id, job["session_id"],
+                    "complete", items,
+                )
+                diagnostics.extend(items)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                store.finish_formation_job(job["job_id"], "failed", error)
+                store.set_formation_status(
+                    message.message_id, job["session_id"], "incomplete", [error],
+                )
+                diagnostics.append(f"formation_job_failed:{job['job_id']}:{error}")
+        return diagnostics
 
     def replay_formation(
         self, session_id: str, message_id: int,
@@ -2592,13 +2684,10 @@ class ContextManager:
                         "typed_formation:skipped_already_processed_source"
                     )
                 else:
-                    typed = formation_mod.apply_proposals(
-                        store, session_id, message, self._formation_provider,
-                    )
-                    self._last_formation_timings = dict(typed.timings_ms)
-                    diagnostics.extend(
-                        [f"typed_formation:{item}" for item in typed.diagnostics]
-                    )
+                    store.enqueue_formation_job(message.message_id, session_id)
+                    diagnostics.append("typed_formation:queued")
+                    if not self._formation_deferred:
+                        diagnostics.extend(self.drain_formation())
             if message.role == "user":
                 diagnostics.extend(self._extract_entities(
                     store, session_id, message_id, message.content,
@@ -2639,8 +2728,8 @@ class ContextManager:
         except Exception as e:
             return [f"m5_failed: {e}"]
 
-    @staticmethod
     def _extract_states(
+        self,
         store,
         session_id: str,
         message_id: int,
@@ -2729,8 +2818,8 @@ class ContextManager:
                         else candidate
                         for candidate in candidates
                     ]
-                diagnostics = state_mod.apply_user_candidates(
-                    store, session_id, message_id, candidates
+                diagnostics = self.admission.admit_user_candidates(
+                    session_id, message_id, candidates
                 )
                 if reference_message is not None:
                     for candidate in candidates:

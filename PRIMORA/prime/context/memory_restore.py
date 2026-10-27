@@ -24,14 +24,15 @@ TABLES = (
     "sessions", "messages", "digests", "experience_events", "states",
     "candidates", "entities", "entity_aliases", "relationships",
     "observations", "observation_sources", "observation_history",
-    "formation_status", "retrieval_vectors", "retrieval_index_meta",
+    "formation_status", "formation_jobs", "retrieval_vectors",
+    "retrieval_index_meta",
 )
 
 _OPTIONAL_TABLES = {"digests", "experience_events", "candidates", "entities",
                     "entity_aliases", "relationships", "observations",
                     "observation_sources", "observation_history",
                     "formation_status", "retrieval_vectors",
-                    "retrieval_index_meta"}
+                    "formation_jobs", "retrieval_index_meta"}
 
 _REQUIRED_COLUMNS = {
     "sessions": {"session_id", "created_at", "last_activity_at"},
@@ -50,6 +51,10 @@ _REQUIRED_COLUMNS = {
     "observation_sources": {"id", "observation_id"},
     "observation_history": {"id", "observation_id", "snapshot_json"},
     "formation_status": {"message_id"},
+    "formation_jobs": {
+        "job_id", "message_id", "session_id", "status", "attempts",
+        "last_error", "created_at", "updated_at",
+    },
 }
 
 
@@ -553,6 +558,26 @@ class MemoryRestoreService:
             message_id = _value(row, "message_id")
             if source.execute("SELECT 1 FROM messages WHERE id=?", (message_id,)).fetchone() is None:
                 return RestoreIssue(table, source_id, "formation source message is missing")
+        if table == "formation_jobs":
+            message_id = _value(row, "message_id")
+            if source.execute("SELECT 1 FROM messages WHERE id=?", (message_id,)).fetchone() is None:
+                return RestoreIssue(table, source_id, "formation job source message is missing")
+            if _value(row, "status") not in {"pending", "processing", "complete", "failed"}:
+                return RestoreIssue(table, source_id, "invalid formation job status")
+            target_message = _target_message_for_source(
+                source, target_rows, message_id,
+            )
+            if target_message is not None:
+                for target_job in target_rows.get("formation_jobs", []):
+                    if int(_value(target_job, "message_id")) != target_message:
+                        continue
+                    if _value(target_job, "status") != _value(row, "status"):
+                        return RestoreIssue(
+                            table, source_id,
+                            "formation job state conflicts with destination",
+                            "conflict", int(_value(target_job, "job_id")),
+                        )
+                    break
         if table == "observation_history":
             observation_id = _value(row, "observation_id")
             if source.execute(
@@ -630,6 +655,13 @@ class MemoryRestoreService:
                            for field in ("observation_type", "actor", "subject", "predicate", "authority")
                        )
                        and target["status"] == row["status"] for target in targets)
+        if table == "formation_jobs":
+            return any(
+                _value(target, "message_id") == _value(row, "message_id")
+                and _value(target, "session_id") == _value(row, "session_id")
+                and _value(target, "status") == _value(row, "status")
+                for target in targets
+            )
         return False
 
     def import_into(self) -> RestoreResult:
@@ -1209,6 +1241,37 @@ class MemoryRestoreService:
                     (message, _value(row, "session_id"), _value(row, "status"), _value(row, "attempts", 0), _value(row, "diagnostics", "[]"), _value(row, "updated_at", 0.0)),
                 )
                 self._bump(imported, "formation_status")
+        if _supported(source, "formation_jobs"):
+            for row in _rows(source, "formation_jobs"):
+                message = maps["messages"].get(int(row["message_id"]))
+                if message is None:
+                    raise _ImportConflict(RestoreIssue(
+                        "formation_jobs", int(row["job_id"]),
+                        "formation job source message was not imported",
+                    ))
+                exists = target.execute(
+                    "SELECT job_id FROM formation_jobs WHERE message_id=?",
+                    (message,),
+                ).fetchone()
+                if exists:
+                    maps["formation_jobs"][int(row["job_id"])] = int(exists[0])
+                    self._bump(already, "formation_jobs")
+                    continue
+                target.execute(
+                    "INSERT INTO formation_jobs(message_id,session_id,status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        message, _value(row, "session_id"),
+                        _value(row, "status", "pending"),
+                        _value(row, "attempts", 0),
+                        _value(row, "last_error", ""),
+                        _value(row, "created_at", 0.0),
+                        _value(row, "updated_at", 0.0),
+                    ),
+                )
+                maps["formation_jobs"][int(row["job_id"])] = int(
+                    target.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+                )
+                self._bump(imported, "formation_jobs")
 
     def _import_observation_history(self, source, target, maps, imported, already, unsupported):
         if not _supported(source, "observation_history"):
