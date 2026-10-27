@@ -5,6 +5,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from unittest.mock import patch
 
 from runner import ANSWERS, bench_env, judge, render, source_audit
@@ -14,7 +15,7 @@ class RunnerTests(unittest.TestCase):
     def test_source_roles_detect_invented_user_authority(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "test.db"
-            with sqlite3.connect(db) as con:
+            with closing(sqlite3.connect(db)) as con:
                 con.executescript(
                     "CREATE TABLE messages(id INTEGER, role TEXT);"
                     "CREATE TABLE states(id INTEGER, authority TEXT, source_ids TEXT);"
