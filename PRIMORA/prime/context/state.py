@@ -328,6 +328,75 @@ def _extract_preference_evolution(text: str) -> list["StateCandidate"]:
     return []
 
 
+# Context-keyed choices have a stable topic independent of the option.
+# These are general language structures, not item-specific facts.
+_CONTEXT_FIRST_PREFERENCE_RE = re.compile(
+    r"^for\s+(?P<context>[^,?.!]{2,90}),?\s+i\s+"
+    r"(?P<now>now\s+)?prefer\s+(?P<choice>[^?.!]{2,130})[.!]?$",
+    re.IGNORECASE,
+)
+_OPTION_FIRST_PREFERENCE_RE = re.compile(
+    r"^i\s+(?P<now>now\s+)?prefer\s+"
+    r"(?P<choice>[^?.!]{2,130}?)\s+for\s+"
+    r"(?P<context>[^,?.!]{2,90})[.!]?$",
+    re.IGNORECASE,
+)
+_EXPLICIT_CHANGE_PREFIX_RE = re.compile(
+    r"^(?:i(?:'ve| have)\s+changed\s+my\s+mind|"
+    r"i\s+changed\s+my\s+mind)[.!]\s*(?P<rest>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_OLD_CHOICE_REPORT_RE = re.compile(
+    r"^(?:the\s+)?[a-z0-9][a-z0-9 '’-]{1,110}\s+"
+    r"was\s+my\s+(?:old|previous)\s+choice[.!]?$",
+    re.IGNORECASE,
+)
+
+
+def _extract_contextual_preference(text: str) -> list["StateCandidate"]:
+    """Create one source-backed preference per explicitly named use context.
+
+    The user must actually assert a choice and its context. We do not infer
+    a replacement merely because an unrelated new option is mentioned.
+    """
+    statement = text.strip()
+    explicit_change = False
+    change = _EXPLICIT_CHANGE_PREFIX_RE.fullmatch(statement)
+    if change:
+        statement = change.group("rest").strip()
+        explicit_change = True
+    # An additional sentence is allowed only when it reports an old choice,
+    # not when it adds an unexamined assertion to the current value.
+    if "." in statement.rstrip("."):
+        main, rest = statement.split(".", 1)
+        if not _OLD_CHOICE_REPORT_RE.fullmatch(rest.strip()):
+            return []
+        statement = main.strip()
+    match = (_CONTEXT_FIRST_PREFERENCE_RE.fullmatch(statement)
+             or _OPTION_FIRST_PREFERENCE_RE.fullmatch(statement))
+    if match is None:
+        return []
+    context = normalize_concept(match.group("context").strip())
+    choice = _ARTICLES_RE.sub("", match.group("choice").strip()).strip()
+    choice = choice.rstrip(".!? ")
+    if (not context or not choice or context == choice
+            or len(context.split()) > 12 or len(choice.split()) > 18):
+        return []
+    if _HEDGE_RE.search(statement) or re.search(
+        r"\b(?:if|would|should|might|could|maybe|perhaps)\b",
+        statement, re.IGNORECASE,
+    ):
+        return []
+    return [StateCandidate(
+        concept="preferred option for " + context,
+        value=choice,
+        kind="correct" if (explicit_change or match.group("now")) else "establish",
+        scope="global",
+        mtype=PREFERENCE,
+        slot="contextual preference",
+    )]
+
+
 # Minimum rationale length: avoids "because yes" becoming memory.
 _RATIONALE_MIN_LEN = 12
 
@@ -913,6 +982,10 @@ def extract_candidates(
         return []
     if _NEGATED_REASON_RE.match(work):
         return []
+
+    contextual = _extract_contextual_preference(work)
+    if contextual:
+        return contextual
 
     head, rationale = _split_rationale(work)
 
