@@ -94,7 +94,7 @@ def test_entity_alias_and_relationship_reject_missing_sources(evidence):
         )
     with pytest.raises(ValueError):
         store.create_relationship(
-            "session-a", "global", "mentions",
+            "session-a", "global", "part_of",
             "entity", entity, "entity", entity, [987654321],
         )
 
