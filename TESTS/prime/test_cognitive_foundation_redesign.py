@@ -78,7 +78,6 @@ def test_production_backends_do_not_use_pre_turn_interpreter():
     cm = SimpleNamespace()
     loop = CognitiveLoop(cm, brain)
     assert loop._enable_memory_interpreter is False
-    assert loop._legacy_scripted_memory is False
 
 
 def test_one_cognitive_loop_uses_prime_memory_tool_without_intent_prepass(tmp_path):
@@ -117,7 +116,6 @@ def test_one_cognitive_loop_uses_prime_memory_tool_without_intent_prepass(tmp_pa
     brain = Scripted()
     loop = CognitiveLoop(prime.mind, brain, executor=CapabilityExecutor(prime))
     # Production never calls the preflight interpreter or phrase handlers.
-    loop._legacy_scripted_memory = False
     result = loop.run([{"role": "user", "content": "What did I watch?"}], session_id="new-session")
     assert result.success
     assert len(brain.calls) == 2

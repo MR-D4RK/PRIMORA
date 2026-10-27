@@ -31,8 +31,9 @@ Preference reasons are admitted only from user text. Both direct `because`
 clauses and an explicit causal follow-up sentence such as “It helps me focus”
 are stored as a rationale state linked to the preference with the same source
 ID. A typed provider may omit that field; Prime binds it from the exact source
-clause, and never invents a reason. Concise follow-ups use the last verified
-topic as a retrieval pointer, while assistant replies remain non-evidence.
+clause, and never invents a reason. Concise follow-ups are interpreted by
+Aurora's normal model-generated recall request; assistant replies remain
+non-evidence and no phrase table routes the follow-up.
 
 ## Windows PowerShell validation
 
@@ -110,6 +111,15 @@ python -m PRIMORA.main --cli
 Remove-Item -LiteralPath $db -Force
 ```
 
+For generalization checks, repeat the run with unrelated user-created subjects
+and paraphrases rather than the example wording: an unfamiliar object or
+activity, an imperfectly typed memory question, a correction, and an ambiguous
+pronoun that should receive clarification. Confirm that Qwen emits a `recall`
+request only when its dialogue understanding requires stored memory, that the
+ordinary turn uses one generation, and that every returned quote carries the
+original user source. The implementation contains no subject or follow-up
+phrase table to tune against these prompts.
+
 To display per-turn latency without changing the conversation path, opt in to
 the CLI timing line before starting it:
 
@@ -121,9 +131,15 @@ python -m PRIMORA.main --cli
 Each completed turn prints JSON containing `planning_ms`,
 `response_generation_ms`, `formation_ms` (and provider/database sub-timings),
 capability timings, Jev timings when `learn` runs, and `total_ms`. Formation
-is skipped for clearly non-assertive follow-ups such as `Why?`; the source
-message and Prime's normal provenance checks remain unchanged. Remove the
+remains Prime-owned and replay-safe; Aurora decides whether a memory read is
+needed in the same model-driven conversational path. The source message and
+Prime's normal provenance checks remain unchanged. Remove the
 variable or set it to `0` to return to the normal CLI output.
+
+Aurora's production path reports `planning_ms` as zero because there is no
+pre-turn semantic planner. The model emits a Prime `recall` request directly
+when the current conversation needs stored memory; the returned tool result is
+then available to the next ordinary answer generation.
 
 ## Tests
 

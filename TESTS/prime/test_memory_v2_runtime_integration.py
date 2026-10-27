@@ -80,6 +80,18 @@ class CausalRecallBrain(OpenAIBrain):
         self._config = type("Config", (), {})()
         self._model = "test-qwen"
         self.calls = []
+        self.next_outputs = []
+
+    def queue_recall(self, query, subject):
+        self.next_outputs.append(
+            "<prime_request>\n" + json.dumps({
+                "action": "recall",
+                "payload": {
+                    "query": query, "sources": ["preferences"],
+                    "subject": subject, "reasons": True,
+                }, "context": None, "metadata": None,
+            }) + "\n</prime_request>"
+        )
 
     def count_tokens(self, messages):
         return sum(max(1, len(str(item.get("content", ""))) // 4)
@@ -88,24 +100,9 @@ class CausalRecallBrain(OpenAIBrain):
     def generate(self, messages, max_output_tokens=None, on_delta=None,
                  cancelled=None):
         self.calls.append(messages)
-        system = str(messages[0].get("content", ""))
-        if "interpreting the LATEST USER MESSAGE" in system:
-            try:
-                request = json.loads(messages[-1]["content"])
-                latest = str(request.get("latest_user_request", "")).casefold()
-            except Exception:
-                latest = ""
-            if latest.startswith("why do i listen"):
-                return BrainResult.success(json.dumps({
-                    "intent": "memory", "operation": "recall",
-                    "sources": ["preferences"], "subject": "techno",
-                    "recent_days": None, "first_mention": False,
-                    "reasons": True, "clarify": False, "result_count": None,
-                    "order": "relevance", "temporal_scope": "current",
-                }), self.get_model_name())
-            return BrainResult.success(json.dumps({"intent": "other"}), self.get_model_name())
-        if "using ONLY the evidence below" in system:
-            evidence = str(messages[-1].get("content", ""))
+        tool_messages = [item for item in messages if item.get("role") == "tool"]
+        if tool_messages:
+            evidence = str(tool_messages[-1].get("content", ""))
             if "focused and calm" in evidence:
                 return BrainResult.success(
                     "Because it helps you stay focused and calm.",
@@ -113,6 +110,8 @@ class CausalRecallBrain(OpenAIBrain):
                 )
             return BrainResult.success(
                 "I couldn't verify a user-stated reason.", self.get_model_name())
+        if self.next_outputs:
+            return BrainResult.success(self.next_outputs.pop(0), self.get_model_name())
         return BrainResult.success("I heard you.", self.get_model_name())
 
 
@@ -234,6 +233,8 @@ def test_live_causal_sentence_forms_verified_reason_and_why_followup_is_fast(
     assert formation_timings["formation_provider_ms"] >= 0
     before = len(provider.calls)
     brain_before = len(brain.calls)
+    brain.queue_recall("Why did I listen to techno music when working?",
+                       "techno music when working")
     followup = aurora.respond([
         {"role": "user", "content": source},
         {"role": "assistant", "content": first.content},
@@ -242,8 +243,9 @@ def test_live_causal_sentence_forms_verified_reason_and_why_followup_is_fast(
 
     assert followup.success
     assert "focused and calm" in followup.content
-    # The short follow-up does not invoke typed formation again.
-    assert len(provider.calls) == before
+    # The replayed source is not re-formed; only the new follow-up is sent
+    # through Prime's typed formation path.
+    assert len(provider.calls) == before + 1
     states = aurora.mind.mechanisms._get_store().fetch_states(
         scope="global", status="current")
     rationale = [row for row in states if row.memory_type == "RATIONALE"]
@@ -257,6 +259,7 @@ def test_live_causal_sentence_forms_verified_reason_and_why_followup_is_fast(
     assert timings["planning_ms"] < 5.0
     assert "total_ms" in timings and timings["response_generation_ms"] >= 0
 
+    brain.queue_recall("Why do I listen to techno?", "techno")
     explicit = aurora.respond([
         {"role": "user", "content": source},
         {"role": "assistant", "content": first.content},
@@ -284,6 +287,7 @@ def test_live_causal_reason_abstains_without_explicit_reason(tmp_path):
     source = "I enjoy watercolor painting on weekends."
     first = aurora.respond([{"role": "user", "content": source}], session_id="one")
     assert first.success
+    brain.queue_recall("Why do I listen to watercolor?", "watercolor")
     result = aurora.respond([
         {"role": "user", "content": source},
         {"role": "assistant", "content": "Watercolor."},

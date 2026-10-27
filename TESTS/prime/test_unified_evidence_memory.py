@@ -87,12 +87,14 @@ def test_latest_capability_evidence_is_retained_under_budget_pressure(tmp_path):
                if message["role"] == "tool")
 
 
-def test_production_openai_brain_enables_semantic_memory_interpreter(monkeypatch):
+def test_production_openai_brain_uses_single_model_driven_path(monkeypatch):
     monkeypatch.setenv("PRIMORA_AURORA_MEMORY_INTERPRETER", "1")
     prime = Prime(_Provider())
     brain = OpenAIBrain(AuroraConfig("model", "adapter"))
     aurora = Aurora(prime, brain=brain, config=AuroraConfig("model", "adapter"))
-    assert aurora.loop._enable_memory_interpreter is True
+    # The compatibility environment variable cannot reintroduce a compulsory
+    # semantic pre-pass into Aurora's production composition.
+    assert aurora.loop._enable_memory_interpreter is False
 
 
 def test_production_composition_wires_learning_and_safe_tools():

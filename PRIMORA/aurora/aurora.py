@@ -249,11 +249,11 @@ class Aurora:
             budget=self._budget(),
             token_counter=self._token_counter(),
             request_extractor=extract_prime_request,
-            enable_memory_interpreter=(
-                str(os.environ.get("PRIMORA_AURORA_MEMORY_INTERPRETER", "1"))
-                .strip().lower() in ("1", "true", "yes", "on")
-                and isinstance(self._brain, (AuroraBrain, OpenAIBrain))
-            ),
+            # Aurora's normal model generation owns intent and memory
+            # decisions.  Prime remains the only retrieval/admission boundary;
+            # there is no compulsory semantic-planning generation before a
+            # conversational turn.
+            enable_memory_interpreter=False,
         )
         # The learn capability checks a self-reported provenance against what
         # the turn actually gathered, which only the loop's executor records.

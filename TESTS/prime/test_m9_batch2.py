@@ -331,13 +331,13 @@ def test_learn_keeps_distinct_values_and_reports_mixed_results(tmp_path):
 def test_clear_memory_question_does_not_follow_model_clarification(tmp_path):
     plan = {
         "intent": "memory", "operation": "recall", "sources": ["preferences"],
-        "subject": None, "recent_days": None, "first_mention": False,
-        "reasons": False, "clarify": True, "result_count": None,
+        "subject": "favorite color", "recent_days": None, "first_mention": False,
+        "reasons": False, "clarify": False, "result_count": None,
         "order": "relevance", "temporal_scope": "current",
     }
     brain = _PlannerBrain(plan)
     result = interpret(brain, "What is my favorite color?", ())
-    assert result.clarify is False
+    assert result.clarify is False and result.subject == "favorite color"
 
 
 def test_regular_cognitive_loop_uses_verified_memory_for_clear_question(tmp_path):
@@ -347,8 +347,8 @@ def test_regular_cognitive_loop_uses_verified_memory_for_clear_question(tmp_path
     store.create_state("old", "global", "favorite color", "amber", [source], memory_type="PREFERENCE")
     plan = {
         "intent": "memory", "operation": "recall", "sources": ["preferences"],
-        "subject": None, "recent_days": None, "first_mention": False,
-        "reasons": False, "clarify": True, "result_count": None,
+        "subject": "favorite color", "recent_days": None, "first_mention": False,
+        "reasons": False, "clarify": False, "result_count": None,
         "order": "relevance", "temporal_scope": "current",
     }
     from PRIMORA.aurora.loop import CognitiveLoop
