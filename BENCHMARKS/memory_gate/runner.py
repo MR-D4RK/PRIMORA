@@ -235,6 +235,8 @@ def main():
     probe_count = 0
     probe_passes = 0
     session_errors = 0
+    provenance_violations = 0
+    source_audit_errors = 0
 
     for index, raw in enumerate(dataset):
         case = render(raw, anchors(args.seed, index))
@@ -276,6 +278,10 @@ def main():
                     if "[Prime] Executing Capability:" in line],
             })
         evaluated["source_audit"] = source_audit(db)
+        audit = evaluated["source_audit"]
+        provenance_violations += len(audit.get("violations", []))
+        source_audit_errors += int("error" in audit or
+                                   audit.get("sqlite_quick_check") != "ok")
         results.append(evaluated)
         print(case["id"] + ": " +
               ("complete" if all(not s["error"] for s in evaluated["sessions"])
@@ -285,6 +291,12 @@ def main():
         "status": "HUMAN_REVIEW_REQUIRED",
         "repo_baseline": "2caf190", "seed": args.seed,
         "cases": len(dataset), "session_errors": session_errors,
+        "provenance_violations": provenance_violations,
+        "source_audit_errors": source_audit_errors,
+        "automated_gate": "FAIL" if (
+            session_errors or provenance_violations or source_audit_errors or
+            probe_count != probe_passes
+        ) else "SMOKE_PASS_HUMAN_REVIEW_REQUIRED",
         "lexical_probes": probe_count, "lexical_passes": probe_passes,
         "lexical_probe_rate": round(probe_passes / probe_count, 3)
         if probe_count else None,
@@ -299,7 +311,12 @@ def main():
     print("Results: " + str(outfile))
     print("Probe pass: " + str(probe_passes) + "/" + str(probe_count))
     print("Session infrastructure errors: " + str(session_errors))
-    return 1 if session_errors or probe_count != probe_passes else 0
+    print("User-provenance violations: " + str(provenance_violations))
+    print("SQLite audit errors: " + str(source_audit_errors))
+    return 1 if (
+        session_errors or provenance_violations or source_audit_errors
+        or probe_count != probe_passes
+    ) else 0
 
 
 if __name__ == "__main__":
