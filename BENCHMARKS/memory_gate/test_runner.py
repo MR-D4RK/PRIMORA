@@ -31,6 +31,7 @@ class RunnerTests(unittest.TestCase):
                     (json.dumps([2]),))
                 con.execute(
                     "INSERT INTO experience_events VALUES(1,'user',1)")
+                con.commit()
             report = source_audit(db)
             self.assertEqual(report["sqlite_quick_check"], "ok")
             self.assertEqual(len(report["violations"]), 1)
