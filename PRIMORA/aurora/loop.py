@@ -76,7 +76,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
-from PRIMORA.aurora.brain import Brain, BrainResult, AuroraBrain, OpenAIBrain
+from PRIMORA.aurora.brain import Brain, BrainResult
 from PRIMORA.aurora.claims import unsupported_claim_error
 from PRIMORA.aurora.citations import dangling_citation_error
 from PRIMORA.aurora.conversation_guard import (
@@ -84,7 +84,6 @@ from PRIMORA.aurora.conversation_guard import (
     denies_assumption_after_correction,
 )
 from PRIMORA.aurora import request_shape
-from PRIMORA.aurora import memory_coordinator
 from PRIMORA.prime.context import BudgetConfig, ContextTooLargeError
 from PRIMORA.prime.context.mind import Mind
 
@@ -308,6 +307,7 @@ class LoopTrace:
     stop_reason: str = ""
     max_cycles: int = DEFAULT_MAX_CYCLES
     total_s: float = 0.0
+    timings_ms: dict[str, float] = field(default_factory=dict)
 
     @property
     def count(self) -> int:
@@ -320,6 +320,9 @@ class LoopTrace:
             "max_cycles": self.max_cycles,
             "segment_count": self.count,
             "total_s": round(self.total_s, 3),
+            "timings_ms": {
+                key: round(value, 3) for key, value in self.timings_ms.items()
+            },
         }
 
 
@@ -344,6 +347,7 @@ class CapabilityExecutor:
         self.max_calls = int(max_calls)
         self.calls: list[tuple[str, Any]] = []
         self.evidence: list[tuple[str, Any]] = []
+        self.timings_ms: dict[str, float] = {}
         self._evidence_session: str = ""
         self.exhausted = False
 
@@ -366,6 +370,7 @@ class CapabilityExecutor:
         """
         self._used = 0
         self.exhausted = False
+        self.timings_ms = {}
         # Actions that actually ran, as opposed to those merely attempted.
         # A refused attempt is not evidence that anything happened, so the
         # loop needs the difference before it can tell Aurora that a claim of
@@ -435,7 +440,27 @@ class CapabilityExecutor:
             })
 
         self._used = self.used + 1
-        result = self._prime.handle(request)
+        operation_started = time.perf_counter()
+        try:
+            result = self._prime.handle(request)
+        finally:
+            elapsed_ms = (time.perf_counter() - operation_started) * 1000
+            self.timings_ms[f"capability_{action}_ms"] = (
+                self.timings_ms.get(f"capability_{action}_ms", 0.0) + elapsed_ms
+            )
+        # Prime capabilities may expose finer-grained timings (for example
+        # learn's Jev provider/parse/admission phases). Carry those samples to
+        # the loop trace without making the loop depend on any capability's
+        # schema.
+        nested = getattr(result, "output", None)
+        nested_timings = nested.get("timings_ms") if isinstance(nested, dict) else None
+        if isinstance(nested_timings, dict):
+            for key, value in nested_timings.items():
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    continue
+                self.timings_ms[key] = self.timings_ms.get(key, 0.0) + number
         rendered = json.dumps(
             {
                 "status": result.status.value,
@@ -510,14 +535,12 @@ class CognitiveLoop:
         # time. Resolved once, not per segment.
         self._request_extractor = request_extractor or _default_extractor()
         self._last_trace: Optional[LoopTrace] = None
-        # Model-led memory is now a normal Prime capability inside cognition.
-        # The old pre-turn classification path is opt-in only, for backwards-
-        # compatibility tests; it is never activated by the production brain.
+        # A pre-turn interpreter is retained only as an explicit compatibility
+        # seam for older embedders. Aurora's production composition leaves it
+        # disabled: the same Qwen generation that answers a turn decides
+        # whether to request Prime recall, so ordinary turns have no hidden
+        # semantic router or compulsory planning generation.
         self._enable_memory_interpreter = bool(enable_memory_interpreter)
-        self._legacy_scripted_memory = (
-            not isinstance(brain, (AuroraBrain, OpenAIBrain))
-            and not self._enable_memory_interpreter
-        )
 
     # -- accessors --------------------------------------------------------
 
@@ -548,6 +571,28 @@ class CognitiveLoop:
 
         return count
 
+    def _record_formation_timings(self, trace: LoopTrace) -> None:
+        """Move Prime's latest formation sample into this turn's trace."""
+        consume_formation = getattr(
+            getattr(self._mind, "mechanisms", None),
+            "consume_formation_timings", None,
+        )
+        if not callable(consume_formation):
+            return
+        try:
+            formation_timings = consume_formation()
+        except Exception:
+            formation_timings = {}
+        if not formation_timings:
+            return
+        for key, value in formation_timings.items():
+            name = "formation_ms" if key == "total_ms" else f"formation_{key}"
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            trace.timings_ms[name] = trace.timings_ms.get(name, 0.0) + number
+
     # -- the loop ---------------------------------------------------------
 
     def run(
@@ -565,6 +610,11 @@ class CognitiveLoop:
         extract = self._request_extractor
         trace = LoopTrace(max_cycles=self.max_cycles)
         started = time.perf_counter()
+        trace.timings_ms.update({
+            "planning_ms": 0.0,
+            "response_generation_ms": 0.0,
+            "formation_ms": 0.0,
+        })
         self._last_trace = trace
         # The capability budget is per turn. The executor owns the counter and
         # resets itself; the loop does not track it. Guarded, because any
@@ -635,21 +685,27 @@ class CognitiveLoop:
         accountability_granted = False
         user_text = latest_user_text(instructed)
 
-        # Historical pre-turn interpretation is explicitly opt-in for old
-        # test harnesses. Production cognition requests memory via the
-        # existing Prime recall capability; it has no preflight router.
-        prior_dialogue = tuple({"role": str(m.get("role")),
-                                "content": str(m.get("content", ""))[:700]}
-                               for m in instructed[:-1]
-                               if m.get("role") in ("user", "assistant"))
+        # An explicitly enabled legacy embedding may still use the validated
+        # JSON planning seam. Production Aurora never enables it; her normal
+        # generation requests Prime capabilities directly.
         plan = None
+        planning_started = time.perf_counter()
         if self._enable_memory_interpreter:
             try:
+                from PRIMORA.aurora import memory_coordinator
+                prior_dialogue = tuple({"role": str(m.get("role")),
+                                        "content": str(m.get("content", ""))[:700]}
+                                       for m in instructed[:-1]
+                                       if m.get("role") in ("user", "assistant"))
                 plan = memory_coordinator.interpret(
                     self._brain, user_text, prior_dialogue)
             except Exception:
                 plan = None  # Ordinary cognition if the live planner fails.
-        if (isinstance(plan, memory_coordinator.MemoryPlan)
+        trace.timings_ms["planning_ms"] = (
+            time.perf_counter() - planning_started
+        ) * 1000
+        if (self._enable_memory_interpreter
+                and isinstance(plan, memory_coordinator.MemoryPlan)
                 and plan.operation == "recall"):
             if plan.clarify:
                 response = BrainResult.success(
@@ -658,92 +714,34 @@ class CognitiveLoop:
             else:
                 try:
                     evidence = self._mind.memory_query_evidence(
-                        plan.as_dict(), session_id=session_id)
+                        {
+                            **plan.as_dict(),
+                            # Contextual follow-ups keep their literal
+                            # wording for Aurora's answer but use a bounded,
+                            # predicate-bearing query for typed retrieval.
+                            "query": plan.retrieval_query or user_text,
+                        },
+                        session_id=session_id)
                 except Exception:
                     response = BrainResult.success(
                         "I couldn't safely retrieve verified memory evidence "
                         "right now. I don't want to guess.",
                         self._brain.get_model_name())
                 else:
+                    answer_started = time.perf_counter()
                     response = memory_coordinator.grounded_answer(
                         self._brain, user_text, plan, evidence)
+                    trace.timings_ms["response_generation_ms"] += (
+                        time.perf_counter() - answer_started
+                    ) * 1000
             trace.stop_reason = "finished"
-            trace.total_s = time.perf_counter() - started
             self._persist_turn(messages, 0, response, trace, session_id)
+            self._record_formation_timings(trace)
+            trace.total_s = time.perf_counter() - started
+            trace.timings_ms["total_ms"] = trace.total_s * 1000
             if on_delta is not None:
                 on_delta(response.content)
             return response
-
-        # Legacy handlers are retained for test/fake brain compatibility.
-        # Production Aurora backends NEVER route wording through these
-        # phrase parsers, regardless of how the semantic planner responds.
-        if plan is None and self._legacy_scripted_memory:
-            # A broad request for user-reported likes gets user-source-backed
-            # evidence instead of an unverified model-generated inventory. Subject
-            # categories are matched from the user's own messages, never a list
-            # of hardcoded domains.
-            likes_lookup = getattr(self._mind, "verified_likes_history", None)
-            if callable(likes_lookup):
-                try:
-                    answer = likes_lookup(user_text)
-                except Exception:
-                    answer = None
-                if answer is not None:
-                    result = BrainResult.success(answer, self._brain.get_model_name())
-                    trace.stop_reason = "finished"
-                    trace.total_s = time.perf_counter() - started
-                    self._persist_turn(messages, 0, result, trace, session_id)
-                    if on_delta is not None:
-                        on_delta(answer)
-                    return result
-
-            # Explicit autobiographical event questions use the same source-
-            # verified episodes stored by Prime, without letting the model guess
-            # missing actions or route private experience history to research.
-            # The parser recognizes generic question intent, never subject names.
-            episode_lookup = getattr(self._mind, "verified_episode_history", None)
-            if callable(episode_lookup):
-                # Only user turns in this local conversation provide a follow-up
-                # referent; never use assistant answers as autobiographical proof.
-                episode_context = tuple(str(m.get("content", "")) for m in instructed
-                                        if m.get("role") == "user" and
-                                        m.get("content") != user_text)
-                try:
-                    answer = episode_lookup(user_text, context=episode_context)
-                except Exception:
-                    answer = None
-                if answer is not None:
-                    result = BrainResult.success(answer, self._brain.get_model_name())
-                    trace.stop_reason = "finished"
-                    trace.total_s = time.perf_counter() - started
-                    self._persist_turn(messages, 0, result, trace, session_id)
-                    if on_delta is not None:
-                        on_delta(answer)
-                    return result
-
-            # For explicit personal-history questions, a verified database answer
-            # is safer than asking a language model to guess dates or to research
-            # private conversation history online. Other questions use the normal
-            # Aurora cognitive loop unchanged.
-            verified = getattr(self._mind, "verified_personal_history", None)
-            if callable(verified):
-                prior = tuple(str(m.get("content", "")) for m in instructed
-                              if m.get("role") == "user" and
-                              m.get("content") != user_text)
-                try:
-                    answer = verified(user_text, context=prior)
-                except Exception:
-                    answer = None  # fail back to the ordinary cognition path
-                if answer is not None:
-                    result = BrainResult.success(answer, self._brain.get_model_name())
-                    trace.stop_reason = "finished"
-                    trace.total_s = time.perf_counter() - started
-                    # Preserve user and assistant turns exactly as normal. The
-                    # answerer itself does not write or edit memory records.
-                    self._persist_turn(messages, 0, result, trace, session_id)
-                    if on_delta is not None:
-                        on_delta(answer)
-                    return result
 
         # Length of `messages` as of the last successful build. The
         # end-of-turn persist compares against it to see rows a correction
@@ -784,6 +782,11 @@ class CognitiveLoop:
                     self._brain.get_model_name(),
                 )
 
+            # Formation is owned by Prime's ContextManager. Consume its
+            # latest sample once so repeated cognitive segments do not count
+            # the same provider call twice.
+            self._record_formation_timings(trace)
+
             built_len = len(messages)
 
             seg_started = time.perf_counter()
@@ -820,6 +823,7 @@ class CognitiveLoop:
                 latency_s=time.perf_counter() - seg_started,
             )
             trace.segments.append(segment)
+            trace.timings_ms["response_generation_ms"] += segment.latency_s * 1000
             result = generated
 
             if not generated.success:
@@ -1118,10 +1122,19 @@ class CognitiveLoop:
         else:
             trace.stop_reason = trace.stop_reason or "max_cycles"
 
-        trace.total_s = time.perf_counter() - started
+        executor_timings = getattr(self._executor, "timings_ms", {})
+        if isinstance(executor_timings, dict):
+            for key, value in executor_timings.items():
+                trace.timings_ms[key] = trace.timings_ms.get(key, 0.0) + float(value)
         # The turn is over: write its closing state before returning so a
         # caller that exits right after respond() cannot lose it.
         self._persist_turn(messages, built_len, result, trace, session_id)
+        # The closing persistence may form the just-finished user message, so
+        # consume that sample after persistence as well as the samples from
+        # cognitive segments above.
+        self._record_formation_timings(trace)
+        trace.total_s = time.perf_counter() - started
+        trace.timings_ms["total_ms"] = trace.total_s * 1000
         if result is None:
             # Unreachable while max_cycles >= 1, kept so the return type is
             # total rather than Optional.

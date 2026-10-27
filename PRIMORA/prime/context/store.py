@@ -13,6 +13,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Optional
+from contextlib import contextmanager
 
 from .entities import (
     ENTITY_AUTHORITIES,
@@ -25,6 +26,8 @@ from .models import (
     EntityRecord,
     ExperienceEvent,
     RelationshipRecord,
+    ObservationRecord,
+    ObservationHistoryRecord,
     SessionRecord,
     StateRecord,
     StoredMessage,
@@ -89,6 +92,9 @@ CREATE TABLE IF NOT EXISTS experience_events (
     statement TEXT NOT NULL,
     reported_at REAL NOT NULL,
     authority TEXT NOT NULL DEFAULT 'user',
+    occurred_at REAL,
+    occurred_precision TEXT NOT NULL DEFAULT 'unknown',
+    occurred_timezone TEXT NOT NULL DEFAULT 'UTC',
     FOREIGN KEY (source_message_id) REFERENCES messages(id)
 );
 CREATE INDEX IF NOT EXISTS idx_experience_events_reported
@@ -158,7 +164,10 @@ CREATE TABLE IF NOT EXISTS entities (
     confidence REAL NOT NULL DEFAULT 0.3,
     created_at REAL NOT NULL,
     observed_at REAL,
-    merged_at REAL
+    merged_at REAL,
+    source_episode_ids TEXT NOT NULL DEFAULT '',
+    valid_from REAL,
+    valid_until REAL
 );
 CREATE INDEX IF NOT EXISTS idx_entities_scope_name_status
     ON entities(scope, normalized_name, status);
@@ -198,6 +207,7 @@ CREATE TABLE IF NOT EXISTS relationships (
     object_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'candidate',
     source_ids TEXT NOT NULL,
+    source_episode_ids TEXT NOT NULL DEFAULT '',
     authority TEXT NOT NULL DEFAULT 'user',
     confidence REAL NOT NULL DEFAULT 0.3,
     created_at REAL NOT NULL,
@@ -216,6 +226,64 @@ CREATE INDEX IF NOT EXISTS idx_relationships_object
     ON relationships(scope, object_kind, object_id, status);
 CREATE INDEX IF NOT EXISTS idx_relationships_supersedes
     ON relationships(supersedes_id);
+CREATE TABLE IF NOT EXISTS observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    concept TEXT NOT NULL,
+    normalized_concept TEXT NOT NULL,
+    value TEXT NOT NULL,
+    observation_type TEXT NOT NULL DEFAULT 'observation',
+    actor TEXT NOT NULL DEFAULT 'user',
+    subject TEXT NOT NULL DEFAULT '',
+    predicate TEXT NOT NULL DEFAULT '',
+    authority TEXT NOT NULL DEFAULT 'user',
+    status TEXT NOT NULL DEFAULT 'current',
+    confidence REAL NOT NULL DEFAULT 1.0,
+    created_at REAL NOT NULL,
+    observed_at REAL,
+    occurred_from REAL,
+    occurred_until REAL,
+    valid_from REAL,
+    valid_until REAL,
+    supersedes_id INTEGER,
+    superseded_at REAL,
+    FOREIGN KEY (supersedes_id) REFERENCES observations(id)
+);
+CREATE INDEX IF NOT EXISTS idx_observations_scope_status
+    ON observations(scope, status);
+CREATE INDEX IF NOT EXISTS idx_observations_normalized_concept
+    ON observations(normalized_concept);
+CREATE INDEX IF NOT EXISTS idx_observations_valid_interval
+    ON observations(scope, valid_from, valid_until);
+CREATE TABLE IF NOT EXISTS observation_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL,
+    source_message_id INTEGER,
+    source_episode_id TEXT,
+    source_quote TEXT NOT NULL DEFAULT '',
+    source_role TEXT NOT NULL DEFAULT 'user',
+    linked_at REAL NOT NULL,
+    FOREIGN KEY (observation_id) REFERENCES observations(id),
+    FOREIGN KEY (source_message_id) REFERENCES messages(id),
+    UNIQUE(observation_id, source_message_id, source_episode_id, source_quote)
+);
+CREATE INDEX IF NOT EXISTS idx_observation_sources_observation
+    ON observation_sources(observation_id);
+CREATE INDEX IF NOT EXISTS idx_observation_sources_message
+    ON observation_sources(source_message_id);
+CREATE TABLE IF NOT EXISTS observation_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    changed_at REAL NOT NULL,
+    superseded_by_id INTEGER,
+    FOREIGN KEY (observation_id) REFERENCES observations(id),
+    FOREIGN KEY (superseded_by_id) REFERENCES observations(id)
+);
+CREATE INDEX IF NOT EXISTS idx_observation_history_observation
+    ON observation_history(observation_id, changed_at, id);
 CREATE TABLE IF NOT EXISTS retrieval_vectors (
     vector_id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT NOT NULL,
@@ -278,12 +346,29 @@ class ContextStore:
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(str(self._db_path), timeout=30.0)
+        con.execute("PRAGMA foreign_keys=ON;")
         con.execute("PRAGMA journal_mode=WAL;")
         con.execute("PRAGMA synchronous=NORMAL;")
         return con
 
+    @contextmanager
+    def _connection(self):
+        """Yield one SQLite connection and always close it.
+
+        ``sqlite3.Connection.__exit__`` commits or rolls back a transaction,
+        but it deliberately does not close the connection.  The store opens
+        short-lived connections for every operation, so the ownership wrapper
+        must close them on both normal and exceptional exits.
+        """
+        con = self._connect()
+        try:
+            with con:
+                yield con
+        finally:
+            con.close()
+
     def _init_db(self) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.executescript(_SCHEMA)
             # Migrate pre-existing databases that lack newer columns.
             cols = {r[1] for r in con.execute("PRAGMA table_info(sessions)").fetchall()}
@@ -309,6 +394,40 @@ class ContextStore:
             ):
                 if column not in state_cols:
                     con.execute(f"ALTER TABLE states ADD COLUMN {column} REAL")
+            relationship_cols = {
+                r[1] for r in con.execute(
+                    "PRAGMA table_info(relationships)"
+                ).fetchall()
+            }
+            if "source_episode_ids" not in relationship_cols:
+                con.execute(
+                    "ALTER TABLE relationships ADD COLUMN source_episode_ids"
+                    " TEXT NOT NULL DEFAULT ''"
+                )
+            event_cols = {
+                r[1] for r in con.execute(
+                    "PRAGMA table_info(experience_events)"
+                ).fetchall()
+            }
+            for column, definition in (
+                ("occurred_at", "REAL"),
+                ("occurred_precision", "TEXT NOT NULL DEFAULT 'unknown'"),
+                ("occurred_timezone", "TEXT NOT NULL DEFAULT 'UTC'"),
+            ):
+                if column not in event_cols:
+                    con.execute(
+                        f"ALTER TABLE experience_events ADD COLUMN {column} {definition}"
+                    )
+            entity_cols = {
+                r[1] for r in con.execute("PRAGMA table_info(entities)").fetchall()
+            }
+            for column, definition in (
+                ("source_episode_ids", "TEXT NOT NULL DEFAULT ''"),
+                ("valid_from", "REAL"),
+                ("valid_until", "REAL"),
+            ):
+                if column not in entity_cols:
+                    con.execute(f"ALTER TABLE entities ADD COLUMN {column} {definition}")
             con.execute(
                 "UPDATE states SET observed_at = COALESCE(observed_at, created_at),"
                 " valid_from = COALESCE(valid_from, created_at)"
@@ -320,10 +439,10 @@ class ContextStore:
             )
         # Probe FTS5 support; never claim it without verifying.
         try:
-            with self._connect() as con:
+            with self._connection() as con:
                 con.executescript(_FTS_SCHEMA)
             # Backfill any rows written before the virtual table existed.
-            with self._connect() as con:
+            with self._connection() as con:
                 con.execute(
                     "INSERT OR IGNORE INTO messages_fts(rowid, content) "
                     "SELECT id, content FROM messages "
@@ -335,7 +454,7 @@ class ContextStore:
 
     def _probe_fts(self) -> bool:
         try:
-            with self._connect() as con:
+            with self._connection() as con:
                 con.execute(
                     "SELECT count(*) FROM messages_fts WHERE messages_fts MATCH ?",
                     ("probeunlikelytermxyz",),
@@ -363,7 +482,7 @@ class ContextStore:
         ts = timestamp if timestamp is not None else time.time()
         fp = fingerprint(session_id, seq, role, content)
         diagnostic: Optional[str] = None
-        with self._connect() as con:
+        with self._connection() as con:
             existing = con.execute(
                 "SELECT id, fingerprint FROM messages"
                 " WHERE session_id = ? AND seq = ?",
@@ -398,7 +517,7 @@ class ContextStore:
         if status not in ("processing", "complete", "incomplete"):
             raise ValueError("invalid formation status")
         payload = json.dumps(list(diagnostics or []), ensure_ascii=False)
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "INSERT INTO formation_status"
                 "(message_id, session_id, status, attempts, diagnostics, updated_at)"
@@ -431,7 +550,7 @@ class ContextStore:
             query += " AND status = ?"
             params.append(status)
         query += " ORDER BY message_id ASC"
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         out = []
         for row in rows:
@@ -449,6 +568,9 @@ class ContextStore:
     def save_experience_event(
         self, session_id: str, source_message_id: int,
         kind: str, actor: str, statement: str,
+        occurred_at: Optional[float] = None,
+        occurred_precision: str = "unknown",
+        occurred_timezone: str = "UTC",
     ) -> Optional[int]:
         """Persist verified user provenance once; never trust caller timestamps.
 
@@ -460,7 +582,11 @@ class ContextStore:
             "activity", "discussion", "milestone", "end", "setback",
         ) or actor not in ("i", "we"):
             raise ValueError("invalid event classification")
-        with self._connect() as con:
+        if occurred_precision not in ("unknown", "day", "instant"):
+            raise ValueError("invalid occurred_precision")
+        if occurred_at is not None:
+            occurred_at = self._normalize_timestamp(occurred_at, "occurred_at")
+        with self._connection() as con:
             row = con.execute(
                 "SELECT session_id, role, content, timestamp FROM messages WHERE id = ?",
                 (source_message_id,),
@@ -472,8 +598,10 @@ class ContextStore:
             con.execute(
                 "INSERT OR IGNORE INTO experience_events "
                 "(session_id, source_message_id, kind, actor, statement, "
-                "reported_at, authority) VALUES (?, ?, ?, ?, ?, ?, 'user')",
-                (session_id, source_message_id, kind, actor, statement, row[3]),
+                "reported_at, authority, occurred_at, occurred_precision, "
+                "occurred_timezone) VALUES (?, ?, ?, ?, ?, ?, 'user', ?, ?, ?)",
+                (session_id, source_message_id, kind, actor, statement, row[3],
+                 occurred_at, occurred_precision, occurred_timezone),
             )
             found = con.execute(
                 "SELECT id FROM experience_events WHERE source_message_id = ?",
@@ -494,7 +622,8 @@ class ContextStore:
             raise ValueError("limit must be between 1 and 1000")
         query = (
             "SELECT e.id, e.session_id, e.source_message_id, e.kind, "
-            "e.actor, e.statement, e.reported_at, e.authority "
+            "e.actor, e.statement, e.reported_at, e.authority, e.occurred_at,"
+            " e.occurred_precision, e.occurred_timezone "
             "FROM experience_events e JOIN messages m "
             "ON m.id = e.source_message_id "
             "WHERE e.authority = 'user' AND m.role = 'user' "
@@ -510,7 +639,7 @@ class ContextStore:
             params.append(kind)
         query += " ORDER BY e.reported_at DESC, e.id DESC LIMIT ?"
         params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [ExperienceEvent(*row) for row in reversed(rows)]
 
@@ -523,7 +652,7 @@ class ContextStore:
         from .episodes import extract_experience_claim
         if not 1 <= limit <= 10000:
             raise ValueError("invalid legacy experience scan limit")
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT m.id, m.session_id, m.content, m.timestamp "
                 "FROM messages m WHERE m.role = 'user' "
@@ -534,11 +663,13 @@ class ContextStore:
             ).fetchall()
         result = []
         for message_id, session_id, statement, timestamp in rows:
-            claim = extract_experience_claim(statement)
+            claim = extract_experience_claim(statement, reported_at=timestamp)
             if claim is not None:
                 result.append(ExperienceEvent(
                     -message_id, session_id, message_id, claim.kind,
                     claim.actor, claim.statement, timestamp, "user",
+                    claim.occurred_at, claim.occurred_precision,
+                    claim.occurred_timezone,
                 ))
         return result
 
@@ -549,7 +680,7 @@ class ContextStore:
         reaction was independently resolved. No changes to memory are made.
         """
         import re
-        with self._connect() as con:
+        with self._connection() as con:
             source = con.execute(
                 "SELECT session_id FROM messages "
                 "WHERE id = ? AND role = 'user'", (source_message_id,)
@@ -570,7 +701,7 @@ class ContextStore:
         return StoredMessage(*row)
 
     def count(self, session_id: str) -> int:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT count(*) FROM messages WHERE session_id = ?",
                 (session_id,),
@@ -597,19 +728,36 @@ class ContextStore:
         if limit is not None:
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [StoredMessage(*r) for r in rows]
 
     def fetch_message(self, message_id: int) -> Optional[StoredMessage]:
         """One stored message by id. Used by the live hybrid admission path."""
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages WHERE id = ?",
                 (message_id,),
             ).fetchone()
         return StoredMessage(*row) if row is not None else None
+
+    def has_user_content(self, content: str, *, exclude_id: Optional[int] = None) -> bool:
+        """Whether an identical user source was already processed.
+
+        Session replay can legitimately append the same immutable source to a
+        new conversation session.  The source row remains distinct for
+        provenance, while model-backed formation need not pay for a second
+        interpretation of byte-identical text.
+        """
+        query = "SELECT 1 FROM messages WHERE role = 'user' AND content = ?"
+        params: list[Any] = [str(content)]
+        if exclude_id is not None:
+            query += " AND id != ?"
+            params.append(int(exclude_id))
+        query += " LIMIT 1"
+        with self._connection() as con:
+            return con.execute(query, params).fetchone() is not None
 
     def fetch_messages_by_ids(
         self, message_ids: list[int]
@@ -622,7 +770,7 @@ class ContextStore:
         if not message_ids:
             return []
         unique = list(dict.fromkeys(int(v) for v in message_ids))
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages"
@@ -635,7 +783,7 @@ class ContextStore:
     def fetch_latest(
         self, session_id: str, limit: int
     ) -> list[StoredMessage]:
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages"
@@ -658,7 +806,7 @@ class ContextStore:
         """
         if limit <= 0:
             return []
-        with self._connect() as con:
+        with self._connection() as con:
             marker = con.execute(
                 "SELECT id FROM messages"
                 " WHERE session_id = ? AND role = 'system' AND content = ?"
@@ -679,7 +827,7 @@ class ContextStore:
 
     def max_seq(self, session_id: str) -> int:
         """Highest stored sequence in this session, or -1 when there is none."""
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT COALESCE(MAX(seq), -1) FROM messages"
                 " WHERE session_id = ?",
@@ -740,7 +888,7 @@ class ContextStore:
                 params.append(session_id)
             sql += " ORDER BY session_id ASC, seq ASC LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(sql, params).fetchall()
         return [StoredMessage(*r) for r in rows]
 
@@ -772,7 +920,7 @@ class ContextStore:
                           .replace("_", "\\_") + "%" for term in terms)
         order = "ASC" if oldest_first else "DESC"
         params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp, "
                 "fingerprint, importance FROM messages WHERE " +
@@ -787,7 +935,7 @@ class ContextStore:
         Bound to one session and a two-hour interval. These rows are *context*,
         not proof that a later reaction referred to the earlier subject.
         """
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp, "
                 "fingerprint, importance FROM messages "
@@ -809,7 +957,7 @@ class ContextStore:
         digest_type: str,
         content: str,
     ) -> int:
-        with self._connect() as con:
+        with self._connection() as con:
             cur = con.execute(
                 "INSERT INTO digests"
                 "(session_id, source_ids, seq_start, seq_end,"
@@ -852,7 +1000,7 @@ class ContextStore:
     ) -> SessionRecord:
         """Create the session row if absent; always touch activity time."""
         ts = timestamp if timestamp is not None else time.time()
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "INSERT OR IGNORE INTO sessions"
                 "(session_id, created_at, last_activity_at, title, status)"
@@ -872,7 +1020,7 @@ class ContextStore:
         return self._row_to_session(row)
 
     def get_session(self, session_id: str) -> Optional[SessionRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT session_id, created_at, last_activity_at, title,"
                 " status, previous_titles"
@@ -884,7 +1032,7 @@ class ContextStore:
         return self._row_to_session(row)
 
     def list_sessions(self) -> list[SessionRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT session_id, created_at, last_activity_at, title,"
                 " status, previous_titles"
@@ -900,7 +1048,7 @@ class ContextStore:
         """
         import json as _json
 
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT session_id, created_at, last_activity_at, title,"
                 " status, previous_titles"
@@ -929,7 +1077,7 @@ class ContextStore:
         return self._row_to_session(updated)
 
     def set_session_status(self, session_id: str, status: str) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "UPDATE sessions SET status = ?, last_activity_at = ?"
                 " WHERE session_id = ?",
@@ -1042,7 +1190,7 @@ class ContextStore:
             self._normalize_timestamp(superseded_at, "superseded_at")
             if superseded_at is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             observed = self._resolve_observed_at(
                 con, source_ids, created_at, observed_at
             )
@@ -1088,7 +1236,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             explained = con.execute(
                 "SELECT scope, status, authority FROM states WHERE id = ?",
@@ -1164,7 +1312,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             current_rows = con.execute(
                 "SELECT id FROM states"
@@ -1220,7 +1368,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else transition
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             for state_id in ids:
                 row = con.execute(
@@ -1242,11 +1390,305 @@ class ContextStore:
 
     def set_state_status(self, state_id: int, status: str) -> None:
         """Transition a state row (e.g. current -> superseded). Raw kept."""
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "UPDATE states SET status = ? WHERE id = ?",
                 (status, state_id),
             )
+
+    # ------------------------------------------------------------------
+    # Evidence-backed observations (additive V2 surface)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _observation_normalize(value: str) -> str:
+        return " ".join(str(value).strip().casefold().split())
+
+    def _observation_row_to_record(self, row) -> ObservationRecord:
+        return ObservationRecord(
+            observation_id=int(row[0]), session_id=row[1], scope=row[2],
+            concept=row[3], normalized_concept=row[4], value=row[5],
+            observation_type=row[6], actor=row[7], subject=row[8],
+            predicate=row[9], authority=row[10], status=row[11],
+            confidence=float(row[12]), created_at=row[13], observed_at=row[14],
+            occurred_from=row[15], occurred_until=row[16], valid_from=row[17],
+            valid_until=row[18], supersedes_id=row[19], superseded_at=row[20],
+            source_ids=[int(v) for v in (row[21] or "").split(",") if v],
+            source_episode_ids=[v for v in (row[22] or "").split(",") if v],
+            proof_count=int(row[23] or 0),
+        )
+
+    def _observation_select(self) -> str:
+        return (
+            "SELECT o.id, o.session_id, o.scope, o.concept,"
+            " o.normalized_concept, o.value, o.observation_type, o.actor,"
+            " o.subject, o.predicate, o.authority, o.status, o.confidence,"
+            " o.created_at, o.observed_at, o.occurred_from, o.occurred_until,"
+            " o.valid_from, o.valid_until, o.supersedes_id, o.superseded_at,"
+            " COALESCE((SELECT group_concat(DISTINCT source_message_id)"
+            "   FROM observation_sources s WHERE s.observation_id=o.id"
+            "     AND s.source_message_id IS NOT NULL), ''),"
+            " COALESCE((SELECT group_concat(DISTINCT source_episode_id)"
+            "   FROM observation_sources s WHERE s.observation_id=o.id"
+            "     AND s.source_episode_id IS NOT NULL), ''),"
+            " (SELECT count(*) FROM observation_sources s"
+            "   WHERE s.observation_id=o.id)"
+            " FROM observations o"
+        )
+
+    def create_observation(
+        self,
+        session_id: str,
+        scope: str,
+        concept: str,
+        value: str,
+        source_ids: list[int],
+        *,
+        source_quotes: Optional[dict[int, str]] = None,
+        source_episode_ids: Optional[list[str]] = None,
+        observation_type: str = "observation",
+        actor: str = "user",
+        subject: str = "",
+        predicate: str = "",
+        authority: str = "user",
+        status: str = "current",
+        confidence: float = 1.0,
+        timestamp: Optional[float] = None,
+        observed_at: Optional[float] = None,
+        occurred_from: Optional[float] = None,
+        occurred_until: Optional[float] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
+        supersedes_id: Optional[int] = None,
+    ) -> int:
+        """Insert an observation and its deduplicated evidence links.
+
+        This low-level store method performs no model interpretation.  The
+        observation service validates authority and source ownership before
+        calling it; the checks here make direct callers fail closed too.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be non-empty")
+        if scope != "global" and scope != session_id:
+            raise ValueError("observation scope must be global or session_id")
+        if authority != "user" and status == "current":
+            raise ValueError("only user observations may be current")
+        if status not in ("current", "superseded", "unresolved", "candidate", "rejected"):
+            raise ValueError("invalid observation status")
+        if not str(concept).strip() or not str(value).strip():
+            raise ValueError("observation concept and value are required")
+        ids = list(dict.fromkeys(int(v) for v in source_ids))
+        episodes = list(dict.fromkeys(str(v).strip() for v in (source_episode_ids or []) if str(v).strip()))
+        if not ids and not episodes:
+            raise ValueError("observation requires source provenance")
+        created = self._normalize_timestamp(timestamp, "created_at") if timestamp is not None else time.time()
+        normalized_from = self._normalize_timestamp(valid_from, "valid_from") if valid_from is not None else None
+        normalized_until = self._normalize_timestamp(valid_until, "valid_until") if valid_until is not None else None
+        occurred_start = self._normalize_timestamp(occurred_from, "occurred_from") if occurred_from is not None else None
+        occurred_end = self._normalize_timestamp(occurred_until, "occurred_until") if occurred_until is not None else None
+        self._validate_interval(normalized_from, normalized_until)
+        self._validate_interval(occurred_start, occurred_end)
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            for source_id in ids:
+                row = con.execute(
+                    "SELECT session_id, role, timestamp FROM messages WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                if row is None or row[1] != "user":
+                    raise ValueError("observation sources must be user messages")
+                if scope != "global" and row[0] != scope:
+                    raise ValueError("observation source crosses scope")
+            observed = self._resolve_observed_at(con, ids, created, observed_at)
+            effective_from = normalized_from if normalized_from is not None else observed
+            self._validate_interval(effective_from, normalized_until)
+            cur = con.execute(
+                "INSERT INTO observations"
+                "(session_id, scope, concept, normalized_concept, value,"
+                " observation_type, actor, subject, predicate, authority,"
+                " status, confidence, created_at, observed_at, occurred_from,"
+                " occurred_until, valid_from, valid_until, supersedes_id)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (session_id, scope, concept.strip(), self._observation_normalize(concept),
+                 value.strip(), observation_type, actor, subject, predicate,
+                 authority, status, float(confidence), created, observed,
+                 occurred_start, occurred_end, effective_from, normalized_until,
+                 supersedes_id),
+            )
+            observation_id = int(cur.lastrowid)
+            for source_id in ids:
+                con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at) VALUES (?, ?, NULL, ?, 'user', ?)",
+                    (observation_id, source_id,
+                     (source_quotes or {}).get(source_id, "")[:1000], created),
+                )
+            for episode_id in episodes:
+                con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at) VALUES (?, NULL, ?, '', 'user', ?)",
+                    (observation_id, episode_id, created),
+                )
+            return observation_id
+
+    def fetch_observations(
+        self, *, session_id: Optional[str] = None, scope: Optional[str] = None,
+        concept: Optional[str] = None, status: Optional[str] = None,
+        normalized_concept: Optional[str] = None, at_time: Optional[float] = None,
+        limit: Optional[int] = None,
+    ) -> list[ObservationRecord]:
+        query = self._observation_select() + " WHERE 1=1"
+        params: list[Any] = []
+        for column, value in (("o.session_id", session_id), ("o.scope", scope),
+                              ("o.concept", concept), ("o.status", status),
+                              ("o.normalized_concept", normalized_concept)):
+            if value is not None:
+                query += f" AND {column} = ?"
+                params.append(value)
+        if at_time is not None:
+            stamp = self._normalize_timestamp(at_time, "at_time")
+            query += " AND o.valid_from <= ? AND (o.valid_until IS NULL OR ? < o.valid_until)"
+            params.extend([stamp, stamp])
+        query += " ORDER BY o.id ASC"
+        if limit is not None:
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+                raise ValueError("limit must be a positive integer")
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connection() as con:
+            rows = con.execute(query, params).fetchall()
+        return [self._observation_row_to_record(row) for row in rows]
+
+    def fetch_observation_history(self, observation_id: int) -> list[ObservationHistoryRecord]:
+        with self._connection() as con:
+            rows = con.execute(
+                "SELECT id, observation_id, snapshot_json, reason, changed_at,"
+                " superseded_by_id FROM observation_history"
+                " WHERE observation_id = ? ORDER BY id ASC", (int(observation_id),)
+            ).fetchall()
+        return [ObservationHistoryRecord(
+            history_id=int(row[0]), observation_id=int(row[1]),
+            snapshot=json.loads(row[2]), reason=row[3], changed_at=row[4],
+            superseded_by_id=row[5]) for row in rows]
+
+    def fetch_observation_sources(self, observation_id: int) -> list[dict[str, Any]]:
+        """Return the immutable evidence links used to derive proof_count."""
+        with self._connection() as con:
+            rows = con.execute(
+                "SELECT id, observation_id, source_message_id, source_episode_id,"
+                " source_quote, source_role, linked_at FROM observation_sources"
+                " WHERE observation_id = ? ORDER BY id ASC", (int(observation_id),)
+            ).fetchall()
+        return [{"id": row[0], "observation_id": row[1],
+                 "source_message_id": row[2], "source_episode_id": row[3],
+                 "source_quote": row[4], "source_role": row[5],
+                 "linked_at": row[6]} for row in rows]
+
+    def add_observation_evidence(
+        self,
+        observation_id: int,
+        source_ids: list[int],
+        *,
+        source_quotes: Optional[dict[int, str]] = None,
+        source_episode_ids: Optional[list[str]] = None,
+    ) -> int:
+        """Add source links atomically while leaving the observation immutable.
+
+        The observation value and lifecycle are never edited here.  Every
+        message link is checked against the same authority and scope gates as
+        initial admission; duplicate links are harmless and idempotent.
+        """
+        ids = list(dict.fromkeys(int(value) for value in (source_ids or [])))
+        episodes = list(dict.fromkeys(
+            str(value).strip() for value in (source_episode_ids or [])
+            if str(value).strip()
+        ))
+        if not ids and not episodes:
+            raise ValueError("observation evidence requires a source")
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(
+                "SELECT scope, status, authority FROM observations WHERE id = ?",
+                (int(observation_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("observation not found")
+            if row[1] not in ("current", "candidate", "unresolved"):
+                raise ValueError("observation is not supportable")
+            scope = row[0]
+            linked = 0
+            for source_id in ids:
+                source = con.execute(
+                    "SELECT session_id, role, content FROM messages WHERE id = ?",
+                    (source_id,),
+                ).fetchone()
+                if source is None or source[1] != "user":
+                    raise ValueError("observation sources must be user messages")
+                if scope != "global" and source[0] != scope:
+                    raise ValueError("observation source crosses scope")
+                quote = (source_quotes or {}).get(source_id, "")
+                if not isinstance(quote, str) or len(quote) > 1000:
+                    raise ValueError("source quote is invalid")
+                if quote and quote.casefold() not in source[2].casefold():
+                    raise ValueError("source quote is not supported by source message")
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at)"
+                    " VALUES (?, ?, NULL, ?, 'user', ?)",
+                    (int(observation_id), source_id, quote[:1000], time.time()),
+                )
+                linked += int(cur.rowcount > 0)
+            for episode_id in episodes:
+                cur = con.execute(
+                    "INSERT OR IGNORE INTO observation_sources"
+                    "(observation_id, source_message_id, source_episode_id,"
+                    " source_quote, source_role, linked_at)"
+                    " VALUES (?, NULL, ?, '', 'user', ?)",
+                    (int(observation_id), episode_id, time.time()),
+                )
+                linked += int(cur.rowcount > 0)
+            return linked
+
+    def supersede_observation(
+        self, observation_id: int, *, reason: str = "superseded",
+        replacement_id: Optional[int] = None, transition_time: Optional[float] = None,
+        valid_until: Optional[float] = None,
+    ) -> ObservationRecord:
+        transition = self._normalize_timestamp(transition_time, "transition_time") if transition_time is not None else time.time()
+        end = self._normalize_timestamp(valid_until, "valid_until") if valid_until is not None else transition
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute(self._observation_select() + " WHERE o.id = ?", (int(observation_id),)).fetchone()
+            if row is None:
+                raise ValueError("observation not found")
+            current = self._observation_row_to_record(row)
+            if current.status != "current":
+                raise ValueError("only current observations may be superseded")
+            snapshot = {"observation_id": current.observation_id, "session_id": current.session_id,
+                        "scope": current.scope, "concept": current.concept,
+                        "normalized_concept": current.normalized_concept, "value": current.value,
+                        "observation_type": current.observation_type, "actor": current.actor,
+                        "subject": current.subject, "predicate": current.predicate,
+                        "source_ids": current.source_ids, "source_episode_ids": current.source_episode_ids,
+                        "authority": current.authority, "status": current.status,
+                        "confidence": current.confidence, "created_at": current.created_at,
+                        "observed_at": current.observed_at, "occurred_from": current.occurred_from,
+                        "occurred_until": current.occurred_until, "valid_from": current.valid_from,
+                        "valid_until": current.valid_until, "supersedes_id": current.supersedes_id,
+                        "superseded_at": current.superseded_at, "proof_count": current.proof_count}
+            con.execute(
+                "INSERT INTO observation_history(observation_id, snapshot_json, reason, changed_at, superseded_by_id)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (current.observation_id, json.dumps(snapshot, ensure_ascii=False), reason, transition, replacement_id),
+            )
+            con.execute(
+                "UPDATE observations SET status='superseded', valid_until=?, superseded_at=?"
+                " WHERE id=? AND status='current'", (end, transition, current.observation_id),
+            )
+            updated = con.execute(self._observation_select() + " WHERE o.id = ?", (current.observation_id,)).fetchone()
+        return self._observation_row_to_record(updated)
 
     def _state_rows_to_records(self, rows) -> list[StateRecord]:
         out = []
@@ -1279,7 +1721,7 @@ class ContextStore:
         """
         if isinstance(state_id, bool) or isinstance(message_id, bool):
             raise ValueError("state_id and message_id must be integers")
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT source_ids, status, authority FROM states WHERE id = ?",
@@ -1349,7 +1791,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._state_rows_to_records(rows)
 
@@ -1368,7 +1810,7 @@ class ContextStore:
         timestamp: Optional[float] = None,
         expires_at: Optional[float] = None,
     ) -> int:
-        with self._connect() as con:
+        with self._connection() as con:
             cur = con.execute(
                 "INSERT INTO candidates"
                 "(session_id, scope, source_ids, proposed_type,"
@@ -1426,12 +1868,12 @@ class ContextStore:
             query += " AND id = ?"
             params.append(candidate_id)
         query += " ORDER BY id ASC"
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._candidate_rows_to_records(rows)
 
     def set_candidate_status(self, candidate_id: int, status: str) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute(
                 "UPDATE candidates SET status = ? WHERE id = ?",
                 (status, candidate_id),
@@ -1446,6 +1888,8 @@ class ContextStore:
             source_ids=[int(value) for value in row[8].split(",") if value],
             authority=row[9], confidence=row[10], created_at=row[11],
             observed_at=row[12], merged_at=row[13],
+            source_episode_ids=[value for value in (row[14] or "").split(",") if value],
+            valid_from=row[15], valid_until=row[16],
         )
 
     def _entity_rows_to_records(self, rows) -> list[EntityRecord]:
@@ -1455,12 +1899,13 @@ class ContextStore:
         return (
             "SELECT id, session_id, scope, entity_type, display_name,"
             " normalized_name, status, merged_into_entity_id, source_ids,"
-            " authority, confidence, created_at, observed_at, merged_at"
+            " authority, confidence, created_at, observed_at, merged_at,"
+            " source_episode_ids, valid_from, valid_until"
             " FROM entities"
         )
 
     def fetch_entity(self, entity_id: int) -> Optional[EntityRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 self._entity_select() + " WHERE id = ?", (entity_id,)
             ).fetchone()
@@ -1475,6 +1920,7 @@ class ContextStore:
         normalized_name: Optional[str] = None,
         entity_ids: Optional[list[int]] = None,
         limit: Optional[int] = None,
+        at_time: Optional[float] = None,
     ) -> list[EntityRecord]:
         if entity_ids is not None and not entity_ids:
             return []
@@ -1498,13 +1944,18 @@ class ContextStore:
         if entity_ids is not None:
             query += " AND id IN (%s)" % ",".join("?" for _ in entity_ids)
             params.extend(int(value) for value in entity_ids)
+        if at_time is not None:
+            evaluation_time = self._normalize_timestamp(at_time, "at_time")
+            query += " AND (valid_from IS NULL OR valid_from <= ?)"
+            query += " AND (valid_until IS NULL OR ? < valid_until)"
+            params.extend([evaluation_time, evaluation_time])
         query += " ORDER BY id ASC"
         if limit is not None:
             if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return self._entity_rows_to_records(rows)
 
@@ -1523,6 +1974,9 @@ class ContextStore:
         observed_at: Optional[float] = None,
         merged_into_entity_id: Optional[int] = None,
         merged_at: Optional[float] = None,
+        source_episode_ids: Optional[list[str]] = None,
+        valid_from: Optional[float] = None,
+        valid_until: Optional[float] = None,
     ) -> int:
         if entity_type not in ENTITY_TYPES:
             raise ValueError(f"unknown entity_type={entity_type!r}")
@@ -1552,7 +2006,16 @@ class ContextStore:
             self._normalize_timestamp(merged_at, "merged_at")
             if merged_at is not None else None
         )
-        with self._connect() as con:
+        normalized_from = (
+            self._normalize_timestamp(valid_from, "valid_from")
+            if valid_from is not None else None
+        )
+        normalized_until = (
+            self._normalize_timestamp(valid_until, "valid_until")
+            if valid_until is not None else None
+        )
+        self._validate_interval(normalized_from, normalized_until)
+        with self._connection() as con:
             observed = self._resolve_observed_at(
                 con, sources, created_at, observed_at
             )
@@ -1560,13 +2023,16 @@ class ContextStore:
                 "INSERT INTO entities"
                 "(session_id, scope, entity_type, display_name,"
                 " normalized_name, status, merged_into_entity_id, source_ids,"
-                " authority, confidence, created_at, observed_at, merged_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " authority, confidence, created_at, observed_at, merged_at,"
+                " source_episode_ids, valid_from, valid_until)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id, scope, entity_type, display_name.strip(),
                     normalized_name, status, merged_into_entity_id,
                     ",".join(str(value) for value in sources), authority,
                     confidence, created_at, observed, normalized_merged_at,
+                    ",".join(str(value) for value in (source_episode_ids or [])),
+                    normalized_from, normalized_until,
                 ),
             )
             return int(cur.lastrowid)
@@ -1574,7 +2040,7 @@ class ContextStore:
     def confirm_entity(
         self, entity_id: int, confidence: float = 1.0
     ) -> Optional[EntityRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status, authority, source_ids FROM entities"
@@ -1602,7 +2068,7 @@ class ContextStore:
         return self._entity_row_to_record(updated)
 
     def archive_entity(self, entity_id: int) -> Optional[EntityRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM entities WHERE id = ?", (entity_id,)
@@ -1632,7 +2098,7 @@ class ContextStore:
         transition = self._normalize_timestamp(merged_at, "merged_at")
         if losing_entity_id == canonical_entity_id:
             raise ValueError("entity cannot be merged into itself")
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             losing = con.execute(
                 self._entity_select() + " WHERE id = ?",
@@ -1696,7 +2162,7 @@ class ContextStore:
     def fetch_entity_alias(
         self, alias_id: int
     ) -> Optional[EntityAliasRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 self._alias_select() + " WHERE id = ?", (alias_id,)
             ).fetchone()
@@ -1742,7 +2208,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [self._alias_row_to_record(row) for row in rows]
 
@@ -1785,7 +2251,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             entity = con.execute(
                 "SELECT scope, status, source_ids FROM entities"
                 " WHERE id = ?",
@@ -1836,7 +2302,7 @@ class ContextStore:
         valid_from: Optional[float] = None,
         valid_until: Optional[float] = None,
     ) -> Optional[EntityAliasRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 self._alias_select() + " WHERE id = ?", (alias_id,)
@@ -1894,6 +2360,7 @@ class ContextStore:
             authority=row[10], confidence=row[11], created_at=row[12],
             observed_at=row[13], valid_from=row[14], valid_until=row[15],
             supersedes_id=row[16], superseded_at=row[17],
+            source_episode_ids=[value for value in (row[18] or "").split(",") if value],
         )
 
     def _relationship_select(self) -> str:
@@ -1901,7 +2368,8 @@ class ContextStore:
             "SELECT id, session_id, scope, relationship_type, subject_kind,"
             " subject_id, object_kind, object_id, status, source_ids,"
             " authority, confidence, created_at, observed_at, valid_from,"
-            " valid_until, supersedes_id, superseded_at FROM relationships"
+            " valid_until, supersedes_id, superseded_at, source_episode_ids"
+            " FROM relationships"
         )
 
     def _relationship_endpoint(
@@ -1978,18 +2446,22 @@ class ContextStore:
         valid_until: Optional[float],
         supersedes_id: Optional[int],
         superseded_at: Optional[float],
+        source_episode_ids: Optional[list[str]] = None,
     ) -> int:
         cur = con.execute(
             "INSERT INTO relationships"
             "(session_id, scope, relationship_type, subject_kind, subject_id,"
-            " object_kind, object_id, status, source_ids, authority, confidence,"
+            " object_kind, object_id, status, source_ids, source_episode_ids,"
+            " authority, confidence,"
             " created_at, observed_at, valid_from, valid_until, supersedes_id,"
             " superseded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-            " ?, ?, ?)",
+            " ?, ?, ?, ?)",
             (
                 session_id, scope, relationship_type, subject_kind,
                 subject_id, object_kind, object_id, status,
-                ",".join(str(value) for value in source_ids), authority,
+                ",".join(str(value) for value in source_ids),
+                ",".join(str(value) for value in (source_episode_ids or [])),
+                authority,
                 confidence, created_at, observed_at, valid_from, valid_until,
                 supersedes_id, superseded_at,
             ),
@@ -1999,7 +2471,7 @@ class ContextStore:
     def fetch_relationship(
         self, relationship_id: int
     ) -> Optional[RelationshipRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 self._relationship_select() + " WHERE id = ?",
                 (relationship_id,),
@@ -2045,7 +2517,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(query, params).fetchall()
         return [self._relationship_row_to_record(row) for row in rows]
 
@@ -2066,6 +2538,7 @@ class ContextStore:
         observed_at: Optional[float] = None,
         valid_from: Optional[float] = None,
         valid_until: Optional[float] = None,
+        source_episode_ids: Optional[list[str]] = None,
     ) -> int:
         if status not in ("candidate", "unresolved"):
             raise ValueError("relationships must be created as candidate or unresolved")
@@ -2090,7 +2563,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else None
         )
-        with self._connect() as con:
+        with self._connection() as con:
             self._validate_relationship_endpoints(
                 con, scope, relationship_type, subject_kind, subject_id,
                 object_kind, object_id, False,
@@ -2104,7 +2577,7 @@ class ContextStore:
                 con, session_id, scope, relationship_type, subject_kind,
                 subject_id, object_kind, object_id, sources, status,
                 authority, confidence, created_at, observed, effective_from,
-                normalized_until, None, None,
+                normalized_until, None, None, source_episode_ids,
             )
 
     def confirm_relationship(
@@ -2119,7 +2592,7 @@ class ContextStore:
             self._normalize_timestamp(transition_time, "transition_time")
             if transition_time is not None else time.time()
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 self._relationship_select() + " WHERE id = ?",
@@ -2213,7 +2686,7 @@ class ContextStore:
     def reject_relationship(
         self, relationship_id: int
     ) -> Optional[RelationshipRecord]:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM relationships WHERE id = ?",
@@ -2244,7 +2717,7 @@ class ContextStore:
         transition = self._normalize_timestamp(
             transition_time, "transition_time"
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM relationships WHERE id = ?",
@@ -2285,7 +2758,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else transition
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute(
                 "SELECT status FROM relationships WHERE id = ?",
@@ -2335,7 +2808,7 @@ class ContextStore:
             self._normalize_timestamp(valid_until, "valid_until")
             if valid_until is not None else transition
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             for state_id in ids:
                 row = con.execute(
@@ -2424,7 +2897,7 @@ class ContextStore:
             self._normalize_timestamp(timestamp, "timestamp")
             if timestamp is not None else time.time()
         )
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "DELETE FROM retrieval_vectors"
@@ -2455,7 +2928,7 @@ class ContextStore:
             if value is not None:
                 query += f" AND {column} = ?"
                 params.append(value)
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             cur = con.execute(query, params)
             return int(cur.rowcount)
@@ -2491,7 +2964,7 @@ class ContextStore:
                 raise ValueError("limit must be a positive integer")
             query += " LIMIT ?"
             params.append(limit)
-        with self._connect() as con:
+        with self._connection() as con:
             return con.execute(query, params).fetchall()
 
     def count_vectors(
@@ -2505,11 +2978,11 @@ class ContextStore:
             if value is not None:
                 query += f" AND {column} = ?"
                 params.append(value)
-        with self._connect() as con:
+        with self._connection() as con:
             return int(con.execute(query, params).fetchone()[0])
 
     def set_index_meta(self, key: str, value: str) -> None:
-        with self._connect() as con:
+        with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
             con.execute(
                 "INSERT INTO retrieval_index_meta(key, value) VALUES (?, ?)"
@@ -2518,7 +2991,7 @@ class ContextStore:
             )
 
     def get_index_meta(self, key: str) -> Optional[str]:
-        with self._connect() as con:
+        with self._connection() as con:
             row = con.execute(
                 "SELECT value FROM retrieval_index_meta WHERE key = ?", (key,)
             ).fetchone()
@@ -2528,7 +3001,7 @@ class ContextStore:
     def fetch_digests(
         self, session_id: str, limit: int = 5
     ) -> list[dict[str, Any]]:
-        with self._connect() as con:
+        with self._connection() as con:
             rows = con.execute(
                 "SELECT id, session_id, source_ids, seq_start, seq_end,"
                 " created_at, digest_type, content FROM digests"

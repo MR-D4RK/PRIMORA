@@ -119,12 +119,18 @@ def _state_accepted(state: StateRecord, temporal: str) -> bool:
 
 
 def _endpoint_usable(
-    store: Any, scope: str, kind: str, record_id: int, temporal: str
+    store: Any, scope: str, kind: str, record_id: int, temporal: str,
+    at_time: Optional[float] = None,
 ) -> bool:
     """Current queries need current/active endpoints; history may keep them."""
     if kind == "entity":
         entity = store.fetch_entity(record_id)
         if entity is None or entity.scope != scope:
+            return False
+        if at_time is not None and entity.valid_from is not None and not (
+            entity.valid_from <= at_time
+            and (entity.valid_until is None or at_time < entity.valid_until)
+        ):
             return False
         return entity.status == "active" if temporal == "current" else (
             entity.status != "archived"
@@ -135,14 +141,15 @@ def _endpoint_usable(
     return _state_accepted(state, temporal)
 
 
-def _gate(store: Any, row: RelationshipRecord, temporal: str) -> bool:
+def _gate(store: Any, row: RelationshipRecord, temporal: str,
+          at_time: Optional[float] = None) -> bool:
     if row.authority != "user":
         return False
     if not _endpoint_usable(store, row.scope, row.subject_kind, row.subject_id,
-                            temporal):
+                            temporal, at_time):
         return False
     return _endpoint_usable(
-        store, row.scope, row.object_kind, row.object_id, temporal
+        store, row.scope, row.object_kind, row.object_id, temporal, at_time
     )
 
 
@@ -167,7 +174,7 @@ def _fetch_gated(
             for row in rows:
                 if row.relationship_id in seen:
                     continue
-                if not _gate(store, row, temporal):
+                if not _gate(store, row, temporal, window):
                     continue
                 seen.add(row.relationship_id)
                 out.append(row)

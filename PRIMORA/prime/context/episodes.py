@@ -8,9 +8,12 @@ immutable source evidence contract.
 """
 
 from dataclasses import dataclass
+from datetime import datetime, time as datetime_time, timedelta, timezone
 from hashlib import sha256
+import os
 import re
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import EpisodeRecord, ExperienceEvent
 
@@ -20,6 +23,9 @@ class ExperienceClaim:
     kind: str
     actor: str
     statement: str
+    occurred_at: Optional[float] = None
+    occurred_precision: str = "unknown"
+    occurred_timezone: str = "UTC"
 
 
 # Category tags describe the action, not the subject.  "We finished the
@@ -43,14 +49,41 @@ _ACTIONS = {
 
 _ACTION_RE = "|".join(re.escape(word) for word in sorted(_ACTIONS, key=len, reverse=True))
 _CLAIM_RE = re.compile(
-    rf"^\s*(?:(?:today|yesterday|earlier today|last night|recently|just)\s*[,;:]?\s+)?"
+    rf"^\s*(?:(?P<relative>today|yesterday|earlier today|last night|recently|just)\s*[,;:]?\s+)?"
     rf"(?P<actor>I|we)\s+(?:(?:have|had)\s+)?(?:(?:recently|just)\s+)?"
-    rf"(?P<action>{_ACTION_RE})\b(?:\s+(?P<object>.+))?$",
+    rf"(?P<action>{_ACTION_RE})\b(?:\s+(?P<object>.+?))?"
+    rf"(?:\s+(?P<relative_after>today|yesterday|earlier today|last night|recently|just))?$",
     re.IGNORECASE,
 )
 
 
-def extract_experience_claim(text: str, role: str = "user") -> Optional[ExperienceClaim]:
+def _resolve_relative_date(
+    relative: Optional[str], reported_at: Optional[float],
+    timezone_name: Optional[str] = None,
+) -> tuple[Optional[float], str, str]:
+    """Resolve explicit relative dates at local midnight, retaining day precision."""
+    if not relative or reported_at is None:
+        return None, "unknown", timezone_name or "UTC"
+    zone_name = timezone_name or os.environ.get("PRIMORA_USER_TIMEZONE", "UTC")
+    try:
+        zone = ZoneInfo(zone_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        zone_name = "UTC"
+        zone = timezone.utc
+    local_reported = datetime.fromtimestamp(float(reported_at), zone)
+    relative = relative.casefold()
+    if relative in {"yesterday", "last night"}:
+        date = local_reported.date() - timedelta(days=1)
+    else:
+        date = local_reported.date()
+    local_midnight = datetime.combine(date, datetime_time.min, tzinfo=zone)
+    return local_midnight.timestamp(), "day", zone_name
+
+
+def extract_experience_claim(
+    text: str, role: str = "user", *, reported_at: Optional[float] = None,
+    timezone_name: Optional[str] = None,
+) -> Optional[ExperienceClaim]:
     """Return one supported, explicit first-person event or None.
 
     Only a new user message can create a claim. Quoted instructions, questions,
@@ -74,10 +107,17 @@ def extract_experience_claim(text: str, role: str = "user") -> Optional[Experien
     # Never infer that a quoted or conditional future task was completed.
     if obj.casefold().startswith(("if ", "maybe ", "perhaps ", "not ", "never ")):
         return None
+    occurred_at, occurred_precision, occurred_timezone = _resolve_relative_date(
+        match.group("relative") or match.group("relative_after"),
+        reported_at, timezone_name
+    )
     return ExperienceClaim(
         kind=_ACTIONS[match.group("action").lower()],
         actor=match.group("actor").lower(),
         statement=statement,
+        occurred_at=occurred_at,
+        occurred_precision=occurred_precision,
+        occurred_timezone=occurred_timezone,
     )
 
 

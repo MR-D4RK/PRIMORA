@@ -104,9 +104,22 @@ _ACTIVITY_LIST = re.compile(
     rf"^what (?:have|did) i (?P<action>{_ACTIVITY_VERB})"
     r"(?:\s+(?:recently|lately|in the last \d+ days?))?\s*[?!.]*$", re.I,
 )
+_COMPLETION_LIST = re.compile(
+    r"^what (?:have|did) i (?P<action>finished|completed)"
+    r"(?:\s+(?:recently|lately|in the last \d+ days?))?\s*[?!.]*$",
+    re.I,
+)
 _EVENT_DATE_FOLLOWUP = re.compile(
     r"^when did i tell you about (?:it|that)(?:\s*[?!.]*)$", re.I,
 )
+_WHEN_ACTIVITY = re.compile(
+    r"^when did (?:i|we) (?P<action>visit|attend|watch|read|play|listen to) "
+    r"(?P<subject>.+?)\s*[?!.]*$", re.I,
+)
+_WHEN_ACTIVITY_ACTION = {
+    "visit": "visited", "attend": "attended", "watch": "watched",
+    "read": "read", "play": "played", "listen to": "listened to",
+}
 
 
 def parse_episode_question(
@@ -117,6 +130,19 @@ def parse_episode_question(
     q = re.sub(r"^\s*(?:hey\s+)?aurora\s*[,!:.]?\s*", "",
                question.strip(), flags=re.I)
     q = re.sub(r"^rememeber\b", "remember", q, flags=re.I)
+    matched_activity_when = _WHEN_ACTIVITY.fullmatch(q)
+    if matched_activity_when:
+        subject = matched_activity_when.group("subject").strip()
+        words = tuple(dict.fromkeys(
+            word for word in _WORDS.findall(subject.casefold())
+            if word not in {"a", "an", "the"}
+        ))
+        if not words:
+            return EpisodeQuery((), needs_subject=True)
+        return EpisodeQuery(
+            words,
+            action=_WHEN_ACTIVITY_ACTION[matched_activity_when.group("action").casefold()],
+        )
     matched_date = _REPORTED_EVENT_DATE.fullmatch(q)
     if matched_date:
         statement = matched_date.group("event")
@@ -146,6 +172,14 @@ def parse_episode_question(
         return EpisodeQuery((), all_experiences=True,
                             action=matched_list.group("action").casefold(),
                             since=since)
+
+    matched_completion = _COMPLETION_LIST.fullmatch(q)
+    if matched_completion:
+        last = re.search(r"\blast (\d+) days?\b", q, re.I)
+        since = time.time() - int(last.group(1)) * 86400 if last else None
+        return EpisodeQuery(
+            (), all_experiences=True, event_kind="completion", since=since
+        )
 
     if _EVENT_DATE_FOLLOWUP.fullmatch(q):
         prior = parse_episode_question(context[-1]) if context else None
@@ -205,7 +239,8 @@ def render_episode_answer(
     """Return verified event reports for a matched episodic question.
 
     Every datum comes from the already provenance-verified episode view.
-    Dates are message report times in UTC, NOT inferred real-world event times.
+    Reported times are message times in UTC; an occurred time is shown only
+    when an explicit source-relative date was resolved with its precision.
     Unknown outcomes and missing episodes are never filled with model guesses.
     """
     query = parse_episode_question(question, context=context)
@@ -248,12 +283,23 @@ def render_episode_answer(
             relevant = tuple(ev for ev in relevant
                              if ev.reported_at >= query.since)
         for event in relevant[:remaining]:
-            when = datetime.fromtimestamp(event.reported_at, timezone.utc)
+            reported = datetime.fromtimestamp(event.reported_at, timezone.utc)
             # Source comes from event + JOIN with original user message.
+            if event.occurred_at is not None:
+                occurred = datetime.fromtimestamp(event.occurred_at, timezone.utc)
+                time_text = (
+                    f"occurred {occurred:%Y-%m-%d %H:%M} UTC "
+                    f"(precision={event.occurred_precision}, "
+                    f"reported {reported:%Y-%m-%d %H:%M} UTC)"
+                )
+            else:
+                time_text = (
+                    f"occurred time unknown (reported "
+                    f"{reported:%Y-%m-%d %H:%M} UTC)"
+                )
             lines.append(
-                f"  - {when:%Y-%m-%d %H:%M} UTC: "
-                f"{event.statement!r} ({event.kind}; source message "
-                f"{event.source_message_id})"
+                f"  - {time_text}: {event.statement!r} ({event.kind}; "
+                f"source message {event.source_message_id})"
             )
             remaining -= 1
             if query.include_feelings and reactions:

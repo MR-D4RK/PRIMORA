@@ -74,6 +74,9 @@ def create_candidate(
     scope: Optional[str] = None,
     timestamp: Optional[float] = None,
     observed_at: Optional[float] = None,
+    source_episode_ids: Optional[list[str]] = None,
+    valid_from: Optional[float] = None,
+    valid_until: Optional[float] = None,
 ) -> tuple[int, list[str]]:
     scope_value = _scope_key(session_id, scope)
     if entity_type not in ENTITY_TYPES:
@@ -97,6 +100,9 @@ def create_candidate(
         confidence=0.3,
         timestamp=timestamp,
         observed_at=observed_at,
+        source_episode_ids=source_episode_ids,
+        valid_from=valid_from,
+        valid_until=valid_until,
     )
     return entity_id, [f"entity_candidate_created: {display_name.strip()}"]
 
@@ -202,6 +208,7 @@ def resolve(
         scope=scope,
         normalized_name=normalized,
         limit=query_limit,
+        at_time=evaluation_time,
     )
     aliases = store.fetch_entity_aliases(
         scope=scope,
@@ -225,6 +232,7 @@ def resolve(
         status="active",
         entity_ids=canonical_ids,
         limit=bounded_limit + 1,
+        at_time=evaluation_time,
     )
     ambiguous = len(resolved) > 1
     return resolved[:bounded_limit], ambiguous

@@ -13,6 +13,8 @@ from typing import Any, Callable, Optional
 
 from . import entities as entities_mod
 from . import entity_formation as entity_formation_mod
+from . import formation as formation_mod
+from . import query_intent as query_intent_mod
 from . import hybrid as hybrid_mod
 from . import queries as queries_mod
 from . import relationships as relationships_mod
@@ -128,7 +130,6 @@ _LOCAL_DISCUSSION_RE = re.compile(
     r"[?!. ]*$", re.IGNORECASE,
 )
 
-
 CROSS_SESSION_CAP = 3
 
 # Roles that carry internal control flow rather than conversation.
@@ -234,10 +235,27 @@ class ContextManager:
         semantic_index=None,
         hybrid_retrieval: Optional[bool] = None,
         include_foreign_history: bool = True,
+        formation_provider=None,
+        enable_memory_v2: Optional[bool] = None,
+        memory_v2: Optional[bool] = None,
     ):
         self._db_path = db_path
         self._budget = budget or BudgetConfig.from_env()
         self._memory_provider = memory_provider
+        self._formation_provider = formation_provider
+        if enable_memory_v2 is None:
+            enable_memory_v2 = memory_v2
+        if enable_memory_v2 is None:
+            enabled_values = (
+                os.environ.get("PRIMORA_MEMORY_V2", "0"),
+                os.environ.get("PRIMORA_MEMORY_V2_FORMATION", "0"),
+                os.environ.get("PRIMORA_MEMORY_V2_RETRIEVAL", "0"),
+            )
+            enable_memory_v2 = any(
+                value.strip().lower() in ("1", "true", "yes", "on")
+                for value in enabled_values
+            )
+        self._memory_v2_enabled = bool(enable_memory_v2)
         self._store: Optional[ContextStore] = None
         # M6 LIVE. Hybrid retrieval is the returned result. Defaults on;
         # set hybrid_retrieval=False (or PRIMORA_HYBRID_RETRIEVAL=0) to roll
@@ -263,6 +281,10 @@ class ContextManager:
         self._semantic_index = semantic_index
         self._shadow_records: list[ShadowComparison] = []
         self._retrieval_traces: list[RetrievalTrace] = []
+        # The latest typed-formation timings are consumed by the cognitive
+        # loop for per-turn diagnostics. They are observability only and never
+        # influence admission or retrieval.
+        self._last_formation_timings: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # M6 live-switch surface
@@ -310,6 +332,23 @@ class ContextManager:
     def clear_shadow_records(self) -> None:
         self._shadow_records.clear()
 
+    @property
+    def memory_v2_enabled(self) -> bool:
+        return self._memory_v2_enabled
+
+    def set_memory_v2_enabled(self, enabled: bool) -> None:
+        """Roll back the additive V2 formation path without touching data."""
+        self._memory_v2_enabled = bool(enabled)
+
+    def set_formation_provider(self, provider) -> None:
+        self._formation_provider = provider
+
+    def consume_formation_timings(self) -> dict[str, float]:
+        """Return and clear the latest typed-formation timing sample."""
+        timings = dict(self._last_formation_timings)
+        self._last_formation_timings.clear()
+        return timings
+
     def retrieval_traces(self) -> list[RetrievalTrace]:
         return list(self._retrieval_traces)
 
@@ -338,24 +377,33 @@ class ContextManager:
 
         Returns a summary for Aurora. Never raises for a bad request.
         """
+        started = time.perf_counter()
+        timings: dict[str, float] = {}
+
+        def finish(summary: dict[str, Any]) -> dict[str, Any]:
+            timings["total_ms"] = (time.perf_counter() - started) * 1000
+            summary["timings_ms"] = dict(timings)
+            return summary
+
         if jev is None:
-            return {"status": "rejected", "reason": "no_jev_configured"}
+            return finish({"status": "rejected", "reason": "no_jev_configured"})
 
         request_provenance = provenance
         from PRIMORA.learning.jev import LearningRequest, PROVENANCE
 
         if provenance not in PROVENANCE:
-            return {
+            return finish({
                 "status": "rejected",
                 "reason": (
                     f"unknown_provenance: {provenance!r}. "
                     f"Use one of: {', '.join(PROVENANCE)}"
                 ),
-            }
+            })
         if not isinstance(text, str) or not text.strip():
-            return {"status": "rejected", "reason": "empty_text"}
+            return finish({"status": "rejected", "reason": "empty_text"})
 
         statement = text.strip()
+        persist_started = time.perf_counter()
         try:
             store = self._get_store()
             seq = store.count(session_id) + 1
@@ -363,8 +411,11 @@ class ContextManager:
                 session_id, seq, "assistant", statement
             )
         except Exception as exc:
-            return {"status": "rejected", "reason": f"persist_failed: {exc}"}
+            timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
+            return finish({"status": "rejected", "reason": f"persist_failed: {exc}"})
+        timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
 
+        jev_started = time.perf_counter()
         try:
             outcome = jev.evaluate(
                 LearningRequest(
@@ -374,19 +425,23 @@ class ContextManager:
                 )
             )
         except Exception as exc:
-            return {
+            timings["jev_ms"] = (time.perf_counter() - jev_started) * 1000
+            return finish({
                 "status": "rejected",
                 "reason": f"jev_failed: {exc}",
                 "source_id": message_id,
-            }
+            })
+        timings["jev_ms"] = (time.perf_counter() - jev_started) * 1000
+        for key, value in getattr(outcome, "timings_ms", {}).items():
+            timings[f"jev_{key}"] = value
 
         if outcome.disposition == "reject":
-            return {
+            return finish({
                 "status": "rejected",
                 "reason": outcome.reason or "jev_rejected",
                 "diagnostics": list(outcome.diagnostics),
                 "source_id": message_id,
-            }
+            })
 
         # The provenance policy is enforced HERE, not trusted from Jev.
         # Jev is a pluggable, model-driven component and a buggy or
@@ -407,15 +462,68 @@ class ContextManager:
 
         learned: list[dict[str, Any]] = []
         held: list[dict[str, Any]] = []
+        already_known: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
         diagnostics: list[str] = (
             list(outcome.diagnostics) + diagnostics_note
         )
 
+        def _normalized_memory_text(value: Any) -> str:
+            return " ".join(
+                re.findall(r"[\w]+", str(value or "").casefold())
+            )
+
+        def _known_state(candidate, scope: str):
+            """Find an equivalent current user state without creating a row."""
+            scopes = [scope]
+            if scope != "global":
+                scopes.append("global")
+            concept = _normalized_memory_text(candidate.concept)
+            value = _normalized_memory_text(candidate.value)
+            for candidate_scope in scopes:
+                for state in store.fetch_states(
+                    scope=candidate_scope, status="current"
+                ):
+                    if state.authority != "user":
+                        continue
+                    if _normalized_memory_text(state.concept) != concept:
+                        continue
+                    if _normalized_memory_text(state.value) != value:
+                        continue
+                    if (candidate.memory_type and state.memory_type
+                            and candidate.memory_type != state.memory_type):
+                        continue
+                    return state
+            return None
+
+        admission_started = time.perf_counter()
         for candidate in outcome.candidates:
             if not candidate.is_wellformed():
                 diagnostics.append("learn_rejected: candidate not wellformed")
+                rejected.append({
+                    "concept": candidate.concept,
+                    "provenance": request_provenance,
+                    "reason": "candidate_not_wellformed",
+                })
                 continue
             scope = "global" if candidate.scope == "global" else "session"
+            try:
+                existing = _known_state(candidate, scope)
+            except Exception as exc:
+                diagnostics.append(f"learn_failed: duplicate check: {exc}")
+                existing = None
+            if existing is not None:
+                record = {
+                    "concept": candidate.concept,
+                    "state_id": existing.state_id,
+                    "provenance": request_provenance,
+                }
+                already_known.append(record)
+                diagnostics.append(
+                    f"learn_already_known: {candidate.concept}"
+                    f" (state {existing.state_id})"
+                )
+                continue
             try:
                 candidate_id = store.create_candidate(
                     session_id,
@@ -454,20 +562,26 @@ class ContextManager:
                 record["memory_type"] = candidate.memory_type
                 learned.append(record)
 
+        timings["admission_ms"] = (time.perf_counter() - admission_started) * 1000
+
         if learned:
             status = "learned"
         elif held:
             status = "held"
+        elif already_known:
+            status = "already_known"
         else:
             status = "rejected"
-        return {
+        return finish({
             "status": status,
             "reason": outcome.reason,
             "learned": learned,
             "held": held,
+            "already_known": already_known,
+            "rejected": rejected,
             "diagnostics": diagnostics,
             "source_id": message_id,
-        }
+        })
 
     def recall(
         self,
@@ -1901,6 +2015,18 @@ class ContextManager:
         from datetime import datetime, timezone
         from . import scoring as scoring_mod
 
+        # V2 typed retrieval is an opt-in replacement for the broad raw
+        # candidate path.  It validates relevance before applying recency and
+        # count, fixing the "last three likes" failure without adding an LLM
+        # call.  A caller that does not provide the original question keeps
+        # the legacy behavior byte-for-byte.
+        if self._memory_v2_enabled and plan.get("query"):
+            typed_intent = query_intent_mod.interpret(plan.get("query", ""), plan)
+            if typed_intent is not None and set(plan.get("sources", ())) & {"preferences", "facts"}:
+                return query_intent_mod.preference_evidence(
+                    self._get_store(), typed_intent, session_id=session_id,
+                )
+
         sources = set(plan["sources"])
         subject = (plan.get("subject") or "").casefold().strip()
         days = plan.get("recent_days")
@@ -2295,6 +2421,13 @@ class ContextManager:
                 if conflict:
                     diagnostics.append(conflict)
                 if is_new:
+                    replayed_user_source = False
+                    if role == "user":
+                        try:
+                            replayed_user_source = store.has_user_content(
+                                content, exclude_id=message_id)
+                        except Exception:
+                            replayed_user_source = False
                     formation_diags: list[str] = []
                     try:
                         store.set_formation_status(
@@ -2307,11 +2440,17 @@ class ContextManager:
                     # original message is the source of both text and time.
                     if role == "user":
                         try:
-                            claim = extract_experience_claim(content, role)
+                            source_message = store.fetch_message(message_id)
+                            claim = extract_experience_claim(
+                                content, role,
+                                reported_at=(source_message.timestamp if source_message else timestamp),
+                            )
                             if claim is not None:
                                 store.save_experience_event(
                                     session_id, message_id, claim.kind,
                                     claim.actor, claim.statement,
+                                    claim.occurred_at, claim.occurred_precision,
+                                    claim.occurred_timezone,
                                 )
                         except Exception as e:
                             formation_diags.append(f"episode_capture_failed: {e}")
@@ -2341,8 +2480,32 @@ class ContextManager:
                         self._extract_states(
                             store, session_id, message_id, role, content,
                             context_question, assistant_question,
+                            global_personal_preferences=self._memory_v2_enabled,
                         )
                     )
+                    # V2 typed formation is opt-in and proposal-only.  The
+                    # deterministic extractor above always runs first, so a
+                    # provider timeout or malformed response cannot remove
+                    # legacy behavior or admit an unsupported claim.
+                    if (
+                        role == "user"
+                        and self._memory_v2_enabled
+                        and self._formation_provider is not None
+                    ):
+                        if replayed_user_source:
+                            formation_diags.append(
+                                "typed_formation:skipped_already_processed_source"
+                            )
+                        else:
+                            typed = formation_mod.apply_proposals(
+                                store, session_id, store.fetch_message(message_id),
+                                self._formation_provider,
+                            )
+                            self._last_formation_timings = dict(typed.timings_ms)
+                            formation_diags.extend(
+                                [f"typed_formation:{item}"
+                                 for item in typed.diagnostics]
+                            )
                     if role == "user":
                         formation_diags.extend(
                             self._extract_entities(
@@ -2402,17 +2565,40 @@ class ContextManager:
         try:
             store.set_formation_status(message_id, session_id, "processing")
             if message.role == "user":
-                claim = extract_experience_claim(message.content, message.role)
+                claim = extract_experience_claim(
+                    message.content, message.role,
+                    reported_at=message.timestamp,
+                )
                 if claim is not None:
                     store.save_experience_event(
                         session_id, message_id, claim.kind,
-                        claim.actor, claim.statement)
+                        claim.actor, claim.statement, claim.occurred_at,
+                        claim.occurred_precision, claim.occurred_timezone)
             prior_user = self._prior_user_text(store, session_id, message_id)
             prior_assistant = self._prior_assistant_text(
                 store, session_id, message_id)
             diagnostics.extend(self._extract_states(
                 store, session_id, message_id, message.role, message.content,
-                prior_user, prior_assistant))
+                prior_user, prior_assistant,
+                global_personal_preferences=self._memory_v2_enabled))
+            if (
+                message.role == "user"
+                and self._memory_v2_enabled
+                and self._formation_provider is not None
+            ):
+                if store.has_user_content(
+                        message.content, exclude_id=message.message_id):
+                    diagnostics.append(
+                        "typed_formation:skipped_already_processed_source"
+                    )
+                else:
+                    typed = formation_mod.apply_proposals(
+                        store, session_id, message, self._formation_provider,
+                    )
+                    self._last_formation_timings = dict(typed.timings_ms)
+                    diagnostics.extend(
+                        [f"typed_formation:{item}" for item in typed.diagnostics]
+                    )
             if message.role == "user":
                 diagnostics.extend(self._extract_entities(
                     store, session_id, message_id, message.content,
@@ -2462,6 +2648,7 @@ class ContextManager:
         content: str,
         context_question: Optional[str] = None,
         assistant_question: Optional[str] = None,
+        global_personal_preferences: bool = False,
     ) -> list[str]:
         """Deterministic state extraction. Never invents on failure."""
         try:
@@ -2469,6 +2656,18 @@ class ContextManager:
                 candidates = state_mod.extract_candidates(
                     content, role, context_question, assistant_question
                 )
+                if global_personal_preferences and not re.search(
+                    r"\b(?:this session|this conversation|for now|temporarily|only here)\b",
+                    content, re.IGNORECASE,
+                ):
+                    from dataclasses import replace as dc_replace
+                    candidates = [
+                        dc_replace(candidate, scope="global")
+                        if candidate.mtype == state_mod.PREFERENCE
+                        and candidate.scope == "session"
+                        else candidate
+                        for candidate in candidates
+                    ]
                 reference_message = None
                 # Never store ``likes for it``. Resolve only a user-to-user
                 # reference with a uniquely named antecedent in this session.
@@ -2518,6 +2717,18 @@ class ContextManager:
                     candidates.extend(followup)
                 if not candidates:
                     return []
+                if global_personal_preferences and not re.search(
+                    r"\b(?:this session|this conversation|for now|temporarily|only here)\b",
+                    content, re.IGNORECASE,
+                ):
+                    from dataclasses import replace as dc_replace
+                    candidates = [
+                        dc_replace(candidate, scope="global")
+                        if candidate.mtype == state_mod.PREFERENCE
+                        and candidate.scope == "session"
+                        else candidate
+                        for candidate in candidates
+                    ]
                 diagnostics = state_mod.apply_user_candidates(
                     store, session_id, message_id, candidates
                 )

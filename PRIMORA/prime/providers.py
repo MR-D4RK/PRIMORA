@@ -71,6 +71,17 @@ class OllamaProvider(Provider):
         try:
             message = response_data.get("message", {})
             content = message.get("content", "")
+            reasoning = message.get("reasoning_content") or message.get("reasoning")
+            if not content and reasoning and capability in {"memory_formation", "jev"}:
+                # Qwen/llama.cpp may place a strict internal JSON reply in a
+                # reasoning channel even when thinking was disabled. The
+                # caller still performs full JSON, provenance, and admission
+                # validation; this transport fallback never turns prose into
+                # memory.
+                return PrimeResult.success({
+                    "content": reasoning, "model": model,
+                    "reasoning_fallback": True,
+                }, metadata={"reasoning_fallback": True})
             if not content:
                 return PrimeResult.failure("Ollama returned empty response")
             return PrimeResult.success({"content": content, "model": model})
@@ -99,6 +110,23 @@ def _normalize_openai_system_messages(messages: list[dict[str, Any]]) -> list[di
     conversation = [message for message in messages
                     if not (isinstance(message, dict) and message.get("role") == "system")]
     return ([{"role": "system", "content": combined}] if combined else []) + conversation
+
+
+def _content_text(value: Any) -> str:
+    """Normalize OpenAI/llama.cpp text content without accepting objects as prose."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        parts: list[str] = []
+        for block in value:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                text = block.get("text") or block.get("content")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
 
 
 class OpenAICompatibleProvider(Provider):
@@ -139,6 +167,8 @@ class OpenAICompatibleProvider(Provider):
 
         if isinstance(payload.get("options"), dict):
             request_body.update(payload["options"])
+        if isinstance(payload.get("response_format"), dict):
+            request_body["response_format"] = payload["response_format"]
 
         url = f"{self._base_url.rstrip('/')}/chat/completions"
 
@@ -167,9 +197,26 @@ class OpenAICompatibleProvider(Provider):
 
         try:
             choices = response_data.get("choices") or []
-            message = choices[0].get("message", {}) if choices else {}
-            content = message.get("content") or ""
+            choice = choices[0] if choices else {}
+            message = choice.get("message", {}) if isinstance(choice, dict) else {}
+            content = _content_text(message.get("content"))
+            if not content and isinstance(choice, dict):
+                content = _content_text(choice.get("text"))
+            reasoning = _content_text(
+                message.get("reasoning_content") or message.get("reasoning")
+            )
             if not content:
+                # Qwen/llama.cpp may spend the whole generation budget in its
+                # reasoning channel. Both internal consumers are strict
+                # JSON-only and validate every proposal, so using that channel
+                # here is safe and preserves deterministic fallback on parse
+                # failure.
+                if capability in {"memory_formation", "jev"} and reasoning:
+                    return PrimeResult.success(
+                        {"content": reasoning, "model": model,
+                         "reasoning_fallback": True},
+                        metadata={"reasoning_fallback": True},
+                    )
                 return PrimeResult.failure("OpenAI returned empty response")
             return PrimeResult.success({"content": content, "model": model})
         except Exception as e:

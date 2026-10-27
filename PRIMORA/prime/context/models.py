@@ -63,9 +63,11 @@ class DigestRecord:
 class ExperienceEvent:
     """An explicitly user-reported experience, with one immutable source.
 
-    ``reported_at`` is the time the message was recorded, not a claimed
-    real-world event time. ``verified`` means provenance-verified, not that
-    the external event itself has been independently checked.
+    ``reported_at`` is the time the message was recorded. ``occurred_at`` is
+    optional source-backed relative-date resolution with an explicit
+    precision; it is never substituted when the user did not provide one.
+    ``verified`` means provenance-verified, not that the external event itself
+    has been independently checked.
     """
 
     event_id: int
@@ -76,6 +78,9 @@ class ExperienceEvent:
     statement: str
     reported_at: float
     authority: str = "user"
+    occurred_at: Optional[float] = None
+    occurred_precision: str = "unknown"
+    occurred_timezone: str = "UTC"
 
 
 @dataclass(frozen=True)
@@ -143,6 +148,167 @@ class StateRecord:
 
 
 @dataclass(frozen=True)
+class ObservationRecord:
+    """A source-backed observation owned by Prime.
+
+    Observations are deliberately separate from states: they may describe a
+    proposed or unresolved interpretation while retaining the exact user
+    evidence that supports it.  ``proof_count`` is derived from linked
+    sources and is never a model supplied confidence value.
+    """
+
+    observation_id: int
+    session_id: str
+    scope: str
+    concept: str
+    normalized_concept: str
+    value: str
+    observation_type: str
+    actor: str
+    subject: str
+    predicate: str
+    source_ids: list[int]
+    source_episode_ids: list[str]
+    authority: str
+    status: str
+    confidence: float
+    created_at: float
+    observed_at: Optional[float] = None
+    occurred_from: Optional[float] = None
+    occurred_until: Optional[float] = None
+    valid_from: Optional[float] = None
+    valid_until: Optional[float] = None
+    supersedes_id: Optional[int] = None
+    superseded_at: Optional[float] = None
+    proof_count: int = 0
+
+    @property
+    def id(self) -> int:
+        return self.observation_id
+
+    @property
+    def source_message_ids(self) -> list[int]:
+        return list(self.source_ids)
+
+
+@dataclass(frozen=True)
+class ObservationHistoryRecord:
+    """Immutable snapshot taken before an observation lifecycle change."""
+
+    history_id: int
+    observation_id: int
+    snapshot: dict[str, Any]
+    reason: str
+    changed_at: float
+    superseded_by_id: Optional[int] = None
+
+    @property
+    def id(self) -> int:
+        return self.history_id
+
+
+@dataclass(frozen=True)
+class ConsolidationProposal:
+    """A reviewable, source-backed derived observation proposal.
+
+    Consolidation never treats a model score as truth.  ``proof_count`` is
+    derived from distinct immutable user source links and proposals remain
+    ``candidate`` until an explicit Prime review admits them.
+    """
+
+    scope: str
+    session_id: str
+    concept: str
+    value: str
+    source_ids: list[int] = field(default_factory=list)
+    source_quotes: dict[int, str] = field(default_factory=dict)
+    source_episode_ids: list[str] = field(default_factory=list)
+    proof_count: int = 0
+    observation_type: str = "derived"
+    predicate: str = ""
+    observed_at: Optional[float] = None
+    occurred_from: Optional[float] = None
+    occurred_until: Optional[float] = None
+    confidence: float = 1.0
+    uncertainty: str = ""
+    reason: str = ""
+    status: str = "candidate"
+
+
+@dataclass(frozen=True)
+class ConsolidationReport:
+    """Progress and results from one bounded consolidation/replay run."""
+
+    run_id: str
+    dry_run: bool
+    scanned: int
+    grouped: int
+    proposals: list[ConsolidationProposal] = field(default_factory=list)
+    applied_ids: list[int] = field(default_factory=list)
+    skipped: int = 0
+    diagnostics: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class RelationEvidencePacket:
+    """One bounded, source-cited relationship traversal result."""
+
+    packet_type: str
+    scope: str
+    relationship_id: int
+    relationship_type: str
+    subject: str
+    object: str
+    source_ids: list[int] = field(default_factory=list)
+    source_episode_ids: list[str] = field(default_factory=list)
+    status: str = "current"
+    authority: str = "user"
+    valid_from: Optional[float] = None
+    valid_until: Optional[float] = None
+    reason: str = ""
+    inferred: bool = False
+    hop: int = 1
+    related_id: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class RelationalRetrievalResult:
+    """Bounded relational results plus fail-closed diagnostics."""
+
+    query: str
+    scope: str
+    packets: list[RelationEvidencePacket] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class AuditFinding:
+    """A reviewable integrity finding; it never mutates memory."""
+
+    kind: str
+    severity: str
+    record_kind: str
+    record_id: int
+    concept: str = ""
+    value: str = ""
+    source_ids: list[int] = field(default_factory=list)
+    message: str = ""
+    recommendation: str = "review"
+
+
+@dataclass(frozen=True)
+class AuditReport:
+    """Read-only metamemory report over one disposable database."""
+
+    run_id: str
+    scanned: int
+    findings: list[AuditFinding] = field(default_factory=list)
+    proposals: list[dict[str, Any]] = field(default_factory=list)
+    diagnostics: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class CandidateRecord:
     """One proposed memory awaiting confirmation.
 
@@ -183,6 +349,9 @@ class EntityRecord:
     status: str = "candidate"
     merged_into_entity_id: Optional[int] = None
     merged_at: Optional[float] = None
+    source_episode_ids: list[str] = field(default_factory=list)
+    valid_from: Optional[float] = None
+    valid_until: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -224,6 +393,7 @@ class RelationshipRecord:
     status: str = "candidate"
     supersedes_id: Optional[int] = None
     superseded_at: Optional[float] = None
+    source_episode_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
