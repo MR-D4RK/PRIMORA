@@ -1,0 +1,1079 @@
+diff --git a/DOCS/01_architecture/MEMORY_UNIFICATION_M10.md b/DOCS/01_architecture/MEMORY_UNIFICATION_M10.md
+new file mode 100644
+index 0000000..2f9d162
+--- /dev/null
++++ b/DOCS/01_architecture/MEMORY_UNIFICATION_M10.md
+@@ -0,0 +1,84 @@
++# Memory unification milestone (M10)
++
++This milestone makes Prime's admission boundary the shared write seam for
++deterministic extraction, typed formation, `learn`, and working-memory
++promotion. Aurora may interpret a turn and propose meaning; Prime checks the
++source role, scope, lifecycle, and provenance before a durable row is written.
++
++## Runtime shape
++
++Raw turns remain append-only in `messages`. A user turn is admitted by the
++deterministic path immediately, then (when Memory V2 and a formation provider
++are enabled) gets one idempotent row in `formation_jobs`. The job stores no
++model output. A worker claims it transactionally, calls the configured local
++provider, and sends proposals through the same gateway and existing typed
++validation. A process restart reclaims `processing` jobs; failed jobs retry up
++to five times. Provider or JSON failure leaves the raw turn and deterministic
++memory intact and is visible in job diagnostics.
++
++`learn(user, ...)` accepts only an exact, already persisted user message in the
++same session. Aurora's assistant wording is never treated as user evidence.
++Other provenance classes remain reviewable and cannot become a current
++user-authority state. Existing databases are additive-migrated only; no
++production path is opened by this milestone.
++
++## Rollback controls
++
++Memory V2 can be disabled with `PRIMORA_MEMORY_V2=0` (or
++`ContextManager.set_memory_v2_enabled(False)`). Deferred processing can be
++drained explicitly with `ContextManager.drain_formation()` or disabled with
++`PRIMORA_MEMORY_FORMATION_DEFERRED=0`. The old deterministic and lexical
++paths remain available, and the durable queue is additive and safe to leave
++behind when the feature is disabled.
++
++## Disposable Windows / PowerShell acceptance
++
++Use a fresh file below `%TEMP%`; never point these commands at the production
++database. The local llama.cpp server must already be running with its
++OpenAI-compatible endpoint.
++
++```powershell
++$ErrorActionPreference = "Stop"
++$db = Join-Path $env:TEMP "primora-memory-unification-$([guid]::NewGuid()).db"
++$env:PRIMORA_MEMORY_V2 = "1"
++$env:PRIMORA_MEMORY_V2_FORMATION = "1"
++$env:PRIMORA_MEMORY_V2_RETRIEVAL = "1"
++$env:PRIMORA_MEMORY_FORMATION_DEFERRED = "1"
++$env:PRIMORA_PROVIDER = "openai"
++$env:PRIMORA_MEMORY_V2_DB = $db
++$env:PRIMORA_OPENAI_URL = "http://127.0.0.1:8080/v1"
++$env:PRIMORA_OPENAI_MODEL = "Qwen3.5-9B-Q4_K_M"
++
++python -m pytest -q `
++  TESTS/prime/test_memory_unification_m10.py `
++  TESTS/prime/test_memory_v2_runtime_integration.py `
++  TESTS/prime/test_evidence_backed_memory_v2.py
++
++# Preview/import is explicit and only targets the disposable destination.
++python -m PRIMORA.prime.context.memory_restore preview `
++  --source .\path\to\approved-source.db --target $db
++python -m PRIMORA.prime.context.memory_restore import `
++  --source .\path\to\approved-source.db --target $db
++
++# Start the normal CLI against the disposable store.  Exit and inspect the
++# formation_jobs table, then restart the CLI to verify durable recovery.
++python -m PRIMORA.main --cli
++```
++
++For a live-Qwen queue drain without starting the CLI, run this from the
++repository root after setting the variables above:
++
++```powershell
++python -c "from PRIMORA.prime.context import ContextManager; from PRIMORA.main import prime_provider_from_env; m=ContextManager(db_path=r'$db', enable_memory_v2=True, formation_provider=prime_provider_from_env()); print(m.drain_formation())"
++```
++
++
++## Acceptance evidence and limits
++
++Automated tests use disposable SQLite files and deterministic provider doubles;
++they do not validate Qwen output quality. Live acceptance must verify source
++quotes and source IDs in `formation_jobs` diagnostics, a restart while a job
++is `processing`, retry after a provider failure, and a repeated transcript
++without a second provider call. No external memory framework or second model
++is introduced. The model's semantic quality, throughput, and llama.cpp
++template behavior remain hardware-dependent and require the local Qwen run.
+diff --git a/PRIMORA/prime/context/__init__.py b/PRIMORA/prime/context/__init__.py
+index 419403e..f65cc57 100644
+--- a/PRIMORA/prime/context/__init__.py
++++ b/PRIMORA/prime/context/__init__.py
+@@ -44,6 +44,7 @@ from .models import (
+     noop_memory,
+ )
+ from .working import WorkingMemory
++from .admission import MemoryAdmissionGateway
+ 
+ __all__ = [
+     "COMPACT_AFTER_MESSAGES",
+@@ -86,6 +87,7 @@ __all__ = [
+     "AuditReport",
+     "StoredMessage",
+     "WorkingMemory",
++    "MemoryAdmissionGateway",
+     "estimate_tokens",
+     "noop_memory",
+ ]
+diff --git a/PRIMORA/prime/context/admission.py b/PRIMORA/prime/context/admission.py
+new file mode 100644
+index 0000000..412b8f3
+--- /dev/null
++++ b/PRIMORA/prime/context/admission.py
+@@ -0,0 +1,70 @@
++"""Prime's single durable-memory admission gateway.
++
++Aurora and formation providers propose meaning. This gateway is the shared
++write seam for deterministic extraction, typed formation, learning, and
++working-memory promotion. It delegates the existing lifecycle rules rather
++than introducing another schema or authority model.
++"""
++from __future__ import annotations
++
++from typing import Any
++
++
++class MemoryAdmissionGateway:
++    """Prime-owned adapter around candidate and state admission."""
++
++    def __init__(self, store: Any):
++        self.store = store
++
++    def create_pending(
++        self,
++        session_id: str,
++        scope: str,
++        source_ids: list[int],
++        proposed_type: str,
++        proposed_concept: str,
++        proposed_value: str,
++        proposed_rationale: str = "",
++        authority: str = "user",
++        confidence: float = 0.3,
++    ) -> int:
++        """Create one reviewable candidate through the trusted store seam."""
++        return self.store.create_candidate(
++            session_id, scope, list(source_ids), proposed_type,
++            proposed_concept, proposed_value, proposed_rationale,
++            authority=authority, confidence=confidence, status="pending",
++        )
++
++    def confirm_pending(self, session_id: str, candidate_id: int) -> list[str]:
++        from . import state as state_mod
++        return state_mod.confirm_pending(self.store, session_id, candidate_id)
++
++    def create_state(self, *args: Any, **kwargs: Any) -> int:
++        """Admit a validated state while retaining the store's invariants."""
++        return self.store.create_state(*args, **kwargs)
++
++    def create_state_successor(self, *args: Any, **kwargs: Any) -> int:
++        """Admit a correction/supersession through the same write seam."""
++        return self.store.create_state_successor(*args, **kwargs)
++
++    def create_state_with_explains(self, *args: Any, **kwargs: Any) -> tuple[int, int]:
++        """Admit a source-backed rationale and its explains edge."""
++        return self.store.create_state_with_explains(*args, **kwargs)
++
++    def create_entity(self, *args: Any, **kwargs: Any) -> int:
++        return self.store.create_entity(*args, **kwargs)
++
++    def create_entity_alias(self, *args: Any, **kwargs: Any) -> int:
++        return self.store.create_entity_alias(*args, **kwargs)
++
++    def create_relationship(self, *args: Any, **kwargs: Any) -> int:
++        return self.store.create_relationship(*args, **kwargs)
++
++    def admit_user_candidates(
++        self, session_id: str, message_id: int, candidates: list[Any]
++    ) -> list[str]:
++        from . import state as state_mod
++        return state_mod.apply_user_candidates(
++            self.store, session_id, message_id, candidates,
++        )
++
+diff --git a/PRIMORA/prime/context/formation.py b/PRIMORA/prime/context/formation.py
+index 12410dd..e337afa 100644
+--- a/PRIMORA/prime/context/formation.py
++++ b/PRIMORA/prime/context/formation.py
+@@ -19,6 +19,7 @@ from typing import Any, Optional
+ 
+ from PRIMORA.prime.contract import RequestStatus
+ from .episodes import extract_experience_claim
++from .admission import MemoryAdmissionGateway
+ 
+ MEMORY_KINDS = frozenset({"preference", "state", "event", "relationship", "observation"})
+ CLAIM_KINDS = frozenset({
+@@ -385,6 +386,7 @@ def _admit_rationale(
+     preference_state_id: int,
+     candidate: TypedMemoryCandidate,
+     message: Any,
++    admission: Optional[MemoryAdmissionGateway] = None,
+ ) -> list[str]:
+     """Persist a provider rationale only after source validation.
+ 
+@@ -409,7 +411,8 @@ def _admit_rationale(
+             [row.state_id for row in current],
+             transition_time=transition,
+         )
+-    rationale_id, relationship_id = store.create_state_with_explains(
++    admission = admission or MemoryAdmissionGateway(store)
++    rationale_id, relationship_id = admission.create_state_with_explains(
+         session_id, scope, concept, rationale, candidate.source_ids,
+         preference_state_id, memory_type="RATIONALE", confidence=candidate.confidence,
+         observed_at=getattr(message, "timestamp", None),
+@@ -446,6 +449,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+     """Validate and admit proposals; deterministic extraction remains separate."""
+     timed_store = _TimingStore(store)
+     store = timed_store
++    admission = MemoryAdmissionGateway(store)
+     started = time.perf_counter()
+     provider_started = time.perf_counter()
+     candidates, diagnostic = provider_proposals(provider, message, session_id)
+@@ -497,7 +501,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+         # Relationships and observations are reviewable proposals until an
+         # entity endpoint or explicit observation admission is available.
+         if candidate.kind in {"relationship", "observation"}:
+-            held.append(store.create_candidate(
++            held.append(admission.create_pending(
+                 session_id, "global" if candidate.scope == "global" else session_id,
+                 candidate.source_ids, candidate.kind, candidate.concept,
+                 candidate.value, candidate.rationale, "user", candidate.confidence,
+@@ -526,7 +530,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+                 )
+             except Exception as exc:
+                 diagnostics.append(f"event_proposal_held:{exc}")
+-                held.append(store.create_candidate(
++                held.append(admission.create_pending(
+                     session_id, session_id, candidate.source_ids, candidate.kind,
+                     candidate.concept, candidate.value, candidate.rationale,
+                     "user", candidate.confidence,
+@@ -591,10 +595,11 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+                 admitted.append(same.state_id)
+                 diagnostics.extend(_admit_rationale(
+                     store, session_id, scope, same.state_id, candidate, message,
++                    admission=admission,
+                 ))
+                 continue
+             if predecessor_ids:
+-                state_id = store.create_state_successor(
++                state_id = admission.create_state_successor(
+                     session_id, scope, candidate.concept, candidate.value,
+                     candidate.source_ids, predecessor_ids, memory_type=(
+                         "PREFERENCE" if candidate.kind == "preference" else "FACT"
+@@ -603,7 +608,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+                     valid_until=candidate.valid_until,
+                 )
+             else:
+-                state_id = store.create_state(
++                state_id = admission.create_state(
+                     session_id, scope, candidate.concept, candidate.value,
+                     candidate.source_ids, memory_type=(
+                         "PREFERENCE" if candidate.kind == "preference" else "FACT"
+@@ -614,6 +619,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+             admitted.append(state_id)
+             diagnostics.extend(_admit_rationale(
+                 store, session_id, scope, state_id, candidate, message,
++                admission=admission,
+             ))
+         except Exception as exc:
+             diagnostics.append(f"proposal_write_failed:{exc}")
+diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
+index dbda4ab..1e5ceb4 100644
+--- a/PRIMORA/prime/context/manager.py
++++ b/PRIMORA/prime/context/manager.py
+@@ -49,6 +49,7 @@ from .models import (
+     noop_memory,
+ )
+ from .store import ContextStore
++from .admission import MemoryAdmissionGateway
+ 
+ DEFAULT_SESSION_ID = "default"
+ 
+@@ -257,6 +258,11 @@ class ContextManager:
+             )
+         self._memory_v2_enabled = bool(enable_memory_v2)
+         self._store: Optional[ContextStore] = None
++        self._admission: Optional[MemoryAdmissionGateway] = None
++        self._formation_deferred = (
++            os.environ.get("PRIMORA_MEMORY_FORMATION_DEFERRED", "0")
++            .strip().lower() in ("1", "true", "yes", "on")
++        )
+         # M6 LIVE. Hybrid retrieval is the returned result. Defaults on;
+         # set hybrid_retrieval=False (or PRIMORA_HYBRID_RETRIEVAL=0) to roll
+         # back to the lexical-only path, which is retained unchanged.
+@@ -286,6 +292,20 @@ class ContextManager:
+         # influence admission or retrieval.
+         self._last_formation_timings: dict[str, float] = {}
+ 
++    @property
++    def admission(self) -> MemoryAdmissionGateway:
++        """The one Prime memory write gateway for this store."""
++        if self._admission is None:
++            self._admission = MemoryAdmissionGateway(self._get_store())
++        return self._admission
++
++    @property
++    def formation_deferred(self) -> bool:
++        return self._formation_deferred
++
++    def set_formation_deferred(self, enabled: bool) -> None:
++        self._formation_deferred = bool(enabled)
++
+     # ------------------------------------------------------------------
+     # M6 live-switch surface
+     # ------------------------------------------------------------------
+@@ -365,10 +385,9 @@ class ContextManager:
+         invents no schema of its own. It calls three existing mechanisms, in
+         the order the memory system already uses:
+ 
+-        1. ``store.append`` persists Aurora's sentence as an *assistant*
+-           message. Assistant-authored statements are not auto-admitted by
+-           formation, so the sentence cannot become memory merely by being
+-           written down, and its id is the provenance anchor.
++        1. A ``user`` provenance request must resolve to an existing immutable
++           user message. Other provenance classes are anchored to a newly
++           appended assistant row and remain held/reviewable.
+         2. ``store.create_candidate`` records Jev's structured reading as a
+            pending candidate carrying the provenance as its ``authority``.
+         3. ``state.confirm_pending`` promotes it, and only if the lifecycle
+@@ -406,10 +425,37 @@ class ContextManager:
+         persist_started = time.perf_counter()
+         try:
+             store = self._get_store()
+-            seq = store.count(session_id) + 1
+-            message_id, _is_new, _diag = store.append(
+-                session_id, seq, "assistant", statement
+-            )
++            if request_provenance == "user":
++                # ``learn`` is invoked after Aurora interprets a turn.  The
++                # interpreted sentence is assistant-authored and therefore
++                # cannot serve as user evidence.  User authority is accepted
++                # only when the exact claim already exists in an immutable
++                # user message for this session.
++                normalized = " ".join(statement.casefold().split())
++                source = next(
++                    (
++                        item for item in reversed(
++                            store.fetch_range(session_id, 0, None, limit=5000)
++                        )
++                        if item.role == "user"
++                        and " ".join(item.content.casefold().split()) == normalized
++                    ),
++                    None,
++                )
++                if source is None:
++                    timings["persist_ms"] = (
++                        time.perf_counter() - persist_started
++                    ) * 1000
++                    return finish({
++                        "status": "rejected",
++                        "reason": "user_provenance_requires_matching_user_source",
++                    })
++                message_id = source.message_id
++            else:
++                seq = store.count(session_id) + 1
++                message_id, _is_new, _diag = store.append(
++                    session_id, seq, "assistant", statement
++                )
+         except Exception as exc:
+             timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
+             return finish({"status": "rejected", "reason": f"persist_failed: {exc}"})
+@@ -525,17 +571,12 @@ class ContextManager:
+                 )
+                 continue
+             try:
+-                candidate_id = store.create_candidate(
+-                    session_id,
+-                    scope,
+-                    [message_id],
+-                    proposed_type=candidate.memory_type or "FACT",
+-                    proposed_concept=candidate.concept,
+-                    proposed_value=candidate.value,
+-                    proposed_rationale=candidate.rationale,
++                candidate_id = self.admission.create_pending(
++                    session_id, scope, [message_id],
++                    candidate.memory_type or "FACT", candidate.concept,
++                    candidate.value, candidate.rationale,
+                     authority=request_provenance,
+                     confidence=candidate.confidence,
+-                    status="pending",
+                 )
+             except Exception as exc:
+                 diagnostics.append(f"learn_failed: candidate write: {exc}")
+@@ -552,9 +593,7 @@ class ContextManager:
+ 
+             # The existing admission gate. It re-validates the candidate and
+             # refuses anything without a concept, a type, or provenance.
+-            from PRIMORA.prime.context import state as state_mod
+-
+-            confirm = state_mod.confirm_pending(store, session_id, candidate_id)
++            confirm = self.admission.confirm_pending(session_id, candidate_id)
+             diagnostics.extend(confirm)
+             if any(d.startswith("state_failed") for d in confirm):
+                 held.append(record)
+@@ -1867,11 +1906,10 @@ class ContextManager:
+         scope_key = "global" if scope == "global" else session_id
+         if not candidates:
+             try:
+-                cid = store.create_candidate(
++                cid = self.admission.create_pending(
+                     session_id, scope_key, list(source_ids or []),
+-                    proposed_type="UNCERTAIN", proposed_concept="",
+-                    proposed_value=text.strip()[:200], authority="user",
+-                    confidence=0.3, status="pending",
++                    "UNCERTAIN", "", text.strip()[:200],
++                    authority="user", confidence=0.3,
+                 )
+                 ids.append(cid)
+                 diagnostics.append("candidate_pending: uncertain promotion")
+@@ -1894,13 +1932,10 @@ class ContextManager:
+                 # Legacy X-is-Y shapes carry no type; they assert a plain
+                 # fact. Genuinely structureless promotions stay UNCERTAIN
+                 # via the branch above, never here.
+-                cid = store.create_candidate(
++                cid = self.admission.create_pending(
+                     session_id, cand_scope_key, list(source_ids or []),
+-                    proposed_type=cand.mtype or "FACT",
+-                    proposed_concept=cand.concept,
+-                    proposed_value=cand.value,
+-                    proposed_rationale=cand.rationale, authority="user",
+-                    confidence=0.3, status="pending",
++                    cand.mtype or "FACT", cand.concept, cand.value,
++                    cand.rationale, authority="user", confidence=0.3,
+                 )
+                 ids.append(cid)
+                 diagnostics.append(
+@@ -2487,6 +2522,7 @@ class ContextManager:
+                     # deterministic extractor above always runs first, so a
+                     # provider timeout or malformed response cannot remove
+                     # legacy behavior or admit an unsupported claim.
++                    formation_pending = False
+                     if (
+                         role == "user"
+                         and self._memory_v2_enabled
+@@ -2497,15 +2533,11 @@ class ContextManager:
+                                 "typed_formation:skipped_already_processed_source"
+                             )
+                         else:
+-                            typed = formation_mod.apply_proposals(
+-                                store, session_id, store.fetch_message(message_id),
+-                                self._formation_provider,
+-                            )
+-                            self._last_formation_timings = dict(typed.timings_ms)
+-                            formation_diags.extend(
+-                                [f"typed_formation:{item}"
+-                                 for item in typed.diagnostics]
+-                            )
++                            store.enqueue_formation_job(message_id, session_id)
++                            formation_pending = True
++                            formation_diags.append("typed_formation:queued")
++                            if not self._formation_deferred:
++                                formation_diags.extend(self.drain_formation())
+                     if role == "user":
+                         formation_diags.extend(
+                             self._extract_entities(
+@@ -2521,10 +2553,13 @@ class ContextManager:
+                         )) for item in formation_diags
+                     )
+                     try:
++                        final_status = (
++                            "processing" if formation_pending and
++                            self._formation_deferred else
++                            ("incomplete" if failed else "complete")
++                        )
+                         store.set_formation_status(
+-                            message_id, session_id,
+-                            "incomplete" if failed else "complete",
+-                            formation_diags,
++                            message_id, session_id, final_status, formation_diags,
+                         )
+                     except Exception as e:
+                         diagnostics.append(f"formation_status_failed: {e}")
+@@ -2548,6 +2583,63 @@ class ContextManager:
+         except Exception:
+             return []
+ 
++    def formation_jobs(self, session_id: Optional[str] = None,
++                       status: Optional[str] = None) -> list[dict[str, Any]]:
++        """Read durable formation work without mutating the queue."""
++        try:
++            return self._get_store().formation_jobs(session_id, status)
++        except Exception:
++            return []
++
++    def drain_formation(self, limit: int = 8) -> list[str]:
++        """Resume queued typed formation exactly once per source message.
++
++        Raw history and deterministic formation are already durable. This
++        worker only handles model-backed proposals; a crash leaves a job that
++        the next drain can safely reclaim because admission is idempotent.
++        """
++        if not self._memory_v2_enabled or self._formation_provider is None:
++            return ["formation_drain:provider_not_configured"]
++        store = self._get_store()
++        diagnostics: list[str] = []
++        for job in store.claim_formation_jobs(limit):
++            message = store.fetch_message(job["message_id"])
++            if message is None or message.role != "user":
++                error = "source_message_not_found_or_not_user"
++                store.finish_formation_job(job["job_id"], "failed", error)
++                diagnostics.append(f"formation_job_failed:{job['job_id']}:{error}")
++                continue
++            try:
++                typed = formation_mod.apply_proposals(
++                    store, job["session_id"], message, self._formation_provider,
++                )
++                self._last_formation_timings = dict(typed.timings_ms)
++                items = [f"typed_formation:{item}" for item in typed.diagnostics]
++                failed = any(item.startswith("typed_formation:provider_")
++                             or item.startswith("typed_formation:malformed")
++                             for item in items)
++                store.finish_formation_job(
++                    job["job_id"], "failed" if failed else "complete",
++                    "provider_or_parse_failure" if failed else "",
++                )
++                # Provider/JSON failures are observable job failures, but the
++                # raw user turn and deterministic formation completed safely;
++                # preserve the historical "complete" conversation status so
++                # an unavailable model never breaks ordinary replies.
++                store.set_formation_status(
++                    message.message_id, job["session_id"],
++                    "complete", items,
++                )
++                diagnostics.extend(items)
++            except Exception as exc:
++                error = f"{type(exc).__name__}: {exc}"
++                store.finish_formation_job(job["job_id"], "failed", error)
++                store.set_formation_status(
++                    message.message_id, job["session_id"], "incomplete", [error],
++                )
++                diagnostics.append(f"formation_job_failed:{job['job_id']}:{error}")
++        return diagnostics
++
+     def replay_formation(
+         self, session_id: str, message_id: int,
+     ) -> list[str]:
+@@ -2592,13 +2684,10 @@ class ContextManager:
+                         "typed_formation:skipped_already_processed_source"
+                     )
+                 else:
+-                    typed = formation_mod.apply_proposals(
+-                        store, session_id, message, self._formation_provider,
+-                    )
+-                    self._last_formation_timings = dict(typed.timings_ms)
+-                    diagnostics.extend(
+-                        [f"typed_formation:{item}" for item in typed.diagnostics]
+-                    )
++                    store.enqueue_formation_job(message.message_id, session_id)
++                    diagnostics.append("typed_formation:queued")
++                    if not self._formation_deferred:
++                        diagnostics.extend(self.drain_formation())
+             if message.role == "user":
+                 diagnostics.extend(self._extract_entities(
+                     store, session_id, message_id, message.content,
+@@ -2639,8 +2728,8 @@ class ContextManager:
+         except Exception as e:
+             return [f"m5_failed: {e}"]
+ 
+-    @staticmethod
+     def _extract_states(
++        self,
+         store,
+         session_id: str,
+         message_id: int,
+@@ -2729,8 +2818,8 @@ class ContextManager:
+                         else candidate
+                         for candidate in candidates
+                     ]
+-                diagnostics = state_mod.apply_user_candidates(
+-                    store, session_id, message_id, candidates
++                diagnostics = self.admission.admit_user_candidates(
++                    session_id, message_id, candidates
+                 )
+                 if reference_message is not None:
+                     for candidate in candidates:
+diff --git a/PRIMORA/prime/context/memory_restore.py b/PRIMORA/prime/context/memory_restore.py
+index 614b218..d538cd5 100644
+--- a/PRIMORA/prime/context/memory_restore.py
++++ b/PRIMORA/prime/context/memory_restore.py
+@@ -24,14 +24,15 @@ TABLES = (
+     "sessions", "messages", "digests", "experience_events", "states",
+     "candidates", "entities", "entity_aliases", "relationships",
+     "observations", "observation_sources", "observation_history",
+-    "formation_status", "retrieval_vectors", "retrieval_index_meta",
++    "formation_status", "formation_jobs", "retrieval_vectors",
++    "retrieval_index_meta",
+ )
+ 
+ _OPTIONAL_TABLES = {"digests", "experience_events", "candidates", "entities",
+                     "entity_aliases", "relationships", "observations",
+                     "observation_sources", "observation_history",
+                     "formation_status", "retrieval_vectors",
+-                    "retrieval_index_meta"}
++                    "formation_jobs", "retrieval_index_meta"}
+ 
+ _REQUIRED_COLUMNS = {
+     "sessions": {"session_id", "created_at", "last_activity_at"},
+@@ -50,6 +51,10 @@ _REQUIRED_COLUMNS = {
+     "observation_sources": {"id", "observation_id"},
+     "observation_history": {"id", "observation_id", "snapshot_json"},
+     "formation_status": {"message_id"},
++    "formation_jobs": {
++        "job_id", "message_id", "session_id", "status", "attempts",
++        "last_error", "created_at", "updated_at",
++    },
+ }
+ 
+ 
+@@ -553,6 +558,26 @@ class MemoryRestoreService:
+             message_id = _value(row, "message_id")
+             if source.execute("SELECT 1 FROM messages WHERE id=?", (message_id,)).fetchone() is None:
+                 return RestoreIssue(table, source_id, "formation source message is missing")
++        if table == "formation_jobs":
++            message_id = _value(row, "message_id")
++            if source.execute("SELECT 1 FROM messages WHERE id=?", (message_id,)).fetchone() is None:
++                return RestoreIssue(table, source_id, "formation job source message is missing")
++            if _value(row, "status") not in {"pending", "processing", "complete", "failed"}:
++                return RestoreIssue(table, source_id, "invalid formation job status")
++            target_message = _target_message_for_source(
++                source, target_rows, message_id,
++            )
++            if target_message is not None:
++                for target_job in target_rows.get("formation_jobs", []):
++                    if int(_value(target_job, "message_id")) != target_message:
++                        continue
++                    if _value(target_job, "status") != _value(row, "status"):
++                        return RestoreIssue(
++                            table, source_id,
++                            "formation job state conflicts with destination",
++                            "conflict", int(_value(target_job, "job_id")),
++                        )
++                    break
+         if table == "observation_history":
+             observation_id = _value(row, "observation_id")
+             if source.execute(
+@@ -630,6 +655,13 @@ class MemoryRestoreService:
+                            for field in ("observation_type", "actor", "subject", "predicate", "authority")
+                        )
+                        and target["status"] == row["status"] for target in targets)
++        if table == "formation_jobs":
++            return any(
++                _value(target, "message_id") == _value(row, "message_id")
++                and _value(target, "session_id") == _value(row, "session_id")
++                and _value(target, "status") == _value(row, "status")
++                for target in targets
++            )
+         return False
+ 
+     def import_into(self) -> RestoreResult:
+@@ -1209,6 +1241,37 @@ class MemoryRestoreService:
+                     (message, _value(row, "session_id"), _value(row, "status"), _value(row, "attempts", 0), _value(row, "diagnostics", "[]"), _value(row, "updated_at", 0.0)),
+                 )
+                 self._bump(imported, "formation_status")
++        if _supported(source, "formation_jobs"):
++            for row in _rows(source, "formation_jobs"):
++                message = maps["messages"].get(int(row["message_id"]))
++                if message is None:
++                    raise _ImportConflict(RestoreIssue(
++                        "formation_jobs", int(row["job_id"]),
++                        "formation job source message was not imported",
++                    ))
++                exists = target.execute(
++                    "SELECT job_id FROM formation_jobs WHERE message_id=?",
++                    (message,),
++                ).fetchone()
++                if exists:
++                    maps["formation_jobs"][int(row["job_id"])] = int(exists[0])
++                    self._bump(already, "formation_jobs")
++                    continue
++                target.execute(
++                    "INSERT INTO formation_jobs(message_id,session_id,status,attempts,last_error,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
++                    (
++                        message, _value(row, "session_id"),
++                        _value(row, "status", "pending"),
++                        _value(row, "attempts", 0),
++                        _value(row, "last_error", ""),
++                        _value(row, "created_at", 0.0),
++                        _value(row, "updated_at", 0.0),
++                    ),
++                )
++                maps["formation_jobs"][int(row["job_id"])] = int(
++                    target.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
++                )
++                self._bump(imported, "formation_jobs")
+ 
+     def _import_observation_history(self, source, target, maps, imported, already, unsupported):
+         if not _supported(source, "observation_history"):
+diff --git a/PRIMORA/prime/context/store.py b/PRIMORA/prime/context/store.py
+index bbaf75b..4c39fc6 100644
+--- a/PRIMORA/prime/context/store.py
++++ b/PRIMORA/prime/context/store.py
+@@ -314,6 +314,18 @@ CREATE TABLE IF NOT EXISTS formation_status (
+ );
+ CREATE INDEX IF NOT EXISTS idx_formation_status_session
+     ON formation_status(session_id, status);
++CREATE TABLE IF NOT EXISTS formation_jobs (
++    job_id INTEGER PRIMARY KEY AUTOINCREMENT,
++    message_id INTEGER NOT NULL UNIQUE,
++    session_id TEXT NOT NULL,
++    status TEXT NOT NULL DEFAULT 'pending',
++    attempts INTEGER NOT NULL DEFAULT 0,
++    last_error TEXT NOT NULL DEFAULT '',
++    created_at REAL NOT NULL,
++    updated_at REAL NOT NULL
++);
++CREATE INDEX IF NOT EXISTS idx_formation_jobs_status
++    ON formation_jobs(status, updated_at, job_id);
+ """
+ 
+ _FTS_SCHEMA = """
+@@ -351,6 +363,32 @@ class ContextStore:
+         con.execute("PRAGMA synchronous=NORMAL;")
+         return con
+ 
++    @staticmethod
++    def _validate_user_source_roles(
++        con: sqlite3.Connection,
++        source_ids: list[int],
++        authority: str,
++    ) -> None:
++        """Reject user-authority writes backed by non-user rows.
++
++        Old imported fixtures can contain references whose raw message is no
++        longer present, so missing rows remain tolerated here and are reported
++        by migration/audit code.  When a referenced row exists, however, its
++        role is authoritative: non-user output can never be promoted to a
++        user-authority memory record.
++        """
++        if authority != "user":
++            return
++        for source_id in dict.fromkeys(int(value) for value in (source_ids or [])):
++            row = con.execute(
++                "SELECT role FROM messages WHERE id = ?", (source_id,)
++            ).fetchone()
++            if row is not None and str(row[0]).casefold() != "user":
++                raise ValueError(
++                    "user-authority memory requires a user source "
++                    f"(source_id={source_id}, role={row[0]!r})"
++                )
++
+     @contextmanager
+     def _connection(self):
+         """Yield one SQLite connection and always close it.
+@@ -565,6 +603,85 @@ class ContextStore:
+             })
+         return out
+ 
++    def enqueue_formation_job(self, message_id: int, session_id: str) -> bool:
++        """Queue one typed-formation job idempotently."""
++        now = time.time()
++        with self._connection() as con:
++            cur = con.execute(
++                "INSERT OR IGNORE INTO formation_jobs"
++                "(message_id, session_id, status, attempts, last_error, created_at, updated_at)"
++                " VALUES (?, ?, 'pending', 0, '', ?, ?)",
++                (int(message_id), session_id, now, now),
++            )
++            return bool(cur.rowcount)
++
++    def claim_formation_jobs(self, limit: int = 8) -> list[dict[str, Any]]:
++        """Claim pending/stale jobs transactionally for restart-safe draining."""
++        limit = max(1, min(int(limit), 100))
++        now = time.time()
++        with self._connection() as con:
++            con.execute("BEGIN IMMEDIATE")
++            # A crashed worker leaves processing behind. Requeue it on the
++            # next drain; jobs are idempotent by message_id.
++            con.execute(
++                "UPDATE formation_jobs SET status='pending', updated_at=? "
++                "WHERE status='processing'", (now,)
++            )
++            rows = con.execute(
++                "SELECT job_id, message_id, session_id, attempts FROM formation_jobs "
++                "WHERE status IN ('pending', 'failed') AND attempts < 5 "
++                "ORDER BY job_id LIMIT ?", (limit,)
++            ).fetchall()
++            jobs = []
++            for job_id, message_id, session_id, attempts in rows:
++                con.execute(
++                    "UPDATE formation_jobs SET status='processing', attempts=?, updated_at=? "
++                    "WHERE job_id=? AND status IN ('pending', 'failed')",
++                    (int(attempts) + 1, now, int(job_id)),
++                )
++                jobs.append({
++                    "job_id": int(job_id), "message_id": int(message_id),
++                    "session_id": session_id, "attempts": int(attempts) + 1,
++                })
++            return jobs
++
++    def finish_formation_job(
++        self, job_id: int, status: str, error: str = "",
++    ) -> None:
++        if status not in ("complete", "failed", "pending"):
++            raise ValueError("invalid formation job status")
++        with self._connection() as con:
++            con.execute(
++                "UPDATE formation_jobs SET status=?, last_error=?, updated_at=? "
++                "WHERE job_id=?",
++                (status, str(error or ""), time.time(), int(job_id)),
++            )
++
++    def formation_jobs(
++        self, session_id: Optional[str] = None,
++        status: Optional[str] = None,
++    ) -> list[dict[str, Any]]:
++        query = (
++            "SELECT job_id, message_id, session_id, status, attempts, "
++            "last_error, created_at, updated_at FROM formation_jobs WHERE 1=1"
++        )
++        params: list[Any] = []
++        if session_id is not None:
++            query += " AND session_id=?"
++            params.append(session_id)
++        if status is not None:
++            query += " AND status=?"
++            params.append(status)
++        query += " ORDER BY job_id"
++        with self._connection() as con:
++            rows = con.execute(query, params).fetchall()
++        return [
++            {"job_id": r[0], "message_id": r[1], "session_id": r[2],
++             "status": r[3], "attempts": r[4], "last_error": r[5],
++             "created_at": r[6], "updated_at": r[7]}
++            for r in rows
++        ]
++
+     def save_experience_event(
+         self, session_id: str, source_message_id: int,
+         kind: str, actor: str, statement: str,
+@@ -1191,6 +1308,7 @@ class ContextStore:
+             if superseded_at is not None else None
+         )
+         with self._connection() as con:
++            self._validate_user_source_roles(con, source_ids, authority)
+             observed = self._resolve_observed_at(
+                 con, source_ids, created_at, observed_at
+             )
+@@ -1238,6 +1356,7 @@ class ContextStore:
+         )
+         with self._connection() as con:
+             con.execute("BEGIN IMMEDIATE")
++            self._validate_user_source_roles(con, sources, "user")
+             explained = con.execute(
+                 "SELECT scope, status, authority FROM states WHERE id = ?",
+                 (explains_state_id,),
+@@ -1314,6 +1433,7 @@ class ContextStore:
+         expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
+         with self._connection() as con:
+             con.execute("BEGIN IMMEDIATE")
++            self._validate_user_source_roles(con, source_ids, authority)
+             current_rows = con.execute(
+                 "SELECT id FROM states"
+                 " WHERE scope = ? AND concept = ? AND status = 'current'"
+@@ -1811,6 +1931,7 @@ class ContextStore:
+         expires_at: Optional[float] = None,
+     ) -> int:
+         with self._connection() as con:
++            self._validate_user_source_roles(con, source_ids, authority)
+             cur = con.execute(
+                 "INSERT INTO candidates"
+                 "(session_id, scope, source_ids, proposed_type,"
+@@ -2016,6 +2137,7 @@ class ContextStore:
+         )
+         self._validate_interval(normalized_from, normalized_until)
+         with self._connection() as con:
++            self._validate_user_source_roles(con, sources, authority)
+             observed = self._resolve_observed_at(
+                 con, sources, created_at, observed_at
+             )
+@@ -2252,6 +2374,7 @@ class ContextStore:
+             if valid_until is not None else None
+         )
+         with self._connection() as con:
++            self._validate_user_source_roles(con, sources, authority)
+             entity = con.execute(
+                 "SELECT scope, status, source_ids FROM entities"
+                 " WHERE id = ?",
+@@ -2564,6 +2687,7 @@ class ContextStore:
+             if valid_until is not None else None
+         )
+         with self._connection() as con:
++            self._validate_user_source_roles(con, sources, authority)
+             self._validate_relationship_endpoints(
+                 con, scope, relationship_type, subject_kind, subject_id,
+                 object_kind, object_id, False,
+diff --git a/TESTS/prime/test_memory_unification_m10.py b/TESTS/prime/test_memory_unification_m10.py
+new file mode 100644
+index 0000000..5114358
+--- /dev/null
++++ b/TESTS/prime/test_memory_unification_m10.py
+@@ -0,0 +1,176 @@
++"""M10 memory-unification regression coverage.
++
++These tests use disposable SQLite stores and a deterministic provider double;
++they exercise the same Prime admission and durable formation seams used by the
++live Qwen path without touching the production database.
++"""
++
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from PRIMORA.prime.contract import PrimeResult
++from PRIMORA.prime.context import ContextManager
++from PRIMORA.prime.context.memory_restore import MemoryRestoreService
++from PRIMORA.prime.context.store import ContextStore
++
++
++class _FormationProvider:
++    def __init__(self, *, failures: int = 0, source_id: int | None = None):
++        self.failures = failures
++        self.source_id = source_id
++        self.calls = 0
++
++    def invoke(self, capability, payload):
++        assert capability == "memory_formation"
++        self.calls += 1
++        if self.failures:
++            self.failures -= 1
++            return PrimeResult.failure("temporary formation outage")
++        source_id = self.source_id or payload["source_message_id"]
++        source = payload["messages"][-1]["content"]
++        return PrimeResult.success({
++            "content": json.dumps({"candidates": [{
++                "kind": "preference",
++                "concept": "preferred material",
++                "value": "opal fiber",
++                "claim_kind": "assertion",
++                "actor": "user",
++                "scope": "global",
++                "source_ids": [source_id],
++                "source_quote": source,
++            }]})
++        })
++
++
++def _manager(path, provider, *, deferred=True):
++    manager = ContextManager(
++        db_path=path,
++        enable_memory_v2=True,
++        formation_provider=provider,
++    )
++    manager.set_formation_deferred(deferred)
++    return manager
++
++
++def test_user_authority_cannot_reference_assistant_source(tmp_path):
++    store = ContextStore(tmp_path / "authority.db")
++    message_id, _, _ = store.append("s", 0, "assistant", "The user's material is opal fiber.")
++
++    with pytest.raises(ValueError, match="requires a user source"):
++        store.create_state("s", "global", "preferred material", "opal fiber", [message_id])
++    with pytest.raises(ValueError, match="requires a user source"):
++        store.create_candidate(
++            "s", "global", [message_id], "PREFERENCE",
++            "preferred material", "opal fiber", authority="user",
++        )
++
++
++def test_deferred_formation_survives_restart_and_is_idempotent(tmp_path):
++    db = tmp_path / "deferred.db"
++    first_provider = _FormationProvider()
++    first = _manager(db, first_provider)
++    first.reconcile([{"role": "user", "content": "I prefer opal fiber."}], "s")
++
++    assert first_provider.calls == 0
++    pending = first.formation_jobs("s", "pending")
++    assert len(pending) == 1
++    message_id = pending[0]["message_id"]
++
++    restarted_provider = _FormationProvider()
++    restarted = _manager(db, restarted_provider)
++    diagnostics = restarted.drain_formation()
++    assert restarted_provider.calls == 1
++    assert any(item.startswith("typed_formation:") for item in diagnostics)
++    assert restarted.formation_jobs("s", "complete")[0]["message_id"] == message_id
++
++    # Replaying the same immutable transcript is a no-op, and a completed
++    # durable job is not called a second time.
++    restarted.reconcile([{"role": "user", "content": "I prefer opal fiber."}], "s")
++    restarted.drain_formation()
++    assert restarted_provider.calls == 1
++
++
++def test_failed_formation_is_retryable_without_duplicate_source_rows(tmp_path):
++    db = tmp_path / "retry.db"
++    provider = _FormationProvider(failures=1)
++    manager = _manager(db, provider)
++    manager.reconcile([{"role": "user", "content": "I prefer opal fiber."}], "s")
++
++    first = manager.drain_formation()
++    assert any("provider_failure" in item for item in first)
++    assert manager.formation_jobs("s", "failed")[0]["attempts"] == 1
++
++    second = manager.drain_formation()
++    assert provider.calls == 2
++    assert manager.formation_jobs("s", "complete")[0]["attempts"] == 2
++    assert not manager.formation_jobs("s", "failed")
++    assert len(manager._get_store().fetch_range("s")) == 1
++    assert any("typed_formation_timing" in item for item in second)
++
++
++def test_wrong_provider_source_is_rejected_without_admission(tmp_path):
++    db = tmp_path / "provenance.db"
++    store = ContextStore(db)
++    assistant_id, _, _ = store.append("s", 0, "assistant", "untrusted output")
++    provider = _FormationProvider(source_id=assistant_id)
++    manager = _manager(db, provider)
++    manager.reconcile([{"role": "user", "content": "I prefer opal fiber."}], "s")
++    manager.drain_formation()
++
++    states = manager._get_store().fetch_states(scope="global", status="current")
++    assert not any(state.concept == "preferred material" for state in states)
++
++
++def test_user_learning_requires_immutable_user_evidence(tmp_path):
++    class _Jev:
++        def evaluate(self, request):
++            from PRIMORA.learning.jev import LearningOutcome, StructuredCandidate
++            return LearningOutcome(
++                disposition="confirm",
++                candidates=[StructuredCandidate(
++                    concept="preferred material", value="opal fiber",
++                    memory_type="PREFERENCE", scope="global",
++                )],
++            )
++
++    manager = ContextManager(db_path=tmp_path / "learn.db")
++    rejected = manager.learn("I prefer opal fiber.", "user", _Jev(), session_id="s")
++    assert rejected["status"] == "rejected"
++    assert rejected["reason"] == "user_provenance_requires_matching_user_source"
++
++    manager.reconcile([{"role": "user", "content": "I prefer opal fiber."}], "s")
++    accepted = manager.learn("I prefer opal fiber.", "user", _Jev(), session_id="s")
++    assert accepted["status"] in {"learned", "already_known"}
++    assert all(
++        state.authority == "user"
++        for state in manager._get_store().fetch_states(scope="global", status="current")
++    )
++
++
++def test_restore_preserves_deferred_job_and_remaps_message_id(tmp_path):
++    source_path = tmp_path / "source.db"
++    target_path = tmp_path / "target.db"
++    source = ContextStore(source_path)
++    source.ensure_session("source-session")
++    source_id, _, _ = source.append(
++        "source-session", 0, "user", "I prefer opal fiber."
++    )
++    assert source.enqueue_formation_job(source_id, "source-session")
++
++    service = MemoryRestoreService(source_path, target_path)
++    preview = service.preview()
++    assert preview.safe_to_import
++    result = service.import_into()
++    assert result.changed
++    assert result.imported["formation_jobs"] == 1
++    source_job_id = source.formation_jobs("source-session")[0]["job_id"]
++    assert source_job_id in result.id_maps["formation_jobs"]
++
++    destination = ContextStore(target_path)
++    jobs = destination.formation_jobs("source-session")
++    assert len(jobs) == 1
++    assert result.id_maps["messages"][source_id] == jobs[0]["message_id"]
++    assert destination.fetch_message(jobs[0]["message_id"]).content == "I prefer opal fiber."
