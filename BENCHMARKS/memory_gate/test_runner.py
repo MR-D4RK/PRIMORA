@@ -18,32 +18,35 @@ class RunnerTests(unittest.TestCase):
             with closing(sqlite3.connect(db)) as con:
                 con.executescript(
                     "CREATE TABLE messages(id INTEGER, role TEXT);"
-                    "CREATE TABLE states(id INTEGER, authority TEXT, source_ids TEXT);"
+                    "CREATE TABLE states(id INTEGER, authority TEXT, source_ids TEXT, "
+                    "concept TEXT, value TEXT, status TEXT, supersedes_id INTEGER);"
                     "CREATE TABLE experience_events("
                     "id INTEGER, authority TEXT, source_message_id INTEGER);")
                 con.execute("INSERT INTO messages VALUES(1, 'user')")
                 con.execute("INSERT INTO messages VALUES(2, 'assistant')")
                 con.execute(
-                    "INSERT INTO states VALUES(1, 'user', ?)",
+                    "INSERT INTO states (id, authority, source_ids) VALUES(1, 'user', ?)",
                     ("1",))
                 con.execute(
-                    "INSERT INTO states VALUES(2, 'user', ?)",
+                    "INSERT INTO states (id, authority, source_ids) VALUES(2, 'user', ?)",
                     ("2",))
                 con.execute(
-                    "INSERT INTO states VALUES(3, 'user', ?)",
+                    "INSERT INTO states (id, authority, source_ids) VALUES(3, 'user', ?)",
                     ("1,2",))
                 con.execute(
-                    "INSERT INTO states VALUES(4, 'user', ?)",
+                    "INSERT INTO states (id, authority, source_ids) VALUES(4, 'user', ?)",
                     ("bad",))
                 con.execute(
                     "INSERT INTO experience_events VALUES(1,'user',1)")
                 con.commit()
             report = source_audit(db)
+            self.assertNotIn("error", report, report)
             self.assertEqual(report["sqlite_quick_check"], "ok")
             self.assertEqual(len(report["violations"]), 3)
             self.assertEqual(
                 [v["state_id"] for v in report["violations"]], [2, 3, 4])
             self.assertEqual(report["state_count"], 4)
+            self.assertEqual(len(report["state_summary"]), 4)
 
     def test_isolation_overrides_operator_memory_db(self):
         with tempfile.TemporaryDirectory() as tmp:
