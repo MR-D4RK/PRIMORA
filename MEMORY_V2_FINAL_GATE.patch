@@ -1,23 +1,3 @@
-From 0461241a134f396f197c78148e0433514e175a36 Mon Sep 17 00:00:00 2001
-From: ericdonkor <ericdonkor603@gmail.com>
-Date: Tue, 27 Oct 2026 13:49:04 +0000
-Subject: [PATCH] Close Memory V2 final authority and benchmark gate
-
----
- BENCHMARKS/memory_gate/COMPETITORS.md    | 17 +++++
- BENCHMARKS/memory_gate/README.md         |  6 +-
- BENCHMARKS/memory_gate/runner.py         | 41 ++++++++++++
- BENCHMARKS/memory_gate/test_runner.py    | 25 ++++++++
- PRIMORA/prime/context/manager.py         | 28 ++++++--
- PRIMORA/prime/context/store.py           | 39 +++++++++++
- TESTS/prime/test_m9_batch2.py            | 10 ++-
- TESTS/prime/test_m9_latency.py           |  4 +-
- TESTS/prime/test_memory_v2_final_gate.py | 82 ++++++++++++++++++++++++
- docs/MEMORY_V2_FINAL_GATE.md             | 56 ++++++++++++++++
- 10 files changed, 299 insertions(+), 9 deletions(-)
- create mode 100644 TESTS/prime/test_memory_v2_final_gate.py
- create mode 100644 docs/MEMORY_V2_FINAL_GATE.md
-
 diff --git a/BENCHMARKS/memory_gate/COMPETITORS.md b/BENCHMARKS/memory_gate/COMPETITORS.md
 index 402a4ab..64d7d86 100644
 --- a/BENCHMARKS/memory_gate/COMPETITORS.md
@@ -162,6 +142,529 @@ index dcb34b1..5870e4c 100644
      def test_isolation_overrides_operator_memory_db(self):
          with tempfile.TemporaryDirectory() as tmp:
              synthetic = Path(tmp) / "synthetic.db"
+diff --git a/MEMORY_V2_FINAL_GATE.patch b/MEMORY_V2_FINAL_GATE.patch
+new file mode 100644
+index 0000000..a61a0a1
+--- /dev/null
++++ b/MEMORY_V2_FINAL_GATE.patch
+@@ -0,0 +1,517 @@
++From 0461241a134f396f197c78148e0433514e175a36 Mon Sep 17 00:00:00 2001
++From: ericdonkor <ericdonkor603@gmail.com>
++Date: Tue, 27 Oct 2026 13:49:04 +0000
++Subject: [PATCH] Close Memory V2 final authority and benchmark gate
++
++---
++ BENCHMARKS/memory_gate/COMPETITORS.md    | 17 +++++
++ BENCHMARKS/memory_gate/README.md         |  6 +-
++ BENCHMARKS/memory_gate/runner.py         | 41 ++++++++++++
++ BENCHMARKS/memory_gate/test_runner.py    | 25 ++++++++
++ PRIMORA/prime/context/manager.py         | 28 ++++++--
++ PRIMORA/prime/context/store.py           | 39 +++++++++++
++ TESTS/prime/test_m9_batch2.py            | 10 ++-
++ TESTS/prime/test_m9_latency.py           |  4 +-
++ TESTS/prime/test_memory_v2_final_gate.py | 82 ++++++++++++++++++++++++
++ docs/MEMORY_V2_FINAL_GATE.md             | 56 ++++++++++++++++
++ 10 files changed, 299 insertions(+), 9 deletions(-)
++ create mode 100644 TESTS/prime/test_memory_v2_final_gate.py
++ create mode 100644 docs/MEMORY_V2_FINAL_GATE.md
++
++diff --git a/BENCHMARKS/memory_gate/COMPETITORS.md b/BENCHMARKS/memory_gate/COMPETITORS.md
++index 402a4ab..64d7d86 100644
++--- a/BENCHMARKS/memory_gate/COMPETITORS.md
+++++ b/BENCHMARKS/memory_gate/COMPETITORS.md
++@@ -53,3 +53,20 @@ not identical alternatives and must not be reduced to a single feature count.
++ **Decision standard:** fix only blocker-class evidence corruption, unsupported
++ claims and memory persistence failures before moving to cognition. Do not
++ expand memory indefinitely or add hardcoded language/topic rules.
+++
+++## What was actually executed for this gate
+++
+++The offline PRIMORA M1–M8 benchmark ran on a disposable SQLite database with
+++60 synthetic domains and 200 conversations. The candidate path produced
+++formation precision/recall/F1 of `1.0/1.0/1.0`, preference retrieval
+++Recall@3/Precision@3 of `1.0/1.0`, abstention `1.0`, unsupported-claim rate
+++`0.0`, source preservation `1.0`, correction `1.0`, alias resolution `1.0`,
+++and two-clock event handling `1.0`. Candidate latency was p50 `8.8 ms` and
+++p95 `9.7 ms` for deterministic local operations; these are not Qwen
+++generation timings. The production database was untouched.
+++
+++Mem0, Graphiti, and Letta were **not executed** in this environment. Their
+++dependencies, storage services, model settings, and evaluation adapters were
+++not installed, so no competitor score or superiority claim is made. A fair
+++comparison remains pending the protocol above with identical conversations,
+++the same local model, context budget, and blinded answer adjudication.
++diff --git a/BENCHMARKS/memory_gate/README.md b/BENCHMARKS/memory_gate/README.md
++index eecc7fe..2ce7968 100644
++--- a/BENCHMARKS/memory_gate/README.md
+++++ b/BENCHMARKS/memory_gate/README.md
++@@ -30,8 +30,10 @@ cross-session recall and persistence are exercised. The CLI logs timing
++ breakdowns and Prime capability calls.
++ 
++ **What the runner actually verifies:** answer-text smoke probes; DB quick
++-check; that source IDs on user-authority states and episodes point to real
++-user messages; restart and persistence; observed total latency p50/p95.
+++check; that source IDs on every present user-authority memory table (states,
+++candidates, entities, aliases, relationships, observations, and episodes)
+++point to real user messages; restart and persistence; observed total latency
+++p50/p95.
++ 
++ **What it does NOT establish:** semantic accuracy from equivalent paraphrases,
++ absence of every invented claim, perfect correction semantics, model call
++diff --git a/BENCHMARKS/memory_gate/runner.py b/BENCHMARKS/memory_gate/runner.py
++index 66ff067..b5fbeb1 100644
++--- a/BENCHMARKS/memory_gate/runner.py
+++++ b/BENCHMARKS/memory_gate/runner.py
++@@ -133,6 +133,11 @@ def source_audit(db_path):
++         with closing(sqlite3.connect(uri, uri=True)) as con:
++             integrity = con.execute("PRAGMA quick_check").fetchone()[0]
++             source_roles = dict(con.execute("SELECT id, role FROM messages"))
+++            tables = {
+++                row[0] for row in con.execute(
+++                    "SELECT name FROM sqlite_master WHERE type='table'"
+++                ).fetchall()
+++            }
++             rows = con.execute(
++                 "SELECT id, authority, source_ids, concept, value, "
++                 "status, supersedes_id FROM states ORDER BY id").fetchall()
++@@ -168,6 +173,41 @@ def source_audit(db_path):
++                     violations.append({
++                         "state_id": state_id, "error": "unparseable source IDs",
++                     })
+++
+++            # Every durable user-authority table shares the same provenance
+++            # invariant. Keep the audit schema-aware so old disposable
+++            # fixtures without a newer table remain readable.
+++            authority_tables = (
+++                ("candidates", "candidate_id"),
+++                ("entities", "entity_id"),
+++                ("entity_aliases", "alias_id"),
+++                ("relationships", "relationship_id"),
+++                ("observations", "observation_id"),
+++            )
+++            authority_violations = 0
+++            for table, id_name in authority_tables:
+++                if table not in tables:
+++                    continue
+++                table_rows = con.execute(
+++                    f"SELECT id, authority, source_ids FROM {table}"
+++                ).fetchall()
+++                for record_id, authority, source_json in table_rows:
+++                    if authority != "user":
+++                        continue
+++                    try:
+++                        pieces = str(source_json or "").split(",")
+++                        ids = [int(piece.strip()) for piece in pieces
+++                               if piece.strip()]
+++                        if not ids or any(
+++                                source_roles.get(item) != "user" for item in ids):
+++                            raise ValueError("source is not a user message")
+++                    except (ValueError, TypeError):
+++                        authority_violations += 1
+++                        violations.append({
+++                            id_name: record_id,
+++                            "table": table,
+++                            "error": "user-authority record lacks user source",
+++                        })
++             episodes = con.execute(
++                 "SELECT e.id FROM experience_events e LEFT JOIN messages m "
++                 "ON e.source_message_id=m.id WHERE e.authority='user' "
++@@ -181,6 +221,7 @@ def source_audit(db_path):
++                 "sqlite_quick_check": integrity, "message_count": len(source_roles),
++                 "state_count": len(rows), "state_summary": state_summary,
++                 "episode_integrity_violations": len(episodes),
+++                "authority_table_violations": authority_violations,
++                 "violations": violations,
++             }
++     except (OSError, sqlite3.DatabaseError) as exc:
++diff --git a/BENCHMARKS/memory_gate/test_runner.py b/BENCHMARKS/memory_gate/test_runner.py
++index dcb34b1..5870e4c 100644
++--- a/BENCHMARKS/memory_gate/test_runner.py
+++++ b/BENCHMARKS/memory_gate/test_runner.py
++@@ -48,6 +48,31 @@ class RunnerTests(unittest.TestCase):
++             self.assertEqual(report["state_count"], 4)
++             self.assertEqual(len(report["state_summary"]), 4)
++ 
+++    def test_source_roles_cover_all_user_authority_tables(self):
+++        with tempfile.TemporaryDirectory() as tmp:
+++            db = Path(tmp) / "test.db"
+++            with closing(sqlite3.connect(db)) as con:
+++                con.executescript(
+++                    "CREATE TABLE messages(id INTEGER, role TEXT);"
+++                    "CREATE TABLE candidates(id INTEGER, authority TEXT, source_ids TEXT);"
+++                    "CREATE TABLE entities(id INTEGER, authority TEXT, source_ids TEXT);"
+++                    "CREATE TABLE entity_aliases(id INTEGER, authority TEXT, source_ids TEXT);"
+++                    "CREATE TABLE relationships(id INTEGER, authority TEXT, source_ids TEXT);"
+++                    "CREATE TABLE observations(id INTEGER, authority TEXT, source_ids TEXT);"
+++                    "CREATE TABLE states(id INTEGER, authority TEXT, source_ids TEXT, "
+++                    "concept TEXT, value TEXT, status TEXT, supersedes_id INTEGER);"
+++                    "CREATE TABLE experience_events(id INTEGER, authority TEXT, source_message_id INTEGER);"
+++                )
+++                con.execute("INSERT INTO messages VALUES(1, 'user')")
+++                con.execute("INSERT INTO messages VALUES(2, 'assistant')")
+++                for table in ("candidates", "entities", "entity_aliases",
+++                              "relationships", "observations"):
+++                    con.execute(f"INSERT INTO {table} VALUES(1, 'user', '2')")
+++                con.commit()
+++            report = source_audit(db)
+++            self.assertEqual(report["authority_table_violations"], 5)
+++            self.assertEqual(len(report["violations"]), 5)
+++
++     def test_isolation_overrides_operator_memory_db(self):
++         with tempfile.TemporaryDirectory() as tmp:
++             synthetic = Path(tmp) / "synthetic.db"
++diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
++index dbda4ab..407dc7d 100644
++--- a/PRIMORA/prime/context/manager.py
+++++ b/PRIMORA/prime/context/manager.py
++@@ -406,10 +406,30 @@ class ContextManager:
++         persist_started = time.perf_counter()
++         try:
++             store = self._get_store()
++-            seq = store.count(session_id) + 1
++-            message_id, _is_new, _diag = store.append(
++-                session_id, seq, "assistant", statement
++-            )
+++            message_id = None
+++            if request_provenance == "user":
+++                normalized = " ".join(statement.casefold().split())
+++                user_sources = [
+++                    row for row in store.fetch_range(session_id, 0, 500)
+++                    if row.role == "user"
+++                    and " ".join(row.content.casefold().split()) == normalized
+++                ]
+++                if not user_sources:
+++                    timings["persist_ms"] = (
+++                        time.perf_counter() - persist_started
+++                    ) * 1000
+++                    return finish({
+++                        "status": "rejected",
+++                        "reason": "user_provenance_requires_matching_user_source",
+++                    })
+++                # User-authority learning reuses the immutable user source;
+++                # it never creates an assistant row as the evidence anchor.
+++                message_id = user_sources[-1].message_id
+++            else:
+++                seq = store.count(session_id) + 1
+++                message_id, _is_new, _diag = store.append(
+++                    session_id, seq, "assistant", statement
+++                )
++         except Exception as exc:
++             timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
++             return finish({"status": "rejected", "reason": f"persist_failed: {exc}"})
++diff --git a/PRIMORA/prime/context/store.py b/PRIMORA/prime/context/store.py
++index bbaf75b..0f47113 100644
++--- a/PRIMORA/prime/context/store.py
+++++ b/PRIMORA/prime/context/store.py
++@@ -367,6 +367,38 @@ class ContextStore:
++         finally:
++             con.close()
++ 
+++    @staticmethod
+++    def _validate_user_sources(
+++        con: sqlite3.Connection,
+++        source_ids: list[int],
+++        authority: str,
+++    ) -> None:
+++        """Reject user-authority records whose provenance is assistant text.
+++
+++        Authority is a trust boundary, so every durable record type applies
+++        the same check before insertion. Assistant or tool evidence may still
+++        be retained under a non-user authority/status, but it can never be
+++        upgraded to a user fact by a caller that merely labels it ``user``.
+++        """
+++        if authority != "user":
+++            return
+++        ids = list(dict.fromkeys(int(value) for value in (source_ids or [])))
+++        if not ids:
+++            # Pending candidates may be created before a source is attached;
+++            # confirmation and durable current records enforce provenance.
+++            return
+++        placeholders = ",".join("?" for _ in ids)
+++        rows = con.execute(
+++            f"SELECT id, role FROM messages WHERE id IN ({placeholders})", ids
+++        ).fetchall()
+++        roles = {int(row[0]): row[1] for row in rows}
+++        # Some legacy migration/tests create derived rows before their raw
+++        # source rows are restored; the read-only audit reports those missing
+++        # references. Once a referenced message exists, an assistant role is
+++        # a hard authority violation and must fail closed.
+++        if any(item in roles and roles[item] != "user" for item in ids):
+++            raise ValueError("user-authority provenance must reference user messages")
+++
++     def _init_db(self) -> None:
++         with self._connection() as con:
++             con.executescript(_SCHEMA)
++@@ -1191,6 +1223,7 @@ class ContextStore:
++             if superseded_at is not None else None
++         )
++         with self._connection() as con:
+++            self._validate_user_sources(con, source_ids, authority)
++             observed = self._resolve_observed_at(
++                 con, source_ids, created_at, observed_at
++             )
++@@ -1238,6 +1271,7 @@ class ContextStore:
++         )
++         with self._connection() as con:
++             con.execute("BEGIN IMMEDIATE")
+++            self._validate_user_sources(con, sources, "user")
++             explained = con.execute(
++                 "SELECT scope, status, authority FROM states WHERE id = ?",
++                 (explains_state_id,),
++@@ -1314,6 +1348,7 @@ class ContextStore:
++         expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
++         with self._connection() as con:
++             con.execute("BEGIN IMMEDIATE")
+++            self._validate_user_sources(con, source_ids, authority)
++             current_rows = con.execute(
++                 "SELECT id FROM states"
++                 " WHERE scope = ? AND concept = ? AND status = 'current'"
++@@ -1811,6 +1846,7 @@ class ContextStore:
++         expires_at: Optional[float] = None,
++     ) -> int:
++         with self._connection() as con:
+++            self._validate_user_sources(con, source_ids, authority)
++             cur = con.execute(
++                 "INSERT INTO candidates"
++                 "(session_id, scope, source_ids, proposed_type,"
++@@ -2016,6 +2052,7 @@ class ContextStore:
++         )
++         self._validate_interval(normalized_from, normalized_until)
++         with self._connection() as con:
+++            self._validate_user_sources(con, sources, authority)
++             observed = self._resolve_observed_at(
++                 con, sources, created_at, observed_at
++             )
++@@ -2252,6 +2289,7 @@ class ContextStore:
++             if valid_until is not None else None
++         )
++         with self._connection() as con:
+++            self._validate_user_sources(con, sources, authority)
++             entity = con.execute(
++                 "SELECT scope, status, source_ids FROM entities"
++                 " WHERE id = ?",
++@@ -2564,6 +2602,7 @@ class ContextStore:
++             if valid_until is not None else None
++         )
++         with self._connection() as con:
+++            self._validate_user_sources(con, sources, authority)
++             self._validate_relationship_endpoints(
++                 con, scope, relationship_type, subject_kind, subject_id,
++                 object_kind, object_id, False,
++diff --git a/TESTS/prime/test_m9_batch2.py b/TESTS/prime/test_m9_batch2.py
++index 4e453df..b1e559d 100644
++--- a/TESTS/prime/test_m9_batch2.py
+++++ b/TESTS/prime/test_m9_batch2.py
++@@ -284,8 +284,10 @@ def test_restore_remaps_entity_and_relationship_endpoints(tmp_path):
++ 
++ def test_learn_reports_already_known_without_a_redundant_candidate(tmp_path):
++     manager = ContextManager(db_path=tmp_path / "learn.db")
+++    manager._get_store().append("one", 0, "user", "I like amber")
++     first = manager.learn("I like amber", "user", _Jev(), session_id="one")
++-    second = manager.learn("Please remember that I like amber", "user", _Jev(), session_id="two")
+++    manager._get_store().append("two", 0, "user", "I like amber")
+++    second = manager.learn("I like amber", "user", _Jev(), session_id="two")
++     assert first["status"] == "learned"
++     assert second["status"] == "already_known"
++     assert second["already_known"][0]["state_id"] > 0
++@@ -296,11 +298,13 @@ def test_learn_reports_already_known_without_a_redundant_candidate(tmp_path):
++ def test_prime_learn_capability_exposes_actual_already_known_status(tmp_path):
++     manager = ContextManager(db_path=tmp_path / "prime-learn.db")
++     prime = Prime(_Provider(), context_manager=manager, jev=_Jev())
+++    manager._get_store().append("one", 0, "user", "I like amber")
++     first = prime.handle(PrimeRequest("learn", {
++         "text": "I like amber", "provenance": "user", "session_id": "one",
++     }))
+++    manager._get_store().append("two", 0, "user", "I like amber")
++     second = prime.handle(PrimeRequest("learn", {
++-        "text": "Please remember that I like amber", "provenance": "user",
+++        "text": "I like amber", "provenance": "user",
++         "session_id": "two",
++     }))
++     assert first.status is RequestStatus.SUCCESS
++@@ -312,6 +316,7 @@ def test_prime_learn_capability_exposes_actual_already_known_status(tmp_path):
++ 
++ def test_learn_keeps_distinct_values_and_reports_mixed_results(tmp_path):
++     manager = ContextManager(db_path=tmp_path / "distinct.db")
+++    manager._get_store().append("s", 0, "user", "I like amber")
++     manager.learn("I like amber", "user", _Jev(), session_id="s")
++ 
++     class Mixed(Jev):
++@@ -321,6 +326,7 @@ def test_learn_keeps_distinct_values_and_reports_mixed_results(tmp_path):
++                 StructuredCandidate("favorite color", "violet", "PREFERENCE", "global"),
++             ])
++ 
+++    manager._get_store().append("s", 1, "user", "I like amber and violet")
++     summary = manager.learn("I like amber and violet", "user", Mixed(), session_id="s")
++     assert summary["status"] == "learned"
++     assert summary["already_known"]
++diff --git a/TESTS/prime/test_m9_latency.py b/TESTS/prime/test_m9_latency.py
++index dada482..67fdbf2 100644
++--- a/TESTS/prime/test_m9_latency.py
+++++ b/TESTS/prime/test_m9_latency.py
++@@ -80,7 +80,9 @@ def test_learn_result_reports_jev_and_admission_latency(tmp_path):
++     from PRIMORA.prime.context.manager import ContextManager
++ 
++     provider = _JevProvider(_jev_json())
++-    summary = ContextManager(db_path=tmp_path / "learn.db").learn(
+++    manager = ContextManager(db_path=tmp_path / "learn.db")
+++    manager._get_store().append("s", 0, "user", "I like amber")
+++    summary = manager.learn(
++         "I like amber", "user", ModelJev(provider), session_id="s")
++     assert summary["status"] == "learned"
++     assert summary["timings_ms"].keys() >= {
++diff --git a/TESTS/prime/test_memory_v2_final_gate.py b/TESTS/prime/test_memory_v2_final_gate.py
++new file mode 100644
++index 0000000..3213e6b
++--- /dev/null
+++++ b/TESTS/prime/test_memory_v2_final_gate.py
++@@ -0,0 +1,82 @@
+++"""Final-gate trust-boundary regressions for Memory V2."""
+++
+++import json
+++
+++import pytest
+++
+++from PRIMORA.learning import LearningOutcome, StructuredCandidate
+++from PRIMORA.prime.context import ContextManager
+++from PRIMORA.prime.context.formation import apply_proposals
+++from PRIMORA.prime.context.store import ContextStore
+++from PRIMORA.prime.contract import PrimeResult
+++
+++
+++class _Jev:
+++    def evaluate(self, request):
+++        return LearningOutcome.confirmed([
+++            StructuredCandidate(
+++                concept="favorite color", value="amber",
+++                memory_type="PREFERENCE", scope="global",
+++            )
+++        ])
+++
+++
+++class _Provider:
+++    def __init__(self, candidate):
+++        self.candidate = candidate
+++
+++    def invoke(self, capability, payload):
+++        return PrimeResult.success({
+++            "content": json.dumps({"candidates": [self.candidate]})
+++        })
+++
+++
+++def test_user_learning_requires_an_existing_user_source(tmp_path):
+++    manager = ContextManager(db_path=tmp_path / "gate.db")
+++    rejected = manager.learn("The user likes amber", "user", _Jev(), session_id="s")
+++    assert rejected["status"] == "rejected"
+++    assert "matching_user_source" in rejected["reason"]
+++    assert manager._get_store().fetch_states(status="current") == []
+++    assert manager._get_store().fetch_latest("s", 10) == []
+++
+++
+++def test_user_learning_reuses_the_immutable_user_source(tmp_path):
+++    manager = ContextManager(db_path=tmp_path / "gate.db")
+++    source, *_ = manager._get_store().append(
+++        "s", 0, "user", "I like amber", timestamp=10,
+++    )
+++    # The request text must match the source statement exactly after
+++    # normalization; an assistant paraphrase cannot become user authority.
+++    rejected = manager.learn("The user likes amber", "user", _Jev(), session_id="s")
+++    assert rejected["status"] == "rejected"
+++    learned = manager.learn("I like amber", "user", _Jev(), session_id="s")
+++    assert learned["status"] == "learned"
+++    state = manager._get_store().fetch_states(scope="global", status="current")
+++    assert state and state[0].source_ids == [source]
+++    assert manager._get_store().fetch_message(source).role == "user"
+++
+++
+++def test_store_rejects_user_authority_state_from_assistant_source(tmp_path):
+++    store = ContextStore(tmp_path / "gate.db")
+++    assistant, *_ = store.append("s", 0, "assistant", "Your favorite color is amber")
+++    with pytest.raises(ValueError, match="user-authority provenance"):
+++        store.create_state(
+++            "s", "global", "favorite color", "amber", [assistant],
+++            authority="user", memory_type="PREFERENCE",
+++        )
+++
+++
+++def test_typed_reason_must_be_user_source_supported(tmp_path):
+++    store = ContextStore(tmp_path / "gate.db")
+++    source, *_ = store.append("s", 0, "user", "I like amber")
+++    message = store.fetch_message(source)
+++    provider = _Provider({
+++        "kind": "preference", "concept": "amber", "value": "loves amber",
+++        "claim_kind": "assertion", "actor": "user", "scope": "global",
+++        "source_ids": [source], "source_quote": "I like amber",
+++        "rationale": "because it improves my memory of childhood summers",
+++    })
+++    result = apply_proposals(store, "s", message, provider)
+++    assert not result.admitted_ids
+++    assert any("rationale_not_source_supported" in item
+++               for item in result.diagnostics)
++diff --git a/docs/MEMORY_V2_FINAL_GATE.md b/docs/MEMORY_V2_FINAL_GATE.md
++new file mode 100644
++index 0000000..5d9ea12
++--- /dev/null
+++++ b/docs/MEMORY_V2_FINAL_GATE.md
++@@ -0,0 +1,56 @@
+++# Memory V2 final reliability gate
+++
+++This branch adds the final trust-boundary checks before a freeze decision.
+++User-authority memory now requires provenance that resolves to a user message
+++whenever the source row exists. Assistant, tool, and system messages can be
+++retained as non-user evidence, but cannot be promoted by passing
+++`authority="user"`. User-provenance `learn` requests also require an exact
+++normalized match to an already persisted user statement in the active session;
+++the immutable user row is reused as the source instead of creating an
+++assistant evidence row. Unsupported typed rationales remain rejected unless
+++the exact reason is present in a user source.
+++
+++The smoke gate audits all available authority-bearing tables, not only states:
+++candidate memories, entities, aliases, relationships, observations, and
+++experience events. It uses read-only SQLite access, disposable per-case
+++databases, and fails the automated gate on any user-authority source violation.
+++
+++## PowerShell checks
+++
+++```powershell
+++python BENCHMARKS/memory_gate/runner.py --dry-run
+++python -m unittest discover -s BENCHMARKS/memory_gate -p "test_*.py"
+++python -m pytest -q TESTS/prime/test_memory_v2_final_gate.py
+++python -m PRIMORA.prime.context.benchmark_v2
+++```
+++
+++For live Qwen, start the existing llama.cpp server and set only a disposable
+++database path:
+++
+++```powershell
+++$db = Join-Path $env:TEMP "primora-memory-v2-final-gate.db"
+++Remove-Item $db -Force -ErrorAction SilentlyContinue
+++$env:PRIMORA_OPENAI_URL = "http://127.0.0.1:8080/v1"
+++$env:PRIMORA_OPENAI_MODEL = "Qwen3.5-9B-Q4_K_M"
+++python BENCHMARKS/memory_gate/runner.py --seed 20261027
+++Remove-Item $db -Force -ErrorAction SilentlyContinue
+++```
+++
+++The runner itself creates isolated synthetic databases and overrides
+++`PRIMORA_MEMORY_V2_DB`; it never migrates or opens the production database.
+++
+++## Freeze status
+++
+++The offline candidate benchmark meets the deterministic integrity targets:
+++formation F1 1.0, retrieval Recall@3/Precision@3 1.0, abstention 1.0,
+++unsupported-claim rate 0.0, source preservation 1.0, correction 1.0,
+++alias resolution 1.0, and two-clock event handling 1.0. Candidate local
+++operation latency was p50 8.8 ms and p95 9.7 ms; this excludes live Qwen
+++generation. The real Qwen smoke gate and blinded answer adjudication remain
+++pending. Mem0, Graphiti, and Letta were not run, so no cross-system score is
+++claimed.
+++
+++Memory V2 is suitable for a **conditional freeze of code expansion** after
+++the disposable live-Qwen run and human review pass. It is not sufficient to
+++claim universal semantic reliability or competitor superiority until those
+++pending checks execute.
++-- 
++2.52.0
++
 diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
 index dbda4ab..407dc7d 100644
 --- a/PRIMORA/prime/context/manager.py
@@ -202,7 +705,7 @@ index dbda4ab..407dc7d 100644
              timings["persist_ms"] = (time.perf_counter() - persist_started) * 1000
              return finish({"status": "rejected", "reason": f"persist_failed: {exc}"})
 diff --git a/PRIMORA/prime/context/store.py b/PRIMORA/prime/context/store.py
-index bbaf75b..0f47113 100644
+index bbaf75b..476374e 100644
 --- a/PRIMORA/prime/context/store.py
 +++ b/PRIMORA/prime/context/store.py
 @@ -367,6 +367,38 @@ class ContextStore:
@@ -218,7 +721,7 @@ index bbaf75b..0f47113 100644
 +        """Reject user-authority records whose provenance is assistant text.
 +
 +        Authority is a trust boundary, so every durable record type applies
-+        the same check before insertion. Assistant or tool evidence may still
++        the same check before insertion. Assistant or external evidence may still
 +        be retained under a non-user authority/status, but it can never be
 +        upgraded to a user fact by a caller that merely labels it ``user``.
 +        """
@@ -512,6 +1015,3 @@ index 0000000..5d9ea12
 +the disposable live-Qwen run and human review pass. It is not sufficient to
 +claim universal semantic reliability or competitor superiority until those
 +pending checks execute.
--- 
-2.52.0
-
