@@ -142,16 +142,17 @@
       "protected": false,
       "render": "The user {value}.",
       "phrasings": [
-        {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>purple) whether it(?:'s| is|s) bright or not\\.?$",
-         "key_group": "obj", "value_template": "loves {obj} in any shade"},
-        {"pattern": "^i (?:really )?(?:love|like|adore|enjoy) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
-         "key_group": "obj", "value_template": "loves {obj}"},
-        {"pattern": "^i (?:really )?(?:hate|dislike) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
-         "key_group": "obj", "value_template": "hates {obj}"},
-        {"pattern": "^i (?:do not|don't) like (?P<obj>.+?)(?: anymore)?\\.?$",
-         "key_group": "obj", "value_template": "dislikes {obj}"},
-        {"pattern": "^(?:(?:yeah|yes)[,!]?\\s+)?(?:but\\s+)?(?P<obj>[a-z0-9][a-z0-9 '-]{0,60}?)\\s+is\\s+on\\s+another\\s+level\\s+for\\s+me(?:[,!]?\\s+(?:don'?t|do not)\\s+forget\\s+it)?[.!]?$",
-         "key_group": "obj", "value_template": "feels {obj} is on another level"}
+        {"pattern":"^i (?:really )?love (?P<obj>purple) whether it(?:'s| is|s) bright or not\\.?$","key_group":"obj","value_template":"loves {obj} in any shade"},
+        {"pattern":"^i (?:really )?like (?P<obj>purple) whether it(?:'s| is|s) bright or not\\.?$","key_group":"obj","value_template":"likes {obj} in any shade"},
+        {"pattern":"^i (?:really )?adore (?P<obj>purple) whether it(?:'s| is|s) bright or not\\.?$","key_group":"obj","value_template":"adores {obj} in any shade"},
+        {"pattern":"^i (?:really )?love (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$","key_group":"obj","value_template":"loves {obj}"},
+        {"pattern":"^i (?:really )?like (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$","key_group":"obj","value_template":"likes {obj}"},
+        {"pattern":"^i (?:really )?adore (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$","key_group":"obj","value_template":"adores {obj}"},
+        {"pattern":"^i (?:really )?enjoy (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$","key_group":"obj","value_template":"enjoys {obj}"},
+        {"pattern":"^i (?:really )?hate (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$","key_group":"obj","value_template":"hates {obj}"},
+        {"pattern":"^i (?:really )?dislike (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$","key_group":"obj","value_template":"dislikes {obj}"},
+        {"pattern":"^i (?:do not|don't) like (?P<obj>.+?)(?: anymore)?\\.?$","key_group":"obj","value_template":"dislikes {obj}"},
+        {"pattern":"^(?:(?:yeah|yes)[,!]?\\s+)?(?:but\\s+)?(?P<obj>[a-z0-9][a-z0-9 '-]{0,60}?)\\s+is\\s+on\\s+another\\s+level\\s+for\\s+me(?:[,!]?\\s+(?:don'?t|do not)\\s+forget\\s+it)?[.!]?$","key_group":"obj","value_template":"feels {obj} is on another level"}
       ]
     },
     {
