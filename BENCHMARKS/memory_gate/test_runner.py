@@ -25,17 +25,25 @@ class RunnerTests(unittest.TestCase):
                 con.execute("INSERT INTO messages VALUES(2, 'assistant')")
                 con.execute(
                     "INSERT INTO states VALUES(1, 'user', ?)",
-                    (json.dumps([1]),))
+                    ("1",))
                 con.execute(
                     "INSERT INTO states VALUES(2, 'user', ?)",
-                    (json.dumps([2]),))
+                    ("2",))
+                con.execute(
+                    "INSERT INTO states VALUES(3, 'user', ?)",
+                    ("1,2",))
+                con.execute(
+                    "INSERT INTO states VALUES(4, 'user', ?)",
+                    ("bad",))
                 con.execute(
                     "INSERT INTO experience_events VALUES(1,'user',1)")
                 con.commit()
             report = source_audit(db)
             self.assertEqual(report["sqlite_quick_check"], "ok")
-            self.assertEqual(len(report["violations"]), 1)
-            self.assertEqual(report["violations"][0]["state_id"], 2)
+            self.assertEqual(len(report["violations"]), 3)
+            self.assertEqual(
+                [v["state_id"] for v in report["violations"]], [2, 3, 4])
+            self.assertEqual(report["state_count"], 4)
 
     def test_isolation_overrides_operator_memory_db(self):
         with tempfile.TemporaryDirectory() as tmp:

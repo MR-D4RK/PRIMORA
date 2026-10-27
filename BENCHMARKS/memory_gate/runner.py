@@ -140,16 +140,22 @@ def source_audit(db_path):
                 if authority != "user":
                     continue
                 try:
-                    ids = json.loads(source_json)
-                    if not isinstance(ids, list) or not ids:
+                    # The store serializes state source IDs as CSV ("1,2"),
+                    # not JSON. Match ContextStore._state_rows_to_records.
+                    pieces = str(source_json or "").split(",")
+                    if not pieces or not all(
+                        piece.strip().isdecimal() and int(piece.strip()) > 0
+                        for piece in pieces
+                    ):
                         raise ValueError("missing or invalid source IDs")
+                    ids = [int(piece.strip()) for piece in pieces]
                     for item in ids:
-                        if source_roles.get(int(item)) != "user":
+                        if source_roles.get(item) != "user":
                             violations.append({
                                 "state_id": state_id, "source_id": item,
                                 "error": "user-authority state lacks user source",
                             })
-                except (ValueError, TypeError, json.JSONDecodeError):
+                except (ValueError, TypeError):
                     violations.append({
                         "state_id": state_id, "error": "unparseable source IDs",
                     })

@@ -114,7 +114,10 @@
             "prompt": "Do I actually own the {{object_a}}?"
           },
           {
-            "prompt": "What was the plan I mentioned?"
+            "prompt": "What was the plan I mentioned?",
+            "expect_contains": [
+              "desk"
+            ]
           }
         ]
       }
