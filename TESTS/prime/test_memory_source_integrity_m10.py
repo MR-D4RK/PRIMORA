@@ -107,3 +107,42 @@ def test_nonuser_authority_records_are_not_relabelled_user(evidence):
     )
     candidate = store.fetch_candidates(candidate_id=candidate_id)[0]
     assert candidate.authority == "assistant"
+
+
+def test_current_observation_needs_real_user_message(evidence):
+    store, user_id, other_id, _ = evidence
+    with pytest.raises(ValueError, match="user message source"):
+        store.create_observation(
+            "session-a", "global", "likes material", "blue", [],
+            source_episode_ids=["unverified-episode"], authority="user",
+        )
+    with pytest.raises(ValueError, match="crosses session"):
+        store.create_observation(
+            "session-a", "global", "likes material", "blue", [other_id],
+            authority="user",
+        )
+    valid_id = store.create_observation(
+        "session-a", "global", "likes material", "blue",
+        [user_id], authority="user",
+    )
+    assert valid_id > 0
+
+
+def test_legacy_candidate_cannot_be_confirmed_with_now_invalid_source(evidence):
+    import sqlite3
+
+    store, user_id, _, _ = evidence
+    entity_id = store.create_entity(
+        "session-a", "global", "PERSON", "Mira", "mira",
+        [user_id], status="candidate",
+    )
+    # Simulate an old/imported candidate referencing a missing source row.
+    # Existing rows are readable; promotion is the point where they must
+    # demonstrate real user evidence.
+    with sqlite3.connect(str(store._db_path)) as con:
+        con.execute(
+            "UPDATE entities SET source_ids=? WHERE id=?",
+            ("987654321", entity_id),
+        )
+    with pytest.raises(ValueError, match="existing user source"):
+        store.confirm_entity(entity_id)
