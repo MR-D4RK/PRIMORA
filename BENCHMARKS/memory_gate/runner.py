@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 from datetime import datetime, timezone
+from contextlib import closing
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CASES = Path(__file__).with_name("cases.json")
@@ -129,7 +130,7 @@ def source_audit(db_path):
         return {"error": "database_not_created"}
     uri = db_path.resolve().as_uri() + "?mode=ro"
     try:
-        with sqlite3.connect(uri, uri=True) as con:
+        with closing(sqlite3.connect(uri, uri=True)) as con:
             integrity = con.execute("PRAGMA quick_check").fetchone()[0]
             source_roles = dict(con.execute("SELECT id, role FROM messages"))
             rows = con.execute(
