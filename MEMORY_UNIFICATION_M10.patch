@@ -111,10 +111,10 @@ index 419403e..f65cc57 100644
  ]
 diff --git a/PRIMORA/prime/context/admission.py b/PRIMORA/prime/context/admission.py
 new file mode 100644
-index 0000000..412b8f3
+index 0000000..83ff7c7
 --- /dev/null
 +++ b/PRIMORA/prime/context/admission.py
-@@ -0,0 +1,70 @@
+@@ -0,0 +1,73 @@
 +"""Prime's single durable-memory admission gateway.
 +
 +Aurora and formation providers propose meaning. This gateway is the shared
@@ -176,6 +176,9 @@ index 0000000..412b8f3
 +
 +    def create_relationship(self, *args: Any, **kwargs: Any) -> int:
 +        return self.store.create_relationship(*args, **kwargs)
++
++    def create_observation(self, *args: Any, **kwargs: Any) -> int:
++        return self.store.create_observation(*args, **kwargs)
 +
 +    def admit_user_candidates(
 +        self, session_id: str, message_id: int, candidates: list[Any]
