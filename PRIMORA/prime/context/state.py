@@ -476,12 +476,33 @@ def _parse_establishment(text: str) -> Optional[tuple[str, str]]:
     return concept, value
 
 
+_CAUSAL_SENTENCE_RE = re.compile(
+    r"^(?P<head>.+?[.!?;])\s+"
+    r"(?P<rationale>(?:it|this|that)\s+"
+    r"(?:helps?|makes?|keeps?|lets?|allows?|gives?|supports?|"
+    r"improves?|calms?|relaxes?|focuses?|grounds?|energizes?)\b.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
 def _split_rationale(text: str) -> tuple[str, str]:
-    """Split 'head because rationale'. Returns (head, rationale or '')."""
+    """Split an explicit causal clause from a preference statement.
+
+    The direct ``because`` form remains the primary path. A second sentence
+    is accepted only when it is explicitly linked by a demonstrative pronoun
+    and a causal verb (``It helps...``, ``This keeps...``). That preserves
+    user meaning without treating an unrelated follow-up sentence as a
+    rationale.
+    """
     parts = re.split(r"\s+[Bb]ecause\s+", text, maxsplit=1)
-    if len(parts) != 2:
-        return text, ""
-    head, rationale = parts[0].strip(), parts[1].strip().rstrip(".")
+    if len(parts) == 2:
+        head, rationale = parts[0].strip(), parts[1].strip().rstrip(".")
+    else:
+        causal = _CAUSAL_SENTENCE_RE.match(text.strip())
+        if causal is None:
+            return text, ""
+        head = causal.group("head").strip()
+        rationale = causal.group("rationale").strip().rstrip(".")
     if _ATTRIBUTED_REASON_RE.match(rationale):
         return head, ""
     if len(rationale) < _RATIONALE_MIN_LEN:

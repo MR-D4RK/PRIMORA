@@ -159,6 +159,13 @@ def interpret(brain: Brain, user_text: str, previous: tuple[dict[str, str], ...]
     # call or invoke Prime merely because it contains the word "said".
     if _CONVERSATION_SUMMARY_RE.fullmatch(user_text or ""):
         return "other"
+    # Short, structurally unambiguous follow-ups already have a bounded
+    # interpreter below.  Sending them through the model planner adds a full
+    # local generation and makes a simple "Why?" depend on a second model
+    # interpretation.  The contextual resolver still fails closed when no
+    # referent is available, so this shortcut cannot invent a subject.
+    if _contextual_kind(user_text) is not None:
+        return _contextual_plan(user_text, previous, None)
     prompt = {
         # Dialogue helps with references, but is NOT factual evidence.
         "recent_dialogue_reference_only": list(previous[-6:]),
@@ -304,6 +311,18 @@ def _topic_from_assistant_text(text: str) -> Optional[str]:
         words = re.findall(r"[A-Za-z0-9][A-Za-z0-9'_-]*", sentence)
         if not words or len(words) > 8:
             continue
+        # An abstention, caveat, or memory-system status line is not a topic.
+        # It can be short enough to pass the pointer shape (for example,
+        # "I couldn't verify a reason"), but using it would turn the system's
+        # own wording into a retrieval subject.  Only concise content-bearing
+        # replies may narrow a follow-up.
+        if re.search(
+            r"\b(?:couldn't|could not|haven't|hasn't|don't|doesn't|can't|"
+            r"cannot|unable|explicit(?:ly)?|verify|verified|reason|memory|"
+            r"guess|unknown|unclear|sorry|stated|said|stored|remember)\b",
+            sentence, re.IGNORECASE,
+        ):
+            continue
         meaningful = [w for w in words if w.casefold() not in _CONTEXTUAL_FILLERS]
         if meaningful and len(meaningful) <= 5:
             # A short first sentence such as "Techno" is a safe topic
@@ -343,10 +362,21 @@ def _contextual_plan(
             if topic:
                 break
 
-    # A planner-produced explicit subject is preferred. If it did not resolve
-    # one, the grammatical pointer above is the only safe fallback.
-    subject = (plan.subject if isinstance(plan, MemoryPlan) and plan.subject
-               else topic)
+    assistant_topic = None
+    if has_prior_question:
+        for candidate in reversed(assistants):
+            assistant_topic = _topic_from_assistant_text(candidate)
+            if assistant_topic:
+                break
+
+    # A concise answer to the immediately preceding question can identify the
+    # actual item inside a broad category ("music" -> "Techno").  It is only
+    # a retrieval pointer: Prime still requires a user-authored source quote
+    # for every returned fact.  If no such pointer exists, retain the user's
+    # grammatical topic or the model's validated subject.
+    subject = (assistant_topic or
+               (plan.subject if isinstance(plan, MemoryPlan) else None) or
+               topic)
     if isinstance(plan, MemoryPlan):
         sources = plan.sources
         result_count = plan.result_count

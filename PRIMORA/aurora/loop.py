@@ -574,6 +574,28 @@ class CognitiveLoop:
 
         return count
 
+    def _record_formation_timings(self, trace: LoopTrace) -> None:
+        """Move Prime's latest formation sample into this turn's trace."""
+        consume_formation = getattr(
+            getattr(self._mind, "mechanisms", None),
+            "consume_formation_timings", None,
+        )
+        if not callable(consume_formation):
+            return
+        try:
+            formation_timings = consume_formation()
+        except Exception:
+            formation_timings = {}
+        if not formation_timings:
+            return
+        for key, value in formation_timings.items():
+            name = "formation_ms" if key == "total_ms" else f"formation_{key}"
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            trace.timings_ms[name] = trace.timings_ms.get(name, 0.0) + number
+
     # -- the loop ---------------------------------------------------------
 
     def run(
@@ -707,11 +729,17 @@ class CognitiveLoop:
                         "right now. I don't want to guess.",
                         self._brain.get_model_name())
                 else:
+                    answer_started = time.perf_counter()
                     response = memory_coordinator.grounded_answer(
                         self._brain, user_text, plan, evidence)
+                    trace.timings_ms["response_generation_ms"] += (
+                        time.perf_counter() - answer_started
+                    ) * 1000
             trace.stop_reason = "finished"
-            trace.total_s = time.perf_counter() - started
             self._persist_turn(messages, 0, response, trace, session_id)
+            self._record_formation_timings(trace)
+            trace.total_s = time.perf_counter() - started
+            trace.timings_ms["total_ms"] = trace.total_s * 1000
             if on_delta is not None:
                 on_delta(response.content)
             return response
@@ -733,8 +761,10 @@ class CognitiveLoop:
                 if answer is not None:
                     result = BrainResult.success(answer, self._brain.get_model_name())
                     trace.stop_reason = "finished"
-                    trace.total_s = time.perf_counter() - started
                     self._persist_turn(messages, 0, result, trace, session_id)
+                    self._record_formation_timings(trace)
+                    trace.total_s = time.perf_counter() - started
+                    trace.timings_ms["total_ms"] = trace.total_s * 1000
                     if on_delta is not None:
                         on_delta(answer)
                     return result
@@ -757,8 +787,10 @@ class CognitiveLoop:
                 if answer is not None:
                     result = BrainResult.success(answer, self._brain.get_model_name())
                     trace.stop_reason = "finished"
-                    trace.total_s = time.perf_counter() - started
                     self._persist_turn(messages, 0, result, trace, session_id)
+                    self._record_formation_timings(trace)
+                    trace.total_s = time.perf_counter() - started
+                    trace.timings_ms["total_ms"] = trace.total_s * 1000
                     if on_delta is not None:
                         on_delta(answer)
                     return result
@@ -779,10 +811,12 @@ class CognitiveLoop:
                 if answer is not None:
                     result = BrainResult.success(answer, self._brain.get_model_name())
                     trace.stop_reason = "finished"
-                    trace.total_s = time.perf_counter() - started
                     # Preserve user and assistant turns exactly as normal. The
                     # answerer itself does not write or edit memory records.
                     self._persist_turn(messages, 0, result, trace, session_id)
+                    self._record_formation_timings(trace)
+                    trace.total_s = time.perf_counter() - started
+                    trace.timings_ms["total_ms"] = trace.total_s * 1000
                     if on_delta is not None:
                         on_delta(answer)
                     return result
@@ -829,24 +863,7 @@ class CognitiveLoop:
             # Formation is owned by Prime's ContextManager. Consume its
             # latest sample once so repeated cognitive segments do not count
             # the same provider call twice.
-            consume_formation = getattr(
-                getattr(self._mind, "mechanisms", None),
-                "consume_formation_timings", None,
-            )
-            if callable(consume_formation):
-                try:
-                    formation_timings = consume_formation()
-                except Exception:
-                    formation_timings = {}
-                if formation_timings:
-                    for key, value in formation_timings.items():
-                        if key == "total_ms":
-                            name = "formation_ms"
-                        else:
-                            name = f"formation_{key}"
-                        trace.timings_ms[name] = (
-                            trace.timings_ms.get(name, 0.0) + float(value)
-                        )
+            self._record_formation_timings(trace)
 
             built_len = len(messages)
 
@@ -1187,10 +1204,15 @@ class CognitiveLoop:
         if isinstance(executor_timings, dict):
             for key, value in executor_timings.items():
                 trace.timings_ms[key] = trace.timings_ms.get(key, 0.0) + float(value)
-        trace.total_s = time.perf_counter() - started
         # The turn is over: write its closing state before returning so a
         # caller that exits right after respond() cannot lose it.
         self._persist_turn(messages, built_len, result, trace, session_id)
+        # The closing persistence may form the just-finished user message, so
+        # consume that sample after persistence as well as the samples from
+        # cognitive segments above.
+        self._record_formation_timings(trace)
+        trace.total_s = time.perf_counter() - started
+        trace.timings_ms["total_ms"] = trace.total_s * 1000
         if result is None:
             # Unreachable while max_cycles >= 1, kept so the return type is
             # total rather than Optional.

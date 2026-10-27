@@ -742,6 +742,23 @@ class ContextStore:
             ).fetchone()
         return StoredMessage(*row) if row is not None else None
 
+    def has_user_content(self, content: str, *, exclude_id: Optional[int] = None) -> bool:
+        """Whether an identical user source was already processed.
+
+        Session replay can legitimately append the same immutable source to a
+        new conversation session.  The source row remains distinct for
+        provenance, while model-backed formation need not pay for a second
+        interpretation of byte-identical text.
+        """
+        query = "SELECT 1 FROM messages WHERE role = 'user' AND content = ?"
+        params: list[Any] = [str(content)]
+        if exclude_id is not None:
+            query += " AND id != ?"
+            params.append(int(exclude_id))
+        query += " LIMIT 1"
+        with self._connection() as con:
+            return con.execute(query, params).fetchone() is not None
+
     def fetch_messages_by_ids(
         self, message_ids: list[int]
     ) -> list[StoredMessage]:

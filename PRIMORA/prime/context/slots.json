@@ -144,7 +144,7 @@
       "phrasings": [
         {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>purple) whether it(?:'s| is|s) bright or not\\.?$",
          "key_group": "obj", "value_template": "loves {obj} in any shade"},
-        {"pattern": "^i (?:really )?(?:love|like|adore) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
+        {"pattern": "^i (?:really )?(?:love|like|adore|enjoy) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
          "key_group": "obj", "value_template": "loves {obj}"},
         {"pattern": "^i (?:really )?(?:hate|dislike) (?P<obj>.+?)(?:,?\\s+(?-i:too))?\\.?$",
          "key_group": "obj", "value_template": "hates {obj}"},

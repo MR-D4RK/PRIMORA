@@ -130,6 +130,25 @@ _LOCAL_DISCUSSION_RE = re.compile(
     r"[?!. ]*$", re.IGNORECASE,
 )
 
+# A typed formation call is useful for user assertions, but a question or a
+# short acknowledgement cannot introduce a new personal fact.  These turns
+# still pass through deterministic extraction, history persistence, and Prime
+# retrieval; only the optional model-backed proposal call is skipped.  This
+# avoids paying for a second local generation on follow-ups such as "Why?".
+_NON_ASSERTIVE_FORMATION_RE = re.compile(
+    r"^\s*(?:why|when|where|what|which|who|how|do|did|can|could|would|"
+    r"tell|remind|recall|i\s+(?:already\s+)?told\s+you|"
+    r"i\s+think\s+i\s+(?:have|['’]?ve)\s+told\s+you|"
+    r"as\s+i\s+said|i\s+mentioned\s+that)\b",
+    re.IGNORECASE,
+)
+
+
+def _skip_typed_formation(content: str) -> bool:
+    """Whether a turn is clearly non-assertive for model-backed formation."""
+    text = " ".join(str(content or "").split())
+    return bool("?" in text or _NON_ASSERTIVE_FORMATION_RE.match(text))
+
 
 CROSS_SESSION_CAP = 3
 
@@ -2422,6 +2441,13 @@ class ContextManager:
                 if conflict:
                     diagnostics.append(conflict)
                 if is_new:
+                    replayed_user_source = False
+                    if role == "user":
+                        try:
+                            replayed_user_source = store.has_user_content(
+                                content, exclude_id=message_id)
+                        except Exception:
+                            replayed_user_source = False
                     formation_diags: list[str] = []
                     try:
                         store.set_formation_status(
@@ -2486,14 +2512,24 @@ class ContextManager:
                         and self._memory_v2_enabled
                         and self._formation_provider is not None
                     ):
-                        typed = formation_mod.apply_proposals(
-                            store, session_id, store.fetch_message(message_id),
-                            self._formation_provider,
-                        )
-                        self._last_formation_timings = dict(typed.timings_ms)
-                        formation_diags.extend(
-                            [f"typed_formation:{item}" for item in typed.diagnostics]
-                        )
+                        if _skip_typed_formation(content):
+                            formation_diags.append(
+                                "typed_formation:skipped_non_assertive_turn"
+                            )
+                        elif replayed_user_source:
+                            formation_diags.append(
+                                "typed_formation:skipped_already_processed_source"
+                            )
+                        else:
+                            typed = formation_mod.apply_proposals(
+                                store, session_id, store.fetch_message(message_id),
+                                self._formation_provider,
+                            )
+                            self._last_formation_timings = dict(typed.timings_ms)
+                            formation_diags.extend(
+                                [f"typed_formation:{item}"
+                                 for item in typed.diagnostics]
+                            )
                     if role == "user":
                         formation_diags.extend(
                             self._extract_entities(
@@ -2574,13 +2610,23 @@ class ContextManager:
                 and self._memory_v2_enabled
                 and self._formation_provider is not None
             ):
-                typed = formation_mod.apply_proposals(
-                    store, session_id, message, self._formation_provider,
-                )
-                self._last_formation_timings = dict(typed.timings_ms)
-                diagnostics.extend(
-                    [f"typed_formation:{item}" for item in typed.diagnostics]
-                )
+                if _skip_typed_formation(message.content):
+                    diagnostics.append(
+                        "typed_formation:skipped_non_assertive_turn"
+                    )
+                elif store.has_user_content(
+                        message.content, exclude_id=message.message_id):
+                    diagnostics.append(
+                        "typed_formation:skipped_already_processed_source"
+                    )
+                else:
+                    typed = formation_mod.apply_proposals(
+                        store, session_id, message, self._formation_provider,
+                    )
+                    self._last_formation_timings = dict(typed.timings_ms)
+                    diagnostics.extend(
+                        [f"typed_formation:{item}" for item in typed.diagnostics]
+                    )
             if message.role == "user":
                 diagnostics.extend(self._extract_entities(
                     store, session_id, message_id, message.content,

@@ -284,6 +284,15 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
         for source in sources
     ):
         return False, "source_quote_not_supported"
+    if candidate.rationale:
+        rationale = " ".join(candidate.rationale.split()).casefold()
+        if len(rationale) < 12:
+            return False, "rationale_too_short"
+        if not any(rationale in " ".join(source.content.split()).casefold()
+                   for source in sources):
+            return False, "rationale_not_source_supported"
+        if re.match(r"^(?:you|someone|people|they)\b", rationale, re.I):
+            return False, "rationale_not_user_authored"
     if candidate.kind == "preference":
         candidate_terms = _preference_fingerprint(
             candidate.concept, candidate.value
@@ -317,7 +326,7 @@ def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[li
                 '{"candidates":[{"kind":"preference|state|event|relationship|observation",'
                 '"concept":"...","value":"...","claim_kind":"assertion|hypothesis|question|fiction|negation|third_party|assistant",'
                 '"actor":"user","scope":"session|global","source_ids":[ID],"source_quote":"exact substring",'
-                f'"predicate":"..."}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
+                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
             )},
             {"role": "user", "content": message.content},
         ],
@@ -369,6 +378,70 @@ def _empty_candidate_object(text: str) -> bool:
     return False
 
 
+def _admit_rationale(
+    store: Any,
+    session_id: str,
+    scope: str,
+    preference_state_id: int,
+    candidate: TypedMemoryCandidate,
+    message: Any,
+) -> list[str]:
+    """Persist a provider rationale only after source validation.
+
+    Typed formation has one admission boundary. A rationale is a second
+    derived state linked to the admitted preference; it is never accepted as
+    a free-standing explanation and it retains the same user source ids.
+    """
+    rationale = " ".join(candidate.rationale.split()).strip()
+    if not rationale:
+        return []
+    concept = "rationale for " + candidate.concept
+    current = store.fetch_states(scope=scope, concept=concept, status="current")
+    for row in current:
+        if row.value.casefold().strip() == rationale.casefold():
+            for source_id in candidate.source_ids:
+                if source_id not in row.source_ids:
+                    store.add_state_evidence(row.state_id, source_id)
+            return [f"rationale_evidence_merged: {row.state_id}"]
+    if current:
+        transition = getattr(message, "timestamp", None)
+        store.supersede_states(
+            [row.state_id for row in current],
+            transition_time=transition,
+        )
+    rationale_id, relationship_id = store.create_state_with_explains(
+        session_id, scope, concept, rationale, candidate.source_ids,
+        preference_state_id, memory_type="RATIONALE", confidence=candidate.confidence,
+        observed_at=getattr(message, "timestamp", None),
+    )
+    return [
+        f"rationale_admitted: {rationale_id}",
+        f"rationale_relationship_admitted: {relationship_id}",
+    ]
+
+
+_EXPLICIT_CAUSAL_SOURCE_RE = re.compile(
+    r"(?:^|[.!?;])\s*((?:it|this|that)\s+"
+    r"(?:helps?|makes?|keeps?|lets?|allows?|gives?|supports?|"
+    r"improves?|calms?|relaxes?|focuses?|grounds?|energizes?)\b.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _source_rationale(store: Any, source_ids: list[int]) -> str:
+    """Return an explicitly causal source clause, never a paraphrase."""
+    for source_id in source_ids:
+        source = store.fetch_message(source_id)
+        if source is None or source.role != "user":
+            continue
+        match = _EXPLICIT_CAUSAL_SOURCE_RE.search(source.content.strip())
+        if match:
+            value = " ".join(match.group(1).split()).strip(" .!?;")
+            if len(value) >= 12:
+                return value
+    return ""
+
+
 def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) -> FormationResult:
     """Validate and admit proposals; deterministic extraction remains separate."""
     timed_store = _TimingStore(store)
@@ -415,6 +488,12 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
         if not valid:
             diagnostics.append(f"proposal_rejected:{reason}")
             continue
+        if candidate.kind == "preference" and not candidate.rationale:
+            explicit_rationale = _source_rationale(store, candidate.source_ids)
+            if explicit_rationale:
+                from dataclasses import replace
+                candidate = replace(candidate, rationale=explicit_rationale)
+                diagnostics.append("rationale_bound_to_explicit_user_clause")
         # Relationships and observations are reviewable proposals until an
         # entity endpoint or explicit observation admission is available.
         if candidate.kind in {"relationship", "observation"}:
@@ -510,6 +589,9 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
                     if source_id not in same.source_ids:
                         store.add_state_evidence(same.state_id, source_id)
                 admitted.append(same.state_id)
+                diagnostics.extend(_admit_rationale(
+                    store, session_id, scope, same.state_id, candidate, message,
+                ))
                 continue
             if predecessor_ids:
                 state_id = store.create_state_successor(
@@ -530,6 +612,9 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
                     valid_until=candidate.valid_until,
                 )
             admitted.append(state_id)
+            diagnostics.extend(_admit_rationale(
+                store, session_id, scope, state_id, candidate, message,
+            ))
         except Exception as exc:
             diagnostics.append(f"proposal_write_failed:{exc}")
     processing_ms = (time.perf_counter() - processing_started) * 1000

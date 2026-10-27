@@ -161,8 +161,9 @@ def test_aurora_abstains_when_contextual_reason_has_no_user_evidence(tmp_path):
 
     assert result.success
     assert "couldn't verify a user-stated reason" in result.content
-    # The explicit abstention is returned before a second Aurora generation.
-    assert len(brain.calls) == 1
+    # The explicit abstention is returned before a planner or answer
+    # generation; this clear follow-up needs no model call at all.
+    assert len(brain.calls) == 0
 
 
 def test_contextual_when_and_topic_followups_get_bounded_plans():
@@ -177,9 +178,9 @@ def test_contextual_when_and_topic_followups_get_bounded_plans():
     )
     when = interpret(_Planner(), "When?", previous)
     topic = interpret(_Planner(), "What about it?", previous)
-    assert when.subject == "music when working"
+    assert when.subject == "Techno"
     assert when.first_mention is True and when.temporal_scope == "historical"
-    assert topic.subject == "music when working"
+    assert topic.subject == "Techno"
     assert topic.reasons is False
 
     assistant_pointer = interpret(

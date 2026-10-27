@@ -27,6 +27,13 @@ a model's over-conservative `clarify=true`. Unresolved pronouns and genuinely
 bare questions still clarify. Prime supplies only source-backed evidence, so a
 missing memory remains an abstention.
 
+Preference reasons are admitted only from user text. Both direct `because`
+clauses and an explicit causal follow-up sentence such as “It helps me focus”
+are stored as a rationale state linked to the preference with the same source
+ID. A typed provider may omit that field; Prime binds it from the exact source
+clause, and never invents a reason. Concise follow-ups use the last verified
+topic as a retrieval pointer, while assistant replies remain non-evidence.
+
 ## Windows PowerShell validation
 
 The source may be the production database for this read-only preview. The
@@ -102,6 +109,21 @@ python -m PRIMORA.main --cli
 # Ask: What music do I listen to when working? / Why? / I already told you
 Remove-Item -LiteralPath $db -Force
 ```
+
+To display per-turn latency without changing the conversation path, opt in to
+the CLI timing line before starting it:
+
+```powershell
+$env:PRIMORA_CLI_TIMINGS = "1"
+python -m PRIMORA.main --cli
+```
+
+Each completed turn prints JSON containing `planning_ms`,
+`response_generation_ms`, `formation_ms` (and provider/database sub-timings),
+capability timings, Jev timings when `learn` runs, and `total_ms`. Formation
+is skipped for clearly non-assertive follow-ups such as `Why?`; the source
+message and Prime's normal provenance checks remain unchanged. Remove the
+variable or set it to `0` to return to the normal CLI output.
 
 ## Tests
 

@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 
 # Disable Transformers' parallel tensor materialization before anything else.
 # Concurrent slicing of the memory-mapped safetensors weights crashes with a
@@ -307,6 +308,8 @@ def _restore_cli_history(aurora, session_id):
 
 def run_cli(aurora):
     session_id = os.environ.get("PRIMORA_SESSION_ID", "default")
+    show_timings = str(os.environ.get("PRIMORA_CLI_TIMINGS", "")).strip().lower() \
+        in {"1", "true", "yes", "on"}
     history, next_seq = _restore_cli_history(aurora, session_id)
     if history:
         print(f"(restored {len(history)} earlier messages)")
@@ -347,6 +350,12 @@ def run_cli(aurora):
                 history.append(reply)
             else:
                 print(f"ERROR: {result.error}\n")
+
+            if show_timings:
+                trace = getattr(getattr(aurora, "loop", None), "last_trace", None)
+                if trace is not None:
+                    payload = trace.to_dict().get("timings_ms", {})
+                    print("Timings: " + json.dumps(payload, sort_keys=True) + "\n")
 
         except Exception as e:
             print(f"ERROR: {e}\n")

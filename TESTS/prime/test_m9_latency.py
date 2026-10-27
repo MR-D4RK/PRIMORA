@@ -181,7 +181,7 @@ def test_cognitive_trace_reports_planning_formation_and_response_latency():
     timings = loop.last_trace.to_dict()["timings_ms"]
     assert timings.keys() >= {
         "planning_ms", "formation_ms", "formation_provider_ms",
-        "response_generation_ms",
+        "response_generation_ms", "total_ms",
     }
     assert timings["formation_ms"] == 4.0
 
@@ -197,3 +197,28 @@ def test_capability_executor_measurement_is_separate_from_model_generation():
     executor.begin_session("s")
     executor.execute(PrimeRequest("learn", {}))
     assert executor.timings_ms["capability_learn_ms"] >= 0
+
+
+def test_cli_timing_diagnostics_are_opt_in(monkeypatch, capsys):
+    from PRIMORA.main import run_cli
+
+    class Trace:
+        def to_dict(self):
+            return {"timings_ms": {"planning_ms": 1.0, "total_ms": 2.0}}
+
+    class Result:
+        success = True
+        content = "ok"
+        error = None
+
+    class Aurora:
+        loop = type("Loop", (), {"last_trace": Trace()})()
+
+        def respond(self, messages, session_id="default"):
+            return Result()
+
+    monkeypatch.setenv("PRIMORA_CLI_TIMINGS", "1")
+    values = iter(["hello", "quit"])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(values))
+    run_cli(Aurora())
+    assert 'Timings: {"planning_ms": 1.0, "total_ms": 2.0}' in capsys.readouterr().out
