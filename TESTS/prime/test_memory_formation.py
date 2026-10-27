@@ -48,12 +48,16 @@ def test_preference_confirmed():
     mgr = ContextManager(db_path=_db())
     hist = []
     res = _say(mgr, hist, "s", "I prefer dark themes.")
-    rows = _currents(mgr, "s", "preference for dark themes")
+    rows = _currents(mgr, "global", "preference for dark themes")
     assert len(rows) == 1
     assert rows[0].value == "dark themes"
     assert rows[0].memory_type == "PREFERENCE"
     assert rows[0].authority == "user"
     assert rows[0].source_ids
+    # Personal preferences are globally available in Memory V2; the
+    # original user turn still belongs to its own session.
+    assert rows[0].scope == "global"
+    assert not _currents(mgr, "s", "preference for dark themes")
     assert any("state_updated" in d for d in res.view.diagnostics)
 
 
@@ -118,11 +122,11 @@ def test_correction_supersedes():
     hist = []
     _say(mgr, hist, "s", "I prefer dark themes.")
     _say(mgr, hist, "s", "Actually, I prefer light themes.")
-    rows = _currents(mgr, "s", "preference for dark themes")
+    rows = _currents(mgr, "global", "preference for dark themes")
     assert len(rows) == 1
     assert rows[0].value == "light themes"
     old = mgr._get_store().fetch_states(
-        scope="s", concept="preference for dark themes", status="superseded")
+        scope="global", concept="preference for dark themes", status="superseded")
     assert [s.value for s in old] == ["dark themes"]
     assert rows[0].supersedes_id == old[0].state_id
 
@@ -209,7 +213,7 @@ def test_repetition_single_current():
     hist = []
     for _ in range(3):
         _say(mgr, hist, "s", "I prefer dark themes.")
-    rows = _currents(mgr, "s", "preference for dark themes")
+    rows = _currents(mgr, "global", "preference for dark themes")
     assert len(rows) == 1
     assert rows[0].value == "dark themes"
     assert mgr._get_store().count("s") == 3
@@ -221,7 +225,7 @@ def test_provenance_points_to_source():
     hist = []
     _say(mgr, hist, "s", "First filler line here.")
     res = _say(mgr, hist, "s", "I prefer dark themes.")
-    rows = _currents(mgr, "s", "preference for dark themes")
+    rows = _currents(mgr, "global", "preference for dark themes")
     assert len(rows) == 1
     (src,) = rows[0].source_ids
     stored = [m for m in mgr._get_store().fetch_range("s", 0)
@@ -248,7 +252,7 @@ def test_reconciliation_no_duplicates():
     snap = [{"role": "user", "content": "I prefer dark themes."}]
     mgr.reconcile(list(snap), "s")
     mgr.reconcile(list(snap), "s")
-    rows = _currents(mgr, "s", "preference for dark themes")
+    rows = _currents(mgr, "global", "preference for dark themes")
     assert len(rows) == 1
     assert mgr._get_store().fetch_candidates() == []
     assert mgr._get_store().count("s") == 1
