@@ -1617,6 +1617,8 @@ class ContextStore:
         episodes = list(dict.fromkeys(str(v).strip() for v in (source_episode_ids or []) if str(v).strip()))
         if not ids and not episodes:
             raise ValueError("observation requires source provenance")
+        if authority == "user" and status == "current" and not ids:
+            raise ValueError("current user observations require a user message source")
         created = self._normalize_timestamp(timestamp, "created_at") if timestamp is not None else time.time()
         normalized_from = self._normalize_timestamp(valid_from, "valid_from") if valid_from is not None else None
         normalized_until = self._normalize_timestamp(valid_until, "valid_until") if valid_until is not None else None
@@ -1633,6 +1635,8 @@ class ContextStore:
                 ).fetchone()
                 if row is None or row[1] != "user":
                     raise ValueError("observation sources must be user messages")
+                if row[0] != session_id:
+                    raise ValueError("observation source crosses session")
                 if scope != "global" and row[0] != scope:
                     raise ValueError("observation source crosses scope")
             observed = self._resolve_observed_at(con, ids, created, observed_at)
@@ -2194,6 +2198,14 @@ class ContextStore:
                 raise ValueError(f"entity {entity_id} authority is not user")
             if not row[2]:
                 raise ValueError(f"entity {entity_id} has no provenance")
+            origin = con.execute(
+                "SELECT session_id, scope FROM entities WHERE id = ?",
+                (entity_id,),
+            ).fetchone()
+            self._validate_user_source_roles(
+                con, [int(v) for v in row[2].split(",") if v],
+                row[1], origin[0], origin[1],
+            )
             cur = con.execute(
                 "UPDATE entities SET status = 'active', confidence = ?"
                 " WHERE id = ? AND status = 'candidate'",
@@ -2456,6 +2468,10 @@ class ContextStore:
                 raise ValueError(f"alias {alias_id} authority is not user")
             if not alias.source_ids:
                 raise ValueError(f"alias {alias_id} has no provenance")
+            self._validate_user_source_roles(
+                con, alias.source_ids, alias.authority,
+                alias.session_id, alias.scope,
+            )
             entity = con.execute(
                 "SELECT scope, status FROM entities WHERE id = ?",
                 (alias.entity_id,),
@@ -2753,6 +2769,10 @@ class ContextStore:
                 )
             if not candidate.source_ids:
                 raise ValueError(f"relationship {relationship_id} has no provenance")
+            self._validate_user_source_roles(
+                con, candidate.source_ids, candidate.authority,
+                candidate.session_id, candidate.scope,
+            )
             self._validate_relationship_endpoints(
                 con, candidate.scope, candidate.relationship_type,
                 candidate.subject_kind, candidate.subject_id,
