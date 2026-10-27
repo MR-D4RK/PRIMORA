@@ -368,25 +368,42 @@ class ContextStore:
         con: sqlite3.Connection,
         source_ids: list[int],
         authority: str,
+        session_id: str,
+        scope: str,
     ) -> None:
-        """Reject user-authority writes backed by non-user rows.
+        """Validate *new writes* against authentic, session-owned user turns.
 
-        Old imported fixtures can contain references whose raw message is no
-        longer present, so missing rows remain tolerated here and are reported
-        by migration/audit code.  When a referenced row exists, however, its
-        role is authoritative: non-user output can never be promoted to a
-        user-authority memory record.
+        Never infer trust from a missing message ID. Historic/imported records
+        remain readable, but new admissions cannot use missing, assistant,
+        tool or cross-session rows as user authority.
         """
         if authority != "user":
             return
-        for source_id in dict.fromkeys(int(value) for value in (source_ids or [])):
+        if scope != "global" and scope != session_id:
+            raise ValueError("user source scope must match originating session")
+        if not source_ids:
+            raise ValueError("user-authority memory requires a user source")
+        for source_id in dict.fromkeys(int(value) for value in source_ids):
+            if source_id <= 0:
+                raise ValueError(f"invalid user source_id={source_id}")
             row = con.execute(
-                "SELECT role FROM messages WHERE id = ?", (source_id,)
+                "SELECT role, session_id FROM messages WHERE id = ?",
+                (source_id,),
             ).fetchone()
-            if row is not None and str(row[0]).casefold() != "user":
+            if row is None:
+                raise ValueError(
+                    f"user-authority memory requires an existing user source "
+                    f"(source_id={source_id})"
+                )
+            if str(row[0]).casefold() != "user":
                 raise ValueError(
                     "user-authority memory requires a user source "
                     f"(source_id={source_id}, role={row[0]!r})"
+                )
+            if row[1] != session_id:
+                raise ValueError(
+                    "user-authority source belongs to another session "
+                    f"(source_id={source_id})"
                 )
 
     @contextmanager
@@ -1308,7 +1325,7 @@ class ContextStore:
             if superseded_at is not None else None
         )
         with self._connection() as con:
-            self._validate_user_source_roles(con, source_ids, authority)
+            self._validate_user_source_roles(con, source_ids, authority, session_id, scope)
             observed = self._resolve_observed_at(
                 con, source_ids, created_at, observed_at
             )
@@ -1356,7 +1373,7 @@ class ContextStore:
         )
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
-            self._validate_user_source_roles(con, sources, "user")
+            self._validate_user_source_roles(con, sources, "user", session_id, scope)
             explained = con.execute(
                 "SELECT scope, status, authority FROM states WHERE id = ?",
                 (explains_state_id,),
@@ -1433,7 +1450,7 @@ class ContextStore:
         expected_ids = list(dict.fromkeys(int(i) for i in predecessor_ids))
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
-            self._validate_user_source_roles(con, source_ids, authority)
+            self._validate_user_source_roles(con, source_ids, authority, session_id, scope)
             current_rows = con.execute(
                 "SELECT id FROM states"
                 " WHERE scope = ? AND concept = ? AND status = 'current'"
@@ -1931,7 +1948,7 @@ class ContextStore:
         expires_at: Optional[float] = None,
     ) -> int:
         with self._connection() as con:
-            self._validate_user_source_roles(con, source_ids, authority)
+            self._validate_user_source_roles(con, source_ids, authority, session_id, scope)
             cur = con.execute(
                 "INSERT INTO candidates"
                 "(session_id, scope, source_ids, proposed_type,"
@@ -2137,7 +2154,7 @@ class ContextStore:
         )
         self._validate_interval(normalized_from, normalized_until)
         with self._connection() as con:
-            self._validate_user_source_roles(con, sources, authority)
+            self._validate_user_source_roles(con, sources, authority, session_id, scope)
             observed = self._resolve_observed_at(
                 con, sources, created_at, observed_at
             )
@@ -2374,7 +2391,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         with self._connection() as con:
-            self._validate_user_source_roles(con, sources, authority)
+            self._validate_user_source_roles(con, sources, authority, session_id, scope)
             entity = con.execute(
                 "SELECT scope, status, source_ids FROM entities"
                 " WHERE id = ?",
@@ -2687,7 +2704,7 @@ class ContextStore:
             if valid_until is not None else None
         )
         with self._connection() as con:
-            self._validate_user_source_roles(con, sources, authority)
+            self._validate_user_source_roles(con, sources, authority, session_id, scope)
             self._validate_relationship_endpoints(
                 con, scope, relationship_type, subject_kind, subject_id,
                 object_kind, object_id, False,
