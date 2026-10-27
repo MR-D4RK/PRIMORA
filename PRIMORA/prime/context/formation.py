@@ -445,6 +445,49 @@ def _source_rationale(store: Any, source_ids: list[int]) -> str:
     return ""
 
 
+_EXPLICIT_ATTRIBUTE_CAUSE_RE = re.compile(
+    r"\bfor\s+((?:its|their|the way|how)\b[^.!?;]+)",
+    re.IGNORECASE,
+)
+
+
+def _rationale_supported_by_user_source(
+    store: Any, source_ids: list[int], rationale: str,
+) -> bool:
+    """Require a reason within an explicit causal clause, not just any quote.
+
+    A matching source sentence alone does not prove that it gives a *reason*.
+    Interpretation belongs to Aurora; Prime conservatively verifies an
+    explicit user-authored causal span before admitting a derived explanation.
+    Unrecognized causal phrasing stays in raw history rather than becoming
+    an invented rationale.
+    """
+    from .state import _split_rationale
+
+    claimed = " ".join((rationale or "").split()).strip().casefold()
+    if len(claimed) < 12:
+        return False
+    for source_id in source_ids:
+        source = store.fetch_message(source_id)
+        if source is None or source.role != "user":
+            continue
+        content = " ".join(source.content.split())
+        _head, because_reason = _split_rationale(content)
+        reasons = [because_reason, _source_rationale(store, [source_id])]
+        # "I admire this for its unusual shape" explicitly states an
+        # attribute as a reason. "I use this for travel notes" is a
+        # purpose/context and is not necessarily why it is preferred.
+        attribute = _EXPLICIT_ATTRIBUTE_CAUSE_RE.search(content)
+        if attribute:
+            reasons.append(attribute.group(1))
+        if any(
+            claimed in " ".join(reason.split()).casefold()
+            for reason in reasons if reason
+        ):
+            return True
+    return False
+
+
 def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) -> FormationResult:
     """Validate and admit proposals; deterministic extraction remains separate."""
     timed_store = _TimingStore(store)
@@ -485,6 +528,22 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             candidate = replace(
                 candidate, scope="session" if session_bound else "global"
             )
+        # A provider may quote the whole source sentence as a "reason".
+        # A quote proves attribution, not causality. Keep the supported
+        # primary memory but drop an explanation without an explicit user
+        # causal clause. Reject invented standalone rationale states.
+        if candidate.rationale and not _rationale_supported_by_user_source(
+            store, candidate.source_ids, candidate.rationale,
+        ):
+            from dataclasses import replace
+            candidate = replace(candidate, rationale="")
+            diagnostics.append("rationale_dropped:no_explicit_user_reason")
+        if (candidate.concept.casefold().startswith("rationale for ")
+                and not _rationale_supported_by_user_source(
+                    store, candidate.source_ids, candidate.value,
+                )):
+            diagnostics.append("proposal_rejected:unsupported_rationale_value")
+            continue
         valid, reason = validate_candidate(
             candidate, session_id=session_id, message=message,
             source_lookup=store.fetch_message,
