@@ -53,6 +53,7 @@ python -m pytest -q `
   TESTS/prime/test_memory_unification_m10.py `
   TESTS/prime/test_memory_v2_runtime_integration.py `
   TESTS/prime/test_evidence_backed_memory_v2.py
+python BENCHMARKS/memory_gate/runner.py --dry-run
 
 # Preview/import is explicit and only targets the disposable destination.
 python -m PRIMORA.prime.context.memory_restore preview `
