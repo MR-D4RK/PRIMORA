@@ -376,7 +376,7 @@ class ContextStore:
         """Reject user-authority records whose provenance is assistant text.
 
         Authority is a trust boundary, so every durable record type applies
-        the same check before insertion. Assistant or tool evidence may still
+        the same check before insertion. Assistant or external evidence may still
         be retained under a non-user authority/status, but it can never be
         upgraded to a user fact by a caller that merely labels it ``user``.
         """
