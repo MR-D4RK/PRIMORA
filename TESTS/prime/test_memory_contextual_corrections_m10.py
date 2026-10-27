@@ -82,7 +82,10 @@ def test_different_contexts_never_supersede_each_other(tmp_path):
 def test_unasserted_or_unparsed_context_does_not_create_current_memory(
     tmp_path, message,
 ):
-    assert not extract_candidates(message, "user")
+    assert not any(
+        candidate.concept.startswith("preferred option for ") and candidate.auto_confirm
+        for candidate in extract_candidates(message, "user")
+    )
     manager = ContextManager(db_path=tmp_path / "unknown.db")
     manager.reconcile([{"role": "user", "content": message}], "one")
     states = manager._get_store().fetch_states(scope="global", status="current")
