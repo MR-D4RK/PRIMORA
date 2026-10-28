@@ -184,3 +184,39 @@ def test_legacy_remains_explicit_rollback(tmp_path, monkeypatch):
         [{"role": "user", "content": "I love Willow Trees."}], "s"
     )
     assert manager._get_store().fetch_states(scope="global", status="current")
+
+def test_negative_preference_supersedes_positive_without_affecting_other_topics(tmp_path):
+    path = tmp_path / "correction.db"
+    first = _ProposalProvider("Maple Board", "love")
+    manager = ContextManager(db_path=path, formation_provider=first)
+    manager.reconcile([
+        {"role": "user", "content": "I love Maple Board."},
+    ], "session")
+    assert len(manager._get_store().fetch_states(
+        scope="global", concept="likes for maple board", status="current")) == 1
+    second = _ProposalProvider("Maple Board", "dislike", "negation")
+    manager.set_formation_provider(second)
+    manager.reconcile([
+        {"role": "user", "content": "I don't like Maple Board anymore."},
+    ], "other-session")
+    currents = manager._get_store().fetch_states(
+        scope="global", concept="likes for maple board", status="current")
+    assert len(currents) == 1
+    assert currents[0].value == "dislikes Maple Board"
+    prior = manager._get_store().fetch_states(
+        scope="global", concept="likes for maple board", status="superseded")
+    assert len(prior) == 1 and prior[0].value == "loves Maple Board"
+
+
+def test_repeated_reconciliation_is_idempotent(tmp_path):
+    provider = _ProposalProvider("Winter Orchard")
+    manager = ContextManager(db_path=tmp_path / "idempotent.db",
+                             formation_provider=provider)
+    turn = [{"role": "user", "content": "I love Winter Orchard."}]
+    manager.reconcile(turn, "session")
+    count_before = len(provider.calls)
+    manager.reconcile(turn, "session")
+    assert len(provider.calls) == count_before
+    assert len(manager._get_store().fetch_states(
+        scope="global", concept="likes for winter orchard",
+        status="current")) == 1
