@@ -362,10 +362,73 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
     return True, "ok"
 
 
-def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[list[TypedMemoryCandidate], str]:
+
+# Strict, domain-independent admission shape for the model-first path.
+# This is a semantic schema check, not an entity-specific extraction regex.
+_PREFERENCE_WORDING = {
+    "love": "loves", "like": "likes", "adore": "adores",
+    "enjoy": "enjoys", "prefer": "prefers",
+    "hate": "hates", "dislike": "dislikes",
+}
+_NON_REFERENTIAL = frozenset({
+    "it", "this", "that", "them", "everything", "anything", "something",
+    "someone", "anyone", "everyone", "nothing",
+})
+
+
+def validate_semantic_candidate(candidate: TypedMemoryCandidate, message: Any) -> tuple[bool, str]:
+    """Check canonical meaning and literal user evidence before durable write."""
+    quote = candidate.source_quote.strip()
+    if candidate.source_ids != [message.message_id]:
+        return False, "semantic_source_must_be_current_user"
+    if not quote or quote.casefold() not in message.content.casefold():
+        return False, "semantic_missing_exact_quote"
+    if candidate.claim_kind != "assertion":
+        return False, "semantic_non_assertion"
+    if candidate.kind != "preference":
+        # Other types remain constrained by the existing provenance validator.
+        return True, "ok"
+    subject = " ".join(candidate.subject.split())
+    if (not subject or len(subject) > 90 or len(subject.split()) > 9
+            or subject.casefold() in _NON_REFERENTIAL):
+        return False, "semantic_invalid_subject"
+    if not re.search(r"(?<!\w)" + re.escape(subject) + r"(?!\w)", quote, re.I):
+        return False, "semantic_subject_not_in_quote"
+    if candidate.concept.casefold() != "likes for " + subject.casefold():
+        return False, "semantic_bad_concept"
+    predicate = candidate.predicate.casefold()
+    verb = _PREFERENCE_WORDING.get(predicate)
+    if verb is None:
+        return False, "semantic_unknown_attitude"
+    if candidate.value.casefold().strip(" .!") != f"{verb} {subject}".casefold():
+        return False, "semantic_bad_value"
+    if predicate not in _source_preference_verbs(quote):
+        return False, "semantic_attitude_unproven"
+    # Reject clear hypothetical framing even if the model mislabeled it.
+    if re.search(
+        r"\b(?:hypothetical|fictional|pretend(?:ing)?|imaginary|"
+        r"imagine\s+(?:that|if)|if\s+i\s+(?:were|had|could|would))\b",
+        message.content, re.I,
+    ):
+        return False, "semantic_nonfactual_source"
+    return True, "ok"
+
+
+def provider_proposals(
+    provider: Any, message: Any, session_id: str, *,
+    context: Optional[list[dict[str, str]]] = None,
+    semantic_first: bool = False,
+) -> tuple[list[TypedMemoryCandidate], str]:
     """Make one bounded provider call and parse its strict response."""
     if provider is None:
         return [], "provider_not_configured"
+    prior = []
+    if semantic_first:
+        for turn in (context or [])[-4:]:
+            role = str(turn.get("role", ""))
+            content = str(turn.get("content", ""))[:320]
+            if role in ("user", "assistant") and content:
+                prior.append({"role": role, "content": content})
     payload = {
         "messages": [
             {"role": "system", "content": (
@@ -373,8 +436,9 @@ def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[li
                 '{"candidates":[{"kind":"preference|state|event|relationship|observation",'
                 '"concept":"...","value":"...","claim_kind":"assertion|hypothesis|question|fiction|negation|third_party|assistant",'
                 '"actor":"user","scope":"session|global","source_ids":[ID],"source_quote":"exact substring",'
-                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
+                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions. In the preference kind, provide a short exact named subject, the attitude predicate (love/like/adore/enjoy/prefer/hate/dislike), concept as likes for <subject>, and third-person value as loves/likes/adores/enjoys/prefers/hates/dislikes <subject>. Separate subject from descriptive attributes. If no reliable claim return an empty candidates array. Earlier dialogue resolves references only, never supplies personal evidence.'
             )},
+            *prior,
             {"role": "user", "content": message.content},
         ],
         "session_id": session_id,
@@ -534,14 +598,21 @@ def _rationale_supported_by_user_source(
     return False
 
 
-def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) -> FormationResult:
+def apply_proposals(
+    store: Any, session_id: str, message: Any, provider: Any, *,
+    context: Optional[list[dict[str, str]]] = None,
+    semantic_first: bool = False,
+) -> FormationResult:
     """Validate and admit proposals; deterministic extraction remains separate."""
     timed_store = _TimingStore(store)
     store = timed_store
     admission = MemoryAdmissionGateway(store)
     started = time.perf_counter()
     provider_started = time.perf_counter()
-    candidates, diagnostic = provider_proposals(provider, message, session_id)
+    candidates, diagnostic = provider_proposals(
+        provider, message, session_id, context=context,
+        semantic_first=semantic_first,
+    )
     provider_ms = (time.perf_counter() - provider_started) * 1000
     timings = {"provider_ms": provider_ms}
     if diagnostic != "ok":
@@ -594,6 +665,8 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             candidate, session_id=session_id, message=message,
             source_lookup=store.fetch_message,
         )
+        if valid and semantic_first:
+            valid, reason = validate_semantic_candidate(candidate, message)
         if not valid:
             diagnostics.append(f"proposal_rejected:{reason}")
             continue
