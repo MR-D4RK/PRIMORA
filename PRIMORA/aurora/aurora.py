@@ -465,6 +465,34 @@ class Aurora:
         # Any other turn cancels pending authorization. A later unrelated
         # voice input can never accidentally confirm a stale command.
         self._pending_forgets.pop(session_id, None)
+        # Never let a model invent remembered personal history about a topic
+        # whose earlier evidence has been suppressed. Ordinary requests for
+        # general knowledge about the topic still use normal cognition.
+        from PRIMORA.prime.context.forgetting import matches_topic
+        history_question = bool(re.search(
+            r"\b(?:remember|recall|memory|memories|"
+            r"what\s+did\s+i|did\s+i|have\s+i\s+(?:ever|told)|"
+            r"my\s+(?:old|previous|past))\b",
+            latest_user, re.IGNORECASE,
+        ))
+        if history_question:
+            try:
+                hidden_topics = self._context._get_store().forgotten_topics()
+            except Exception as exc:
+                return BrainResult.failure(
+                    f"Memory privacy filter unavailable: {exc}",
+                    self._brain.get_model_name(),
+                )
+            if any(matches_topic(latest_user, t) for t in hidden_topics):
+                response = BrainResult.success(
+                    "I no longer use my earlier stored memories about that "
+                    "topic, so I can't verify your past personal details "
+                    "about it. Original database records were not erased.",
+                    self._brain.get_model_name(),
+                )
+                if on_delta is not None:
+                    on_delta(response.content)
+                return response
         # A broad or ambiguous request (e.g. "forget yesterday") must
         # never fall through to the language model, which could falsely
         # promise deletion without an operation.
