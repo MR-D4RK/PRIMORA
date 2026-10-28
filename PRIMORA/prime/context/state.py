@@ -1060,8 +1060,13 @@ def extract_candidates(
         cands = _extract_explicit_car_preferences(head)
     if not cands:
         cands = _extract_all_shades(head)
-    if not cands:
+    if not cands and _REPEATED_SUBJECT_LIKE_RE.fullmatch(head.strip()):
         cands = _extract_repeated_subject_preference(head)
+        if not cands:
+            # An ambiguous subject ("this"/"anything") is not a named
+            # preference. Do not let the generic greedy likes slot treat
+            # the whole utterance as an item name instead.
+            return []
     if not cands:
         cands = _extract_slots(head)
     if not cands:
