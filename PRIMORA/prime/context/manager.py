@@ -9,6 +9,7 @@ import math
 import os
 import re
 import time
+import threading
 from typing import Any, Callable, Optional
 
 from . import entities as entities_mod
@@ -291,6 +292,18 @@ class ContextManager:
         # loop for per-turn diagnostics. They are observability only and never
         # influence admission or retrieval.
         self._last_formation_timings: dict[str, float] = {}
+        # Only an explicit deferred environment configuration starts the
+        # background worker. Tests that call set_formation_deferred(True)
+        # retain manual deterministic queue control.
+        self._formation_auto_worker = self._formation_deferred and (
+            os.environ.get("PRIMORA_MEMORY_FORMATION_AUTO_WORKER", "1")
+            .strip().lower() not in ("0", "false", "no", "off")
+        )
+        self._formation_stop_event = threading.Event()
+        self._formation_wakeup = threading.Event()
+        self._formation_drain_lock = threading.Lock()
+        self._formation_worker: Optional[threading.Thread] = None
+        self._maybe_start_formation_worker()
 
     @property
     def admission(self) -> MemoryAdmissionGateway:
@@ -305,6 +318,55 @@ class ContextManager:
 
     def set_formation_deferred(self, enabled: bool) -> None:
         self._formation_deferred = bool(enabled)
+        if enabled:
+            self._maybe_start_formation_worker()
+
+    def _maybe_start_formation_worker(self) -> None:
+        """Start one bounded worker only for an opt-in deferred runtime."""
+        if not (self._formation_auto_worker and self._formation_deferred
+                and self._memory_v2_enabled
+                and self._formation_provider is not None):
+            return
+        if self._formation_worker is not None and self._formation_worker.is_alive():
+            self._formation_wakeup.set()
+            return
+        if self._formation_stop_event.is_set():
+            return
+        self._formation_worker = threading.Thread(
+            target=self._run_formation_worker,
+            name="primora-memory-formation", daemon=True,
+        )
+        self._formation_worker.start()
+
+    def _run_formation_worker(self) -> None:
+        """Poll the SQLite queue at most once per short interval.
+
+        One worker per manager; SQLite transactions and processing leases
+        prevent competing manager processes from claiming the same live job.
+        The worker does not own or modify raw conversation messages.
+        """
+        while not self._formation_stop_event.is_set():
+            self._formation_wakeup.wait(timeout=2.0)
+            self._formation_wakeup.clear()
+            if self._formation_stop_event.wait(2.0):
+                break
+            if not (self._formation_deferred and self._memory_v2_enabled
+                    and self._formation_provider is not None):
+                continue
+            try:
+                self.drain_formation(limit=1, respect_backoff=True)
+            except Exception:
+                # A failed sweep must never kill the worker or erase jobs.
+                # Jobs and failure details remain inspectable in SQLite.
+                pass
+
+    def stop_formation_worker(self, timeout: float = 1.0) -> None:
+        """Signal shutdown without blocking indefinitely on a model request."""
+        self._formation_stop_event.set()
+        self._formation_wakeup.set()
+        worker = self._formation_worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.0, float(timeout)))
 
     # ------------------------------------------------------------------
     # M6 live-switch surface
@@ -359,9 +421,11 @@ class ContextManager:
     def set_memory_v2_enabled(self, enabled: bool) -> None:
         """Roll back the additive V2 formation path without touching data."""
         self._memory_v2_enabled = bool(enabled)
+        self._maybe_start_formation_worker()
 
     def set_formation_provider(self, provider) -> None:
         self._formation_provider = provider
+        self._maybe_start_formation_worker()
 
     def consume_formation_timings(self) -> dict[str, float]:
         """Return and clear the latest typed-formation timing sample."""
@@ -2534,6 +2598,8 @@ class ContextManager:
                             )
                         else:
                             store.enqueue_formation_job(message_id, session_id)
+                            if self._formation_deferred:
+                                self._formation_wakeup.set()
                             formation_pending = True
                             formation_diags.append("typed_formation:queued")
                             if not self._formation_deferred:
@@ -2591,54 +2657,65 @@ class ContextManager:
         except Exception:
             return []
 
-    def drain_formation(self, limit: int = 8) -> list[str]:
-        """Resume queued typed formation exactly once per source message.
+    def drain_formation(
+        self, limit: int = 8, *, respect_backoff: bool = False,
+    ) -> list[str]:
+        """Process claimed typed-formation jobs, one drain at a time.
 
-        Raw history and deterministic formation are already durable. This
-        worker only handles model-backed proposals; a crash leaves a job that
-        the next drain can safely reclaim because admission is idempotent.
+        Production background runs use backoff. Explicit manual drains
+        retain immediate retry semantics for maintenance and tests.
         """
         if not self._memory_v2_enabled or self._formation_provider is None:
             return ["formation_drain:provider_not_configured"]
-        store = self._get_store()
-        diagnostics: list[str] = []
-        for job in store.claim_formation_jobs(limit):
-            message = store.fetch_message(job["message_id"])
-            if message is None or message.role != "user":
-                error = "source_message_not_found_or_not_user"
-                store.finish_formation_job(job["job_id"], "failed", error)
-                diagnostics.append(f"formation_job_failed:{job['job_id']}:{error}")
-                continue
-            try:
-                typed = formation_mod.apply_proposals(
-                    store, job["session_id"], message, self._formation_provider,
-                )
-                self._last_formation_timings = dict(typed.timings_ms)
-                items = [f"typed_formation:{item}" for item in typed.diagnostics]
-                failed = any(item.startswith("typed_formation:provider_")
-                             or item.startswith("typed_formation:malformed")
-                             for item in items)
-                store.finish_formation_job(
-                    job["job_id"], "failed" if failed else "complete",
-                    "provider_or_parse_failure" if failed else "",
-                )
-                # Provider/JSON failures are observable job failures, but the
-                # raw user turn and deterministic formation completed safely;
-                # preserve the historical "complete" conversation status so
-                # an unavailable model never breaks ordinary replies.
-                store.set_formation_status(
-                    message.message_id, job["session_id"],
-                    "complete", items,
-                )
-                diagnostics.extend(items)
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-                store.finish_formation_job(job["job_id"], "failed", error)
-                store.set_formation_status(
-                    message.message_id, job["session_id"], "incomplete", [error],
-                )
-                diagnostics.append(f"formation_job_failed:{job['job_id']}:{error}")
-        return diagnostics
+        with self._formation_drain_lock:
+            store = self._get_store()
+            diagnostics: list[str] = []
+            for job in store.claim_formation_jobs(
+                limit, respect_backoff=respect_backoff,
+            ):
+                message = store.fetch_message(job["message_id"])
+                if (message is None or message.role != "user"
+                        or message.session_id != job["session_id"]):
+                    error = "source_message_not_found_or_not_user_in_session"
+                    store.finish_formation_job(job["job_id"], "failed", error)
+                    diagnostics.append(
+                        f"formation_job_failed:{job['job_id']}:{error}"
+                    )
+                    continue
+                try:
+                    typed = formation_mod.apply_proposals(
+                        store, job["session_id"], message,
+                        self._formation_provider,
+                    )
+                    self._last_formation_timings = dict(typed.timings_ms)
+                    items = [
+                        f"typed_formation:{item}" for item in typed.diagnostics
+                    ]
+                    failed = any(
+                        item.startswith("typed_formation:provider_")
+                        or item.startswith("typed_formation:malformed")
+                        for item in items
+                    )
+                    store.finish_formation_job(
+                        job["job_id"], "failed" if failed else "complete",
+                        "provider_or_parse_failure" if failed else "",
+                    )
+                    store.set_formation_status(
+                        message.message_id, job["session_id"],
+                        "incomplete" if failed else "complete", items,
+                    )
+                    diagnostics.extend(items)
+                except Exception as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    store.finish_formation_job(job["job_id"], "failed", error)
+                    store.set_formation_status(
+                        message.message_id, job["session_id"],
+                        "incomplete", [error],
+                    )
+                    diagnostics.append(
+                        f"formation_job_failed:{job['job_id']}:{error}"
+                    )
+            return diagnostics
 
     def replay_formation(
         self, session_id: str, message_id: int,
@@ -2685,6 +2762,8 @@ class ContextManager:
                     )
                 else:
                     store.enqueue_formation_job(message.message_id, session_id)
+                    if self._formation_deferred:
+                        self._formation_wakeup.set()
                     diagnostics.append("typed_formation:queued")
                     if not self._formation_deferred:
                         diagnostics.extend(self.drain_formation())
