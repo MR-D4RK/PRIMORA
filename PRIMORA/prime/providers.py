@@ -4,6 +4,7 @@ import os
 import json
 import urllib.request
 import urllib.error
+from PRIMORA.local_model_gate import local_model_request
 from .contract import PrimeResult
 
 
@@ -52,11 +53,13 @@ class OllamaProvider(Provider):
                 headers={"Content-Type": "application/json"},
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                if resp.status != 200:
-                    return PrimeResult.failure(f"Ollama HTTP {resp.status}: {resp.read().decode('utf-8')}")
-                response_data = json.loads(resp.read().decode("utf-8"))
-
+            with local_model_request(url):
+                with local_model_request(url):
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                        if resp.status != 200:
+                            return PrimeResult.failure(f"Ollama HTTP {resp.status}: {resp.read().decode('utf-8')}")
+                        response_data = json.loads(resp.read().decode("utf-8"))
+        
         except urllib.error.HTTPError as e:
             return PrimeResult.failure(f"Ollama HTTP error {e.code}: {e.read().decode('utf-8')}")
         except urllib.error.URLError as e:
