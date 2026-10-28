@@ -431,6 +431,16 @@ class Aurora:
             if on_delta is not None:
                 on_delta(response.content)
             return response
+        # A broad or ambiguous request (e.g. "forget yesterday") must
+        # never fall through to the language model, which could falsely
+        # promise deletion without an operation.
+        if re.match(r"^\\s*(?:hey\\s+aurora[,!.]?\\s*)?(?:please\\s+)?(?:forget|erase|delete)\\b",
+                    latest_user, re.IGNORECASE):
+            return BrainResult.success(
+                "No memory was changed. To suppress a specific subject, "
+                "say 'forget everything about [topic]'.",
+                self._brain.get_model_name(),
+            )
         try:
             safe_messages = self._context.filter_conversation_input(messages)
         except Exception as exc:
