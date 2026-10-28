@@ -3106,14 +3106,20 @@ class ContextManager:
             diagnostics.append("counter_fallback: current turn")
 
         if base_tokens + current_tokens > cfg.input_ceiling:
-            if current is not None:
-                try:
-                    self._get_store()
-                except Exception as e:
-                    diagnostics.append(f"store_unavailable: {e}")
+            # The combined floor can overflow even when the user said only
+            # two words. Never blame the user's short message for an
+            # overgrown system prompt; neither section is silently cut.
+            if current_tokens > cfg.input_ceiling:
+                detail = "Current user message alone exceeds the hard input ceiling"
+            elif base_tokens >= cfg.input_ceiling:
+                detail = "System instructions exceed the hard input ceiling"
+            else:
+                detail = (
+                    "System instructions and current user message together "
+                    "exceed the hard input ceiling"
+                )
             raise ContextTooLargeError(
-                "Current user message alone exceeds the hard input ceiling; "
-                "raw message preserved, no inference attempted."
+                detail + "; raw message preserved, no inference attempted."
             )
 
         selected: list[dict[str, str]] = list(base)
