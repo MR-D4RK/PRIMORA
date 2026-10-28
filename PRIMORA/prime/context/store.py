@@ -809,7 +809,7 @@ class ContextStore:
         params.append(limit)
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return [ExperienceEvent(*row) for row in reversed(rows)]
+        return [ExperienceEvent(*row) for row in self._visible("experience_events", list(reversed(rows)), lambda r: r[0])]
 
     def fetch_legacy_experience_reports(self, *, limit: int = 5000) -> list[ExperienceEvent]:
         """Read-only fallback for user reports predating experience capture.
@@ -830,7 +830,7 @@ class ContextStore:
                 "ORDER BY m.id DESC LIMIT ?", (limit,)
             ).fetchall()
         result = []
-        for message_id, session_id, statement, timestamp in rows:
+        for message_id, session_id, statement, timestamp in self._visible("messages", rows, lambda r: r[0]):
             claim = extract_experience_claim(statement, reported_at=timestamp)
             if claim is not None:
                 result.append(ExperienceEvent(
@@ -866,7 +866,7 @@ class ContextStore:
             r"(?:it|that|them)[.! ]*", row[4], re.I
         ):
             return None
-        return StoredMessage(*row)
+        return (StoredMessage(*row) if not self.is_suppressed("messages", row[0]) else None)
 
     # ------------------------------------------------------------------
     # Topic forgetting: read-time suppression, not physical deletion.
@@ -1073,7 +1073,7 @@ class ContextStore:
             params.append(limit)
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return [StoredMessage(*r) for r in rows]
+        return [StoredMessage(*r) for r in self._visible("messages", list(rows), lambda r: r[0])]
 
     def fetch_message(self, message_id: int) -> Optional[StoredMessage]:
         """One stored message by id. Used by the live hybrid admission path."""
@@ -1083,7 +1083,7 @@ class ContextStore:
                 " fingerprint, importance FROM messages WHERE id = ?",
                 (message_id,),
             ).fetchone()
-        return StoredMessage(*row) if row is not None else None
+        return (StoredMessage(*row) if row is not None and not self.is_suppressed("messages", row[0]) else None)
 
     def has_user_content(self, content: str, *, exclude_id: Optional[int] = None) -> bool:
         """Whether an identical user source was already processed.
@@ -1120,7 +1120,7 @@ class ContextStore:
                 f" WHERE id IN ({','.join('?' for _ in unique)})",
                 unique,
             ).fetchall()
-        found = {row[0]: StoredMessage(*row) for row in rows}
+        found = {row[0]: StoredMessage(*row) for row in self._visible("messages", rows, lambda r: r[0])}
         return [found[v] for v in unique if v in found]
 
     def fetch_latest(
@@ -1133,7 +1133,7 @@ class ContextStore:
                 " WHERE session_id = ? ORDER BY seq DESC, id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
-        return [StoredMessage(*r) for r in reversed(rows)]
+        return [StoredMessage(*r) for r in self._visible("messages", list(reversed(rows)), lambda r: r[0])]
 
     def fetch_conversation(
         self, session_id: str, limit: int = 30
@@ -1166,7 +1166,7 @@ class ContextStore:
                 " ORDER BY id DESC LIMIT ?",
                 (session_id, after_id, "%<prime_request>%", int(limit)),
             ).fetchall()
-        return [StoredMessage(*r) for r in reversed(rows)]
+        return [StoredMessage(*r) for r in self._visible("messages", list(reversed(rows)), lambda r: r[0])]
 
     def max_seq(self, session_id: str) -> int:
         """Highest stored sequence in this session, or -1 when there is none."""
@@ -1233,7 +1233,7 @@ class ContextStore:
             params.append(limit)
         with self._connection() as con:
             rows = con.execute(sql, params).fetchall()
-        return [StoredMessage(*r) for r in rows]
+        return [StoredMessage(*r) for r in self._visible("messages", list(rows), lambda r: r[0])]
 
     def search_user_evidence(
         self, terms: tuple[str, ...] = (), *, start: Optional[float] = None,
@@ -1270,7 +1270,7 @@ class ContextStore:
                 " AND ".join(parts) + f" ORDER BY timestamp {order}, id {order} LIMIT ?",
                 params,
             ).fetchall()
-        return [StoredMessage(*row) for row in rows]
+        return [StoredMessage(*row) for row in self._visible("messages", rows, lambda r: r[0])]
 
     def neighboring_user_evidence(self, message: StoredMessage) -> list[StoredMessage]:
         """Two preceding and following user turns; may be unrelated.
@@ -1289,7 +1289,7 @@ class ContextStore:
                  message.timestamp - 7200, message.timestamp + 7200,
                  message.message_id),
             ).fetchall()
-        return [StoredMessage(*row) for row in rows[:4]]
+        return [StoredMessage(*row) for row in self._visible("messages", rows, lambda r: r[0])[:4]]
 
     def save_digest(
         self,
@@ -1908,9 +1908,11 @@ class ContextStore:
             params.append(limit)
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return [self._observation_row_to_record(row) for row in rows]
+        return [self._observation_row_to_record(row) for row in self._visible("observations", rows, lambda r: r[0])]
 
     def fetch_observation_history(self, observation_id: int) -> list[ObservationHistoryRecord]:
+        if self.is_suppressed("observations", observation_id):
+            return []
         with self._connection() as con:
             rows = con.execute(
                 "SELECT id, observation_id, snapshot_json, reason, changed_at,"
@@ -1924,6 +1926,8 @@ class ContextStore:
 
     def fetch_observation_sources(self, observation_id: int) -> list[dict[str, Any]]:
         """Return the immutable evidence links used to derive proof_count."""
+        if self.is_suppressed("observations", observation_id):
+            return []
         with self._connection() as con:
             rows = con.execute(
                 "SELECT id, observation_id, source_message_id, source_episode_id,"
@@ -2143,7 +2147,7 @@ class ContextStore:
             params.append(limit)
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return self._state_rows_to_records(rows)
+        return self._state_rows_to_records(self._visible("states", rows, lambda r: r[0]))
 
     def create_candidate(
         self,
@@ -2221,7 +2225,7 @@ class ContextStore:
         query += " ORDER BY id ASC"
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return self._candidate_rows_to_records(rows)
+        return self._candidate_rows_to_records(self._visible("candidates", rows, lambda r: r[0]))
 
     def set_candidate_status(self, candidate_id: int, status: str) -> None:
         with self._connection() as con:
@@ -2260,7 +2264,7 @@ class ContextStore:
             row = con.execute(
                 self._entity_select() + " WHERE id = ?", (entity_id,)
             ).fetchone()
-        return self._entity_row_to_record(row) if row is not None else None
+        return (self._entity_row_to_record(row) if row is not None and not self.is_suppressed("entities", row[0]) else None)
 
     def fetch_entities(
         self,
@@ -2308,7 +2312,7 @@ class ContextStore:
             params.append(limit)
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return self._entity_rows_to_records(rows)
+        return self._entity_rows_to_records(self._visible("entities", rows, lambda r: r[0]))
 
     def create_entity(
         self,
@@ -2526,7 +2530,7 @@ class ContextStore:
             row = con.execute(
                 self._alias_select() + " WHERE id = ?", (alias_id,)
             ).fetchone()
-        return self._alias_row_to_record(row) if row is not None else None
+        return (self._alias_row_to_record(row) if row is not None and not self.is_suppressed("entity_aliases", row[0]) else None)
 
     def fetch_entity_aliases(
         self,
@@ -2570,7 +2574,7 @@ class ContextStore:
             params.append(limit)
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return [self._alias_row_to_record(row) for row in rows]
+        return [self._alias_row_to_record(row) for row in self._visible("entity_aliases", rows, lambda r: r[0])]
 
     def create_entity_alias(
         self,
@@ -2841,7 +2845,7 @@ class ContextStore:
                 self._relationship_select() + " WHERE id = ?",
                 (relationship_id,),
             ).fetchone()
-        return self._relationship_row_to_record(row) if row is not None else None
+        return (self._relationship_row_to_record(row) if row is not None and not self.is_suppressed("relationships", row[0]) else None)
 
     def fetch_relationships(
         self,
@@ -2884,7 +2888,7 @@ class ContextStore:
             params.append(limit)
         with self._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return [self._relationship_row_to_record(row) for row in rows]
+        return [self._relationship_row_to_record(row) for row in self._visible("relationships", rows, lambda r: r[0])]
 
     def create_relationship(
         self,
@@ -3335,7 +3339,8 @@ class ContextStore:
             query += " LIMIT ?"
             params.append(limit)
         with self._connection() as con:
-            return con.execute(query, params).fetchall()
+            rows = con.execute(query, params).fetchall()
+        return [row for row in rows if not self.is_suppressed({"state": "states", "entity": "entities"}.get(row[0], row[0]), row[1])]
 
     def count_vectors(
         self,
@@ -3394,4 +3399,4 @@ class ContextStore:
                     "content": r[7],
                 }
             )
-        return out
+        return self._visible("digests", out, lambda item: item["digest_id"])
