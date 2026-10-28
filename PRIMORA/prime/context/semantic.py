@@ -224,7 +224,8 @@ class SemanticIndex:
         query += " ORDER BY id ASC"
         with self._store._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return self._store._state_rows_to_records(rows)
+        return self._store._state_rows_to_records(
+            self._store._visible("states", rows, lambda r: r[0]))
 
     def indexable_entities(self, scope: Optional[str] = None) -> list[Any]:
         statuses = ",".join(f"'{s}'" for s in _ENTITY_INDEX_STATUSES)
@@ -243,7 +244,8 @@ class SemanticIndex:
         query += " ORDER BY id ASC"
         with self._store._connection() as con:
             rows = con.execute(query, params).fetchall()
-        return self._store._entity_rows_to_records(rows)
+        return self._store._entity_rows_to_records(
+            self._store._visible("entities", rows, lambda r: r[0]))
 
     # -- lifecycle ----------------------------------------------------
     def _alias_map(self, scope=None) -> dict:
