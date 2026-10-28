@@ -122,9 +122,9 @@ DEFAULT_SYSTEM_INSTRUCTION = (
     "it an assumption, acknowledge the mistake instead of denying it. "
     "A correction supersedes your prior interpretation. Focus "
     "on the latest user message, even if earlier tool results disagree. "
-    "When an 'I love X' statement answers a category question, interpret "
-    "X within that category, not as a generic topic. Acknowledge the "
-    "details already stated without inventing new ones.\n"
+    "Preserve conversational referents and distinguish an entity from "
+    "its attributes. Never guess an entity category or attribute unless "
+    "the user's own words or relevant dialogue actually establish it.\n"
     "\n"
     "Never do Prime's work yourself and never claim that you did."
 )
