@@ -3383,6 +3383,26 @@ class ContextManager:
             + protected
         )
 
+        # Last model-facing guard: task-local Working Memory, preserved
+        # capability evidence, and session metadata can contain older
+        # references that bypass ordinary store fetch methods. Filter their
+        # text too, while preserving the actual current user question and
+        # the mandatory core system instruction.
+        from .forgetting import matches_topic
+        topics = self._get_store().forgotten_topics()
+        if topics:
+            kept = [
+                item for item in ordered
+                if item is system_msg or item is current
+                or not any(matches_topic(item.get("content", ""), topic)
+                           for topic in topics)
+            ]
+            if len(kept) != len(ordered):
+                diagnostics.append(
+                    f"forgotten_context_suppressed: {len(ordered)-len(kept)}"
+                )
+                ordered = kept
+
         allowed = max(
             0, min(max_new_tokens, cfg.total_budget - total)
         )
