@@ -158,7 +158,8 @@ def main():
     print("Starting PRIMORA...")
     print("Type 'exit' or 'quit' to quit.\n")
 
-    cli_mode = "--cli" in sys.argv
+    voice_mode = "--voice" in sys.argv
+    cli_mode = "--cli" in sys.argv or voice_mode
 
     # Endpoint decisions must see the operator's *explicit* configuration,
     # captured before configure_runtime_defaults() fills in the defaults.
@@ -271,6 +272,10 @@ def main():
         print(f"Web UI running at http://{HOST}:{PORT}\n")
 
     try:
+        if voice_mode:
+            from PRIMORA.voice_demo import run_voice
+            run_voice(aurora)
+            return 0
         if cli_mode:
             run_cli(aurora)
             return 0
