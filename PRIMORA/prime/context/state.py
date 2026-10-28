@@ -208,6 +208,7 @@ _REPEATED_SUBJECT_LIKE_RE = re.compile(
 )
 _REPEATED_SUBJECT_JUNK = re.compile(
     r"\b(?:i|you|we|they|he|she|my|your|our|their|his|her|"
+    r"this|that|it|them|anything|everything|something|everyone|"
     r"because|whether|but|if|when|which|what)\b",
     re.IGNORECASE,
 )
