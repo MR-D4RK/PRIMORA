@@ -632,34 +632,54 @@ class ContextStore:
             )
             return bool(cur.rowcount)
 
-    def claim_formation_jobs(self, limit: int = 8) -> list[dict[str, Any]]:
-        """Claim pending/stale jobs transactionally for restart-safe draining."""
+    def claim_formation_jobs(
+        self, limit: int = 8, *, respect_backoff: bool = False,
+        lease_seconds: float = 900.0,
+    ) -> list[dict[str, Any]]:
+        """Claim jobs atomically without stealing another worker's live call.
+
+        A processing lease expires only after an elapsed interval; fresh
+        processing work cannot be reclaimed by another drain. Background
+        callers use exponential retry backoff. Explicit/manual drain callers
+        can retry failed jobs immediately, retaining the legacy test contract.
+        """
         limit = max(1, min(int(limit), 100))
+        lease_seconds = max(120.0, float(lease_seconds))
         now = time.time()
         with self._connection() as con:
             con.execute("BEGIN IMMEDIATE")
-            # A crashed worker leaves processing behind. Requeue it on the
-            # next drain; jobs are idempotent by message_id.
+            # A crashed worker's lease eventually expires. Never reclaim a
+            # live in-flight job simply because another drain started.
             con.execute(
                 "UPDATE formation_jobs SET status='pending', updated_at=? "
-                "WHERE status='processing'", (now,)
+                "WHERE status='processing' AND updated_at <= ?",
+                (now, now - lease_seconds),
             )
             rows = con.execute(
-                "SELECT job_id, message_id, session_id, attempts FROM formation_jobs "
+                "SELECT job_id, message_id, session_id, attempts, status, "
+                "updated_at FROM formation_jobs "
                 "WHERE status IN ('pending', 'failed') AND attempts < 5 "
-                "ORDER BY job_id LIMIT ?", (limit,)
+                "ORDER BY CASE WHEN status='pending' THEN 0 ELSE 1 END, "
+                "job_id",
             ).fetchall()
             jobs = []
-            for job_id, message_id, session_id, attempts in rows:
-                con.execute(
-                    "UPDATE formation_jobs SET status='processing', attempts=?, updated_at=? "
-                    "WHERE job_id=? AND status IN ('pending', 'failed')",
+            for job_id, message_id, session_id, attempts, status, updated_at in rows:
+                if len(jobs) >= limit:
+                    break
+                if respect_backoff and status == "failed":
+                    retry_delay = min(300.0, 5.0 * (2 ** max(0, attempts - 1)))
+                    if now < updated_at + retry_delay:
+                        continue
+                cur = con.execute(
+                    "UPDATE formation_jobs SET status='processing', attempts=?, "
+                    "updated_at=? WHERE job_id=? AND status IN ('pending', 'failed')",
                     (int(attempts) + 1, now, int(job_id)),
                 )
-                jobs.append({
-                    "job_id": int(job_id), "message_id": int(message_id),
-                    "session_id": session_id, "attempts": int(attempts) + 1,
-                })
+                if cur.rowcount == 1:
+                    jobs.append({
+                        "job_id": int(job_id), "message_id": int(message_id),
+                        "session_id": session_id, "attempts": int(attempts) + 1,
+                    })
             return jobs
 
     def finish_formation_job(
