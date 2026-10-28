@@ -306,11 +306,7 @@ class Aurora:
         return self._brain.generate(messages)
 
     def _with_instruction(self, messages: list[dict[str, str]]) -> list[dict[str, str]]:
-        capability_instruction = (
-            build_capability_instruction(self._prime)
-            + build_specialist_instruction(self._prime)
-            + build_tool_instruction(self._prime)
-        )
+        capability_instruction = build_capability_instruction(self._prime)
         # The identity is resolved from the live config on every call, so the
         # prompt describes the model and adapter this run actually uses. It
         # goes into both branches: a caller-supplied system message must not
