@@ -198,17 +198,17 @@ def _extract_all_shades(text: str) -> list["StateCandidate"]:
 # back to one clearly named subject. The remainder is preserved verbatim in
 # its user source, not reinterpreted as a new fact or invented motive.
 _REPEATED_SUBJECT_LIKE_RE = re.compile(
-    r"^i\\s+(?:really\\s+)?(?P<verb>love|like|adore|enjoy)\\s+"
-    r"(?P<subject>[a-z][a-z0-9 '&\\-]{1,74}?)"
-    r"\\s*[,;.]?\\s+i\\s+(?:really\\s+)?(?:love|like|adore|enjoy)\\s+"
-    r"(?:(?:every|each)\\s+(?:aspect|part|bit)\\s+of|"
-    r"all\\s+(?:the\\s+)?(?:aspects|parts|bits)\\s+of)\\s+"
-    r"(?:it|them)\\b(?P<details>.*)$",
+    r"^i\s+(?:really\s+)?(?P<verb>love|like|adore|enjoy)\s+"
+    r"(?P<subject>[a-z][a-z0-9 '&\-]{1,74}?)"
+    r"\s*[,;.]?\s+i\s+(?:really\s+)?(?:love|like|adore|enjoy)\s+"
+    r"(?:(?:every|each)\s+(?:aspect|part|bit)\s+of|"
+    r"all\s+(?:the\s+)?(?:aspects|parts|bits)\s+of)\s+"
+    r"(?:it|them)\b(?P<details>.*)$",
     re.IGNORECASE | re.DOTALL,
 )
 _REPEATED_SUBJECT_JUNK = re.compile(
-    r"\\b(?:i|you|we|they|he|she|my|your|our|their|his|her|"
-    r"because|whether|but|if|when|which|what)\\b",
+    r"\b(?:i|you|we|they|he|she|my|your|our|their|his|her|"
+    r"because|whether|but|if|when|which|what)\b",
     re.IGNORECASE,
 )
 
