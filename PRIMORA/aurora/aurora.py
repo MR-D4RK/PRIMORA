@@ -234,6 +234,9 @@ class Aurora:
             # wrapper created per Aurora instance.
             self._mind = getattr(prime, "mind", None) or Mind(prime.context)
         self._context = self._mind.mechanisms
+        # Session-scoped, volatile confirmation for consequential forgetting.
+        # Never persist or reuse a pending command after a restart.
+        self._pending_forgets: dict[str, str] = {}
 
         # Milestone 2: the cognitive loop. It reuses this Aurora's existing
         # brain and the same Mind, so there is no second agent. The executor
@@ -411,7 +414,35 @@ class Aurora:
             if m.get("role") == "user"
         ), "")
         topic = parse_forget_request(latest_user)
+        confirmation = re.fullmatch(
+            r"\\s*confirm\\s+forget\\s+(.+?)\\s*[.!?]*\\s*",
+            latest_user, re.IGNORECASE,
+        )
         if topic is not None:
+            self._pending_forgets[session_id] = topic
+            response = BrainResult.success(
+                f"Please confirm: suppress all stored memory about {topic}? "
+                f"Reply exactly 'confirm forget {topic}' to proceed. "
+                "This hides old memory from Aurora but does not physically "
+                "erase the SQLite records or backups.",
+                self._brain.get_model_name(),
+            )
+            if on_delta is not None:
+                on_delta(response.content)
+            return response
+        if confirmation is not None:
+            from PRIMORA.prime.context.forgetting import normalize_topic
+            try:
+                confirmed = normalize_topic(confirmation.group(1))
+            except ValueError:
+                confirmed = ""
+            pending = self._pending_forgets.pop(session_id, None)
+            if confirmed != pending or not pending:
+                return BrainResult.success(
+                    "No matching forget request is pending; nothing changed.",
+                    self._brain.get_model_name(),
+                )
+            topic = pending
             try:
                 receipt = self._context.forget_topic(topic)
                 if receipt.get("status") != "suppressed":
@@ -431,6 +462,9 @@ class Aurora:
             if on_delta is not None:
                 on_delta(response.content)
             return response
+        # Any other turn cancels pending authorization. A later unrelated
+        # voice input can never accidentally confirm a stale command.
+        self._pending_forgets.pop(session_id, None)
         # A broad or ambiguous request (e.g. "forget yesterday") must
         # never fall through to the language model, which could falsely
         # promise deletion without an operation.
