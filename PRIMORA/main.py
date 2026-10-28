@@ -276,6 +276,13 @@ def main():
             return 0
         return run_gui(aurora)
     finally:
+        # Stop new background memory jobs before shutting down their shared
+        # local model endpoint. A bounded join will not hang the interface
+        # if an in-flight model call is already waiting on the server.
+        context = getattr(prime, "context", None)
+        stop_formation = getattr(context, "stop_formation_worker", None)
+        if callable(stop_formation):
+            stop_formation(timeout=1.0)
         # Stops only what this process started: the SearXNG instance
         # (adopted or disabled services are no-ops) and a llama-server
         # this process started (an adopted server is never touched).
