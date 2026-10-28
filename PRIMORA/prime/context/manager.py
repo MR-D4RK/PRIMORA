@@ -2042,6 +2042,17 @@ class ContextManager:
             return None
 
     # ------------------------------------------------------------------
+    # Explicit topic forgetting: durable suppression, no raw-row deletion.
+    # ------------------------------------------------------------------
+    def forget_topic(self, topic: str) -> dict[str, Any]:
+        return self._get_store().forget_topic(topic)
+
+    def filter_conversation_input(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        return self._get_store().filter_conversation_input(messages)
+
+    # ------------------------------------------------------------------
     # Ingest
     # ------------------------------------------------------------------
     def experience_events(self, *, session_id: Optional[str] = None,
@@ -2483,6 +2494,7 @@ class ContextManager:
         """
         diagnostics: list[str] = []
         try:
+            messages = self.filter_conversation_input(messages)
             store = self._get_store()
         except Exception as e:
             return [f"store_unavailable: {e}"]
@@ -3068,6 +3080,9 @@ class ContextManager:
         """
         cfg = budget or self._budget
         counter = self._counter_or_fallback(token_counter)
+        # Other callers may supply cached chat transcripts; never resurrect
+        # forgotten rows merely because they remain in an in-memory list.
+        messages = self.filter_conversation_input(messages)
         diagnostics: list[str] = []
 
         # 0. Session row first (safe fallback keeps the request alive).
