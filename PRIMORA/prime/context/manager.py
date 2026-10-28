@@ -245,6 +245,15 @@ class ContextManager:
         self._budget = budget or BudgetConfig.from_env()
         self._memory_provider = memory_provider
         self._formation_provider = formation_provider
+        # Explicit opt-in. In semantic mode no deterministic extractor may
+        # write a current personal fact ahead of source-verified model analysis.
+        # The old pipeline remains an available rollback.
+        self._formation_mode = (
+            os.environ.get("PRIMORA_MEMORY_FORMATION_MODE", "legacy")
+            .strip().casefold()
+        )
+        if self._formation_mode not in ("legacy", "semantic"):
+            raise ValueError("PRIMORA_MEMORY_FORMATION_MODE must be legacy or semantic")
         if enable_memory_v2 is None:
             enable_memory_v2 = memory_v2
         if enable_memory_v2 is None:
@@ -253,9 +262,10 @@ class ContextManager:
                 os.environ.get("PRIMORA_MEMORY_V2_FORMATION", "0"),
                 os.environ.get("PRIMORA_MEMORY_V2_RETRIEVAL", "0"),
             )
-            enable_memory_v2 = any(
-                value.strip().lower() in ("1", "true", "yes", "on")
-                for value in enabled_values
+            enable_memory_v2 = (
+                self._formation_mode == "semantic"
+                or any(value.strip().lower() in ("1", "true", "yes", "on")
+                       for value in enabled_values)
             )
         self._memory_v2_enabled = bool(enable_memory_v2)
         self._store: Optional[ContextStore] = None
@@ -311,6 +321,10 @@ class ContextManager:
         if self._admission is None:
             self._admission = MemoryAdmissionGateway(self._get_store())
         return self._admission
+
+    @property
+    def semantic_formation(self) -> bool:
+        return self._formation_mode == "semantic" and self._memory_v2_enabled
 
     @property
     def formation_deferred(self) -> bool:
@@ -2587,13 +2601,18 @@ class ContextManager:
                             assistant_question = self._prior_assistant_text(
                                 store, session_id, message_id
                             )
-                    formation_diags.extend(
-                        self._extract_states(
-                            store, session_id, message_id, role, content,
-                            context_question, assistant_question,
-                            global_personal_preferences=self._memory_v2_enabled,
+                    if not (role == "user" and self.semantic_formation):
+                        formation_diags.extend(
+                            self._extract_states(
+                                store, session_id, message_id, role, content,
+                                context_question, assistant_question,
+                                global_personal_preferences=self._memory_v2_enabled,
+                            )
                         )
-                    )
+                    elif self._formation_provider is None:
+                        formation_diags.append(
+                            "semantic_formation:provider_unavailable_raw_only"
+                        )
                     # V2 typed formation is opt-in and proposal-only.  The
                     # deterministic extractor above always runs first, so a
                     # provider timeout or malformed response cannot remove
@@ -2604,7 +2623,7 @@ class ContextManager:
                         and self._memory_v2_enabled
                         and self._formation_provider is not None
                     ):
-                        if replayed_user_source:
+                        if replayed_user_source and not self.semantic_formation:
                             formation_diags.append(
                                 "typed_formation:skipped_already_processed_source"
                             )
@@ -2616,7 +2635,7 @@ class ContextManager:
                             formation_diags.append("typed_formation:queued")
                             if not self._formation_deferred:
                                 formation_diags.extend(self.drain_formation())
-                    if role == "user":
+                    if role == "user" and not self.semantic_formation:
                         formation_diags.extend(
                             self._extract_entities(
                                 store, session_id, message_id, content,
@@ -2695,9 +2714,13 @@ class ContextManager:
                     )
                     continue
                 try:
+                    prior = store.fetch_context_before(message.message_id, limit=4)
                     typed = formation_mod.apply_proposals(
                         store, job["session_id"], message,
                         self._formation_provider,
+                        context=[{"role": row.role, "content": row.content}
+                                 for row in prior],
+                        semantic_first=self.semantic_formation,
                     )
                     self._last_formation_timings = dict(typed.timings_ms)
                     items = [
@@ -2758,17 +2781,18 @@ class ContextManager:
             prior_user = self._prior_user_text(store, session_id, message_id)
             prior_assistant = self._prior_assistant_text(
                 store, session_id, message_id)
-            diagnostics.extend(self._extract_states(
-                store, session_id, message_id, message.role, message.content,
-                prior_user, prior_assistant,
-                global_personal_preferences=self._memory_v2_enabled))
+            if not (message.role == "user" and self.semantic_formation):
+                diagnostics.extend(self._extract_states(
+                    store, session_id, message_id, message.role, message.content,
+                    prior_user, prior_assistant,
+                    global_personal_preferences=self._memory_v2_enabled))
             if (
                 message.role == "user"
                 and self._memory_v2_enabled
                 and self._formation_provider is not None
             ):
-                if store.has_user_content(
-                        message.content, exclude_id=message.message_id):
+                if (not self.semantic_formation and store.has_user_content(
+                        message.content, exclude_id=message.message_id)):
                     diagnostics.append(
                         "typed_formation:skipped_already_processed_source"
                     )
@@ -2779,7 +2803,7 @@ class ContextManager:
                     diagnostics.append("typed_formation:queued")
                     if not self._formation_deferred:
                         diagnostics.extend(self.drain_formation())
-            if message.role == "user":
+            if message.role == "user" and not self.semantic_formation:
                 diagnostics.extend(self._extract_entities(
                     store, session_id, message_id, message.content,
                     message.timestamp))
