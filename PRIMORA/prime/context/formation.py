@@ -407,6 +407,16 @@ def validate_semantic_candidate(candidate: TypedMemoryCandidate, message: Any) -
         return False, "semantic_bad_value"
     if predicate not in _source_preference_verbs(quote):
         return False, "semantic_attitude_unproven"
+    # Naming an object and an attitude in someone else's report is not
+    # evidence of the user's own preference.
+    if not re.search(
+        r"\b(?:i|we)\s+(?:(?:really|truly|absolutely)\s+)?"
+        r"(?:love|like|adore|enjoy|prefer|hate|dislike|"
+        r"don't\s+like|do\s+not\s+like)\b"
+        r"|\bmy\s+(?:fav|favorite|favourite)\b",
+        quote, re.I,
+    ):
+        return False, "semantic_attitude_not_first_person"
     # Reject clear hypothetical framing even if the model mislabeled it.
     if re.search(
         r"\b(?:hypothetical|fictional|pretend(?:ing)?|imaginary|"
