@@ -118,7 +118,7 @@ class WindowsVoice:
             "try {"
             "$culture=[Globalization.CultureInfo]::GetCultureInfo("
             + _ps_safe(language) + ");"
-            "$r=New-Object System.Speech.Recognition.SpeechRecognitionEngine($culture);"
+            "$r=[System.Speech.Recognition.SpeechRecognitionEngine]::new($culture);"
             "$r.LoadGrammar((New-Object System.Speech.Recognition.DictationGrammar));"
             "$r.SetInputToDefaultAudioDevice();"
             "$heard=$r.Recognize([TimeSpan]::FromSeconds(" + str(seconds) + "));"
@@ -216,3 +216,30 @@ def _voice_session(aurora, voice: WindowsVoice, *,
 def run_voice(aurora) -> None:
     voice = WindowsVoice()
     _voice_session(aurora, voice)
+
+
+def preview_voice() -> None:
+    """Hear three delivery styles before starting any model or microphone."""
+    voice = WindowsVoice()
+    print("Voice: " + voice.voice_id)
+    for tone, sentence in (
+        ("neutral", "Hello. I am Aurora."),
+        ("excited", "That's wonderful! I can't wait to show you!"),
+        ("gentle", "I'm here. We can work through this together."),
+    ):
+        print(tone + ": " + sentence)
+        voice.speak(sentence, tone)
+
+
+if __name__ == "__main__":
+    import sys
+    if "--list" in sys.argv:
+        for name in installed_voices():
+            print(name)
+    elif "--preview" in sys.argv:
+        preview_voice()
+    else:
+        print(
+            "Use --list to see installed voices, --preview to hear samples, "
+            "or python -m PRIMORA.main --voice for two-way conversation."
+        )
