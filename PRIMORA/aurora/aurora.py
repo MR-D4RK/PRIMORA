@@ -401,8 +401,46 @@ class Aurora:
         when omitted, the existing non-streaming behavior is preserved.
         The signature and return type are unchanged for existing callers.
         """
+        # Explicit forgetting is a Prime-owned memory mutation, not a
+        # conversational promise. Process it before the model can see or
+        # restate historical material; acknowledge only after the SQLite
+        # transaction and verification complete.
+        from PRIMORA.prime.context.forgetting import parse_forget_request
+        latest_user = next((
+            str(m.get("content", "")) for m in reversed(messages)
+            if m.get("role") == "user"
+        ), "")
+        topic = parse_forget_request(latest_user)
+        if topic is not None:
+            try:
+                receipt = self._context.forget_topic(topic)
+                if receipt.get("status") != "suppressed":
+                    raise RuntimeError("no verified suppression receipt")
+            except Exception as exc:
+                return BrainResult.failure(
+                    f"Couldn't suppress that memory topic: {exc}",
+                    self._brain.get_model_name(),
+                )
+            response = BrainResult.success(
+                f"I've suppressed my stored memories about {topic} from "
+                "conversation, memory retrieval, and active context. "
+                "Original SQLite records and backups are not physically "
+                "deleted. I won't use those old records in future replies.",
+                self._brain.get_model_name(),
+            )
+            if on_delta is not None:
+                on_delta(response.content)
+            return response
+        try:
+            safe_messages = self._context.filter_conversation_input(messages)
+        except Exception as exc:
+            return BrainResult.failure(
+                f"Memory privacy filter unavailable: {exc}",
+                self._brain.get_model_name(),
+            )
         return self._loop.run(
-            self._with_instruction(messages), session_id, on_delta=on_delta)
+            self._with_instruction(safe_messages), session_id,
+            on_delta=on_delta)
 
     def context_for(
         self,
