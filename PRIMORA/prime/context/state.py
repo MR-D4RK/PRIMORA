@@ -191,51 +191,6 @@ def _extract_all_shades(text: str) -> list["StateCandidate"]:
         return []
     return [normalized, relationship[0]]
 
-# In speech, punctuation is frequently missing: "I love Aurora I love
-# every aspect of it, especially the design". The generic likes slot would
-# otherwise treat the entire repeated clause as the *name of the thing*.
-# Accept only a repeated FIRST-PERSON preference with a pronoun referring
-# back to one clearly named subject. The remainder is preserved verbatim in
-# its user source, not reinterpreted as a new fact or invented motive.
-_REPEATED_SUBJECT_LIKE_RE = re.compile(
-    r"^i\s+(?:really\s+)?(?P<verb>love|like|adore|enjoy)\s+"
-    r"(?P<subject>[a-z][a-z0-9 '&\-]{1,74}?)"
-    r"\s*[,;.]?\s+i\s+(?:really\s+)?(?:love|like|adore|enjoy)\s+"
-    r"(?:(?:every|each)\s+(?:aspect|part|bit)\s+of|"
-    r"all\s+(?:the\s+)?(?:aspects|parts|bits)\s+of)\s+"
-    r"(?:it|them)\b(?P<details>.*)$",
-    re.IGNORECASE | re.DOTALL,
-)
-_REPEATED_SUBJECT_JUNK = re.compile(
-    r"\b(?:i|you|we|they|he|she|my|your|our|their|his|her|"
-    r"this|that|it|them|anything|everything|something|everyone|"
-    r"because|whether|but|if|when|which|what)\b",
-    re.IGNORECASE,
-)
-
-
-def _extract_repeated_subject_preference(text: str) -> list["StateCandidate"]:
-    """Preserve the actual item rather than making its details part of its name.
-
-    No domain-specific classification (music, games, books, etc.) is inferred.
-    It remains an ordinary, source-backed liked-item preference; the entire
-    text is retained as evidence for its explicitly described dimensions.
-    """
-    match = _REPEATED_SUBJECT_LIKE_RE.fullmatch(text.strip())
-    if not match:
-        return []
-    subject = " ".join(match.group("subject").split()).strip(" .,!;")
-    if (not subject or len(subject.split()) > 7
-            or _REPEATED_SUBJECT_JUNK.search(subject)):
-        return []
-    first_clause = f"I {match.group('verb')} {subject}"
-    candidates = _extract_slots(first_clause)
-    if (len(candidates) != 1 or candidates[0].slot != "likes"
-            or not candidates[0].auto_confirm):
-        return []
-    return candidates
-
-
 # High-confidence natural-language car preferences that the generic likes
 # slot cannot parse correctly. Keep these anchored: speculative noun/brand
 # guessing would create false personal memories.
@@ -1060,13 +1015,6 @@ def extract_candidates(
         cands = _extract_explicit_car_preferences(head)
     if not cands:
         cands = _extract_all_shades(head)
-    if not cands and _REPEATED_SUBJECT_LIKE_RE.fullmatch(head.strip()):
-        cands = _extract_repeated_subject_preference(head)
-        if not cands:
-            # An ambiguous subject ("this"/"anything") is not a named
-            # preference. Do not let the generic greedy likes slot treat
-            # the whole utterance as an item name instead.
-            return []
     if not cands:
         cands = _extract_slots(head)
     if not cands:
