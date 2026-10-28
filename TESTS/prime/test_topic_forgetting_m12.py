@@ -132,8 +132,14 @@ def test_aurora_confirms_only_after_verified_sqlite_suppression(tmp_path):
         prime, brain=brain,
         config=AuroraConfig(model_path="unused", adapter_path="unused"),
     )
-    reply = aurora.respond([
+    preview = aurora.respond([
         {"role": "user", "content": "forget everything about Atlas Kite"},
+    ], session_id="test-session")
+    assert preview.success
+    assert "confirm forget atlas kite" in preview.content
+    assert manager._get_store().forgotten_topics() == ()
+    reply = aurora.respond([
+        {"role": "user", "content": "confirm forget Atlas Kite"},
     ], session_id="test-session")
     assert reply.success
     assert "not physically deleted" in reply.content
@@ -153,8 +159,45 @@ def test_forgetting_failure_never_claims_success(tmp_path, monkeypatch):
                     config=AuroraConfig(model_path="unused", adapter_path="unused"))
     monkeypatch.setattr(manager, "forget_topic",
                         lambda _: (_ for _ in ()).throw(OSError("disk error")))
-    result = aurora.respond([
+    preview = aurora.respond([
         {"role": "user", "content": "forget everything about Atlas Kite"},
+    ], session_id="x")
+    assert preview.success
+    result = aurora.respond([
+        {"role": "user", "content": "confirm forget Atlas Kite"},
     ], session_id="x")
     assert not result.success
     assert "disk error" in result.error
+
+
+def test_confirmation_is_session_scoped_and_not_reused(tmp_path):
+    manager = ContextManager(db_path=tmp_path / "confirm.db")
+    brain = _NeverGenerate()
+    aurora = Aurora(
+        Prime(_Provider(), context_manager=manager), brain=brain,
+        config=AuroraConfig(model_path="unused", adapter_path="unused"),
+    )
+    mismatch = aurora.respond([
+        {"role": "user", "content": "confirm forget Cedar Observatory"},
+    ], session_id="a")
+    assert mismatch.success and "nothing changed" in mismatch.content
+    request = aurora.respond([
+        {"role": "user", "content": "forget everything about Cedar Observatory"},
+    ], session_id="a")
+    assert request.success
+    wrong_session = aurora.respond([
+        {"role": "user", "content": "confirm forget Cedar Observatory"},
+    ], session_id="b")
+    assert wrong_session.success and "nothing changed" in wrong_session.content
+    assert manager._get_store().forgotten_topics() == ()
+    mismatched = aurora.respond([
+        {"role": "user", "content": "confirm forget Laurel Cart"},
+    ], session_id="a")
+    assert mismatched.success and "nothing changed" in mismatched.content
+    assert manager._get_store().forgotten_topics() == ()
+    # Authorization is consumed even on a mismatch.
+    reattempt = aurora.respond([
+        {"role": "user", "content": "confirm forget Cedar Observatory"},
+    ], session_id="a")
+    assert reattempt.success and "nothing changed" in reattempt.content
+    assert brain.calls == 0
