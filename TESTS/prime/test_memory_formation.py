@@ -7,12 +7,23 @@ import os
 import sys
 import tempfile
 
+import pytest
+
 sys.path.insert(0, "C:\\PRIMORA PROJECT")
 
 from PRIMORA.prime.context import BudgetConfig, ContextManager
 
 _TEST_TMPDIR = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
 _SEQ = [0]
+
+@pytest.fixture(autouse=True)
+def _isolate_memory_mode(monkeypatch):
+    """Explicit legacy deterministic mode; individual tests opt into V2."""
+    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_MODE", "legacy")
+    for key in ("PRIMORA_MEMORY_V2", "PRIMORA_MEMORY_V2_FORMATION",
+                "PRIMORA_MEMORY_V2_RETRIEVAL"):
+        monkeypatch.setenv(key, "0")
+
 
 
 def _db():
@@ -42,10 +53,23 @@ def _currents(mgr, scope, concept=None):
     return mgr._get_store().fetch_states(
         scope=scope, concept=concept, status="current")
 
+def test_preference_scope_is_controlled_by_memory_v2():
+    """Legacy stays session-scoped; V2 persists preferences globally."""
+    for enabled, expected_scope in ((False, "s"), (True, "global")):
+        manager = ContextManager(db_path=_db(), enable_memory_v2=enabled)
+        _say(manager, [], "s", "I prefer dark mode.")
+        rows = manager._get_store().fetch_states(
+            concept="preference for dark mode", status="current")
+        assert len(rows) == 1
+        assert rows[0].scope == expected_scope
+        assert rows[0].value == "dark mode"
+        assert rows[0].source_ids
+
+
 
 # 1. preference ---------------------------------------------------------------
 def test_preference_confirmed():
-    mgr = ContextManager(db_path=_db())
+    mgr = ContextManager(db_path=_db(), enable_memory_v2=True)
     hist = []
     res = _say(mgr, hist, "s", "I prefer dark themes.")
     rows = _currents(mgr, "global", "preference for dark themes")
@@ -118,7 +142,7 @@ def test_rationale_linked():
 
 # 5. correction -----------------------------------------------------------------
 def test_correction_supersedes():
-    mgr = ContextManager(db_path=_db())
+    mgr = ContextManager(db_path=_db(), enable_memory_v2=True)
     hist = []
     _say(mgr, hist, "s", "I prefer dark themes.")
     _say(mgr, hist, "s", "Actually, I prefer light themes.")
@@ -209,7 +233,7 @@ def test_assistant_never_current():
 
 # 8. repetition -------------------------------------------------------------------
 def test_repetition_single_current():
-    mgr = ContextManager(db_path=_db())
+    mgr = ContextManager(db_path=_db(), enable_memory_v2=True)
     hist = []
     for _ in range(3):
         _say(mgr, hist, "s", "I prefer dark themes.")
@@ -221,7 +245,7 @@ def test_repetition_single_current():
 
 # 9. provenance ---------------------------------------------------------------------
 def test_provenance_points_to_source():
-    mgr = ContextManager(db_path=_db())
+    mgr = ContextManager(db_path=_db(), enable_memory_v2=True)
     hist = []
     _say(mgr, hist, "s", "First filler line here.")
     res = _say(mgr, hist, "s", "I prefer dark themes.")
@@ -248,7 +272,7 @@ def test_global_scope_formation():
 
 # 11. idempotence -----------------------------------------------------------------------
 def test_reconciliation_no_duplicates():
-    mgr = ContextManager(db_path=_db())
+    mgr = ContextManager(db_path=_db(), enable_memory_v2=True)
     snap = [{"role": "user", "content": "I prefer dark themes."}]
     mgr.reconcile(list(snap), "s")
     mgr.reconcile(list(snap), "s")
