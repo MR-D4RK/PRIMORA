@@ -326,6 +326,20 @@ CREATE TABLE IF NOT EXISTS formation_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_formation_jobs_status
     ON formation_jobs(status, updated_at, job_id);
+CREATE TABLE IF NOT EXISTS forgotten_topics (
+    topic TEXT PRIMARY KEY,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS suppressed_memory (
+    kind TEXT NOT NULL,
+    ref_id INTEGER NOT NULL,
+    topic TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY(kind, ref_id, topic),
+    FOREIGN KEY(topic) REFERENCES forgotten_topics(topic)
+);
+CREATE INDEX IF NOT EXISTS idx_suppressed_memory_lookup
+    ON suppressed_memory(kind, ref_id);
 """
 
 _FTS_SCHEMA = """
@@ -853,6 +867,181 @@ class ContextStore:
         ):
             return None
         return StoredMessage(*row)
+
+    # ------------------------------------------------------------------
+    # Topic forgetting: read-time suppression, not physical deletion.
+    # ------------------------------------------------------------------
+
+    def forget_topic(self, requested_topic: str) -> dict[str, Any]:
+        """Atomically suppress historical topic evidence and its derivatives.
+
+        All existing rows stay intact for audit/backup integrity. Affected
+        source messages and linked typed records are hidden in future reads.
+        Repeated requests are idempotent; only exact topic phrase matching
+        plus provenance links are used (no domain-specific word lists).
+        """
+        from .forgetting import normalize_topic, matches_topic
+
+        topic = normalize_topic(requested_topic)
+        now = time.time()
+        suppressed: dict[str, set[int]] = {}
+        with self._connection() as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "INSERT OR IGNORE INTO forgotten_topics(topic, created_at) "
+                "VALUES (?, ?)", (topic, now),
+            )
+            already = con.execute(
+                "SELECT kind, ref_id FROM suppressed_memory"
+            ).fetchall()
+            all_hidden = {key: set() for key in (
+                "messages", "states", "candidates", "entities",
+                "entity_aliases", "relationships", "observations",
+                "experience_events", "digests"
+            )}
+            for kind, ref_id in already:
+                if kind in all_hidden:
+                    all_hidden[kind].add(int(ref_id))
+            tables = {
+                "messages": ("messages", "content", None),
+                "states": ("states", "concept || ' ' || value", "source_ids"),
+                "candidates": (
+                    "candidates", "proposed_concept || ' ' || proposed_value"
+                    " || ' ' || proposed_rationale", "source_ids"),
+                "entities": ("entities", "display_name || ' ' || normalized_name", "source_ids"),
+                "entity_aliases": ("entity_aliases", "alias_text || ' ' || normalized_alias", "source_ids"),
+                "relationships": ("relationships", "relationship_type", "source_ids"),
+                "observations": (
+                    "observations", "concept || ' ' || value || ' ' || subject"
+                    " || ' ' || predicate", None),
+                "experience_events": (
+                    "experience_events", "statement || ' ' || kind", "source_message_id"),
+                "digests": ("digests", "content", "source_ids"),
+            }
+            rows_by_kind = {}
+            for kind, (table, expression, source_column) in tables.items():
+                source_select = f", {source_column}" if source_column else ", NULL"
+                rows_by_kind[kind] = con.execute(
+                    f"SELECT id, {expression}{source_select} FROM {table}"
+                ).fetchall()
+            obs_links = {}
+            for obs_id, message_id in con.execute(
+                "SELECT observation_id, source_message_id FROM observation_sources "
+                "WHERE source_message_id IS NOT NULL"
+            ):
+                obs_links.setdefault(int(obs_id), set()).add(int(message_id))
+
+            # Fixed point over source links. If a derived record names the
+            # topic, suppress its source; if a source is suppressed, suppress
+            # all related derived records and digests.
+            changed = True
+            while changed:
+                changed = False
+                hidden_messages = all_hidden["messages"]
+                for kind, rows in rows_by_kind.items():
+                    for ref_id, body, source_raw in rows:
+                        ref_id = int(ref_id)
+                        if ref_id in all_hidden[kind]:
+                            continue
+                        if kind == "observations":
+                            sources = obs_links.get(ref_id, set())
+                        elif kind == "experience_events":
+                            sources = {int(source_raw)} if source_raw is not None else set()
+                        elif source_raw:
+                            sources = {int(t) for t in str(source_raw).split(",")
+                                       if t.strip().isdigit()}
+                        else:
+                            sources = set()
+                        if matches_topic(body or "", topic) or (sources & hidden_messages):
+                            all_hidden[kind].add(ref_id)
+                            hidden_messages.update(sources)
+                            changed = True
+
+            for kind, old_and_new in all_hidden.items():
+                old = {int(row[0]) for row in con.execute(
+                    "SELECT ref_id FROM suppressed_memory WHERE kind=?", (kind,)
+                )}
+                new = old_and_new - old
+                if not new:
+                    continue
+                suppressed[kind] = new
+                con.executemany(
+                    "INSERT OR IGNORE INTO suppressed_memory"
+                    "(kind, ref_id, topic, created_at) VALUES (?, ?, ?, ?)",
+                    [(kind, ref_id, topic, now) for ref_id in sorted(new)],
+                )
+            # Verify the marker and every new row before committing.
+            for kind, ids in suppressed.items():
+                actual = {int(row[0]) for row in con.execute(
+                    "SELECT ref_id FROM suppressed_memory WHERE kind=?",
+                    (kind,),
+                )}
+                if not ids <= actual:
+                    raise RuntimeError("topic suppression verification failed")
+        return {
+            "status": "suppressed", "topic": topic,
+            "newly_suppressed": {k: len(v) for k, v in suppressed.items()},
+            "total_hidden_messages": self._hidden_count("messages"),
+            "physical_deletion": False,
+        }
+
+    def _hidden_count(self, kind: str) -> int:
+        with self._connection() as con:
+            return int(con.execute(
+                "SELECT count(DISTINCT ref_id) FROM suppressed_memory "
+                "WHERE kind = ?", (kind,),
+            ).fetchone()[0])
+
+    def is_suppressed(self, kind: str, ref_id: int) -> bool:
+        with self._connection() as con:
+            return con.execute(
+                "SELECT 1 FROM suppressed_memory WHERE kind=? AND ref_id=? LIMIT 1",
+                (kind, int(ref_id)),
+            ).fetchone() is not None
+
+    def _visible(self, kind: str, rows, identifier):
+        """Drop suppressed records after database reads, including legacy data."""
+        if not rows:
+            return rows
+        with self._connection() as con:
+            blocked = {int(row[0]) for row in con.execute(
+                "SELECT ref_id FROM suppressed_memory WHERE kind=?", (kind,)
+            )}
+        return [row for row in rows if int(identifier(row)) not in blocked]
+
+    def filter_conversation_input(self, messages: list[dict[str, Any]]):
+        """Protect against stale CLI/voice history passed back after forgetting.
+
+        Keep the latest user message as the fresh request, but hide older
+        suppressed text even when carried in the calling process's list.
+        """
+        from .forgetting import matches_topic
+        with self._connection() as con:
+            topics = [row[0] for row in con.execute(
+                "SELECT topic FROM forgotten_topics"
+            )]
+            exact_old = {row[0] for row in con.execute(
+                "SELECT DISTINCT m.content FROM messages m "
+                "JOIN suppressed_memory s ON s.kind='messages' AND s.ref_id=m.id"
+            )}
+        if not topics and not exact_old:
+            return list(messages)
+        current = next((i for i in range(len(messages) - 1, -1, -1)
+                        if messages[i].get("role") == "user"), -1)
+        return [
+            msg for i, msg in enumerate(messages)
+            if i == current or (
+                str(msg.get("content", "")) not in exact_old
+                and not any(matches_topic(msg.get("content", ""), topic)
+                            for topic in topics)
+            )
+        ]
+
+    def forgotten_topics(self) -> tuple[str, ...]:
+        with self._connection() as con:
+            return tuple(row[0] for row in con.execute(
+                "SELECT topic FROM forgotten_topics ORDER BY created_at, topic"
+            ))
 
     def count(self, session_id: str) -> int:
         with self._connection() as con:
