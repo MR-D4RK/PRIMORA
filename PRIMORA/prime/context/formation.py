@@ -731,6 +731,18 @@ def apply_proposals(
                     admitted.append(event_id)
             continue
         scope = "global" if candidate.scope == "global" else session_id
+        if semantic_first and candidate.kind == "state":
+            # A paraphrased generic assertion is not automatically a user
+            # fact. Without literal evidence for its value, keep it pending
+            # for review rather than promote speculative model prose.
+            if candidate.value.casefold() not in candidate.source_quote.casefold():
+                held.append(admission.create_pending(
+                    session_id, scope, candidate.source_ids, candidate.kind,
+                    candidate.concept, candidate.value, candidate.rationale,
+                    "user", candidate.confidence,
+                ))
+                diagnostics.append("state_proposal_held:not_literal_source_value")
+                continue
         existing = [state for state in store.fetch_states(scope=scope, concept=candidate.concept, status="current")]
         if candidate.kind == "preference":
             candidate_terms = _preference_fingerprint(
