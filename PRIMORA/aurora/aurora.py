@@ -415,7 +415,7 @@ class Aurora:
         ), "")
         topic = parse_forget_request(latest_user)
         confirmation = re.fullmatch(
-            r"\\s*confirm\\s+forget\\s+(.+?)\\s*[.!?]*\\s*",
+            r"\s*confirm\s+forget\s+(.+?)\s*[.!?]*\s*",
             latest_user, re.IGNORECASE,
         )
         if topic is not None:
@@ -468,7 +468,7 @@ class Aurora:
         # A broad or ambiguous request (e.g. "forget yesterday") must
         # never fall through to the language model, which could falsely
         # promise deletion without an operation.
-        if re.match(r"^\\s*(?:hey\\s+aurora[,!.]?\\s*)?(?:please\\s+)?(?:forget|erase|delete)\\b",
+        if re.match(r"^\s*(?:hey\s+aurora[,!.]?\s*)?(?:please\s+)?(?:forget|erase|delete)\b",
                     latest_user, re.IGNORECASE):
             return BrainResult.success(
                 "No memory was changed. To suppress a specific subject, "
