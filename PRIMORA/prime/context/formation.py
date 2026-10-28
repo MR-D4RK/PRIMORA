@@ -392,6 +392,9 @@ def validate_semantic_candidate(candidate: TypedMemoryCandidate, message: Any) -
     if (not subject or len(subject) > 90 or len(subject.split()) > 9
             or subject.casefold() in _NON_REFERENTIAL):
         return False, "semantic_invalid_subject"
+    if re.search(r"\b(?:i|we|you|they)\s+(?:love|like|adore|enjoy|"
+                 r"prefer|hate|dislike|think|feel|say)\b", subject, re.I):
+        return False, "semantic_subject_is_sentence"
     if not re.search(r"(?<!\w)" + re.escape(subject) + r"(?!\w)", quote, re.I):
         return False, "semantic_subject_not_in_quote"
     if candidate.concept.casefold() != "likes for " + subject.casefold():
