@@ -151,6 +151,13 @@ def test_aurora_confirms_only_after_verified_sqlite_suppression(tmp_path):
     assert not after_restart.load_transcript("test-session")
     assert not after_restart.recall("Atlas Kite", "test-session")
 
+    recall_response = aurora.respond([
+        {"role": "user", "content": "What do you remember about Atlas Kite?"}
+    ], session_id="test-session")
+    assert recall_response.success
+    assert "can't verify" in recall_response.content
+    assert brain.calls == 0
+
 
 def test_forgetting_failure_never_claims_success(tmp_path, monkeypatch):
     manager = ContextManager(db_path=tmp_path / "failed.db")
