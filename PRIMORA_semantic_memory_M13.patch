@@ -115,7 +115,7 @@ diff --git a/PRIMORA/prime/context/formation.py b/PRIMORA/prime/context/formatio
                  '"concept":"...","value":"...","claim_kind":"assertion|hypothesis|question|fiction|negation|third_party|assistant",'
                  '"actor":"user","scope":"session|global","source_ids":[ID],"source_quote":"exact substring",'
 -                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
-+                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, and hypotheses are not assertions; direct dislike or hate is a real negative preference, for which claim_kind=negation is acceptable. In the preference kind, provide a short exact named subject, the attitude predicate (love/like/adore/enjoy/prefer/hate/dislike), concept as likes for <subject>, and third-person value as loves/likes/adores/enjoys/prefers/hates/dislikes <subject>. Separate subject from descriptive attributes. If no reliable claim return an empty candidates array. Earlier dialogue resolves references only, never supplies personal evidence.'
++                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, and hypotheses are not assertions; direct dislike or hate is a real negative preference, for which claim_kind=negation is acceptable. In the preference kind, provide a short exact named subject, the attitude predicate (love/like/adore/enjoy/prefer/hate/dislike), concept as likes for <subject>, and third-person value as loves/likes/adores/enjoys/prefers/hates/dislikes <subject>. Separate subject from descriptive attributes. For an explicit personal fact or favorite slot (my favorite <category> is <value>), propose kind=state, concept=favorite <category>, and value as the exact stated <value>. Do not treat it as an attitude toward the category. If no reliable claim return an empty candidates array. Earlier dialogue resolves references only, never supplies personal evidence.'
              )},
 +            *prior,
              {"role": "user", "content": message.content},
@@ -535,7 +535,7 @@ diff --git a/PRIMORA/prime/context/store.py b/PRIMORA/prime/context/store.py
 diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_compound_preference_m12.py
 --- a/TESTS/prime/test_compound_preference_m12.py
 +++ b/TESTS/prime/test_compound_preference_m12.py
-@@ -1,99 +1,222 @@
+@@ -1,99 +1,254 @@
 -"""M12 preference parsing regression: speech without punctuation or item metadata.
 +"""Integrated semantic-first memory acceptance: disposable SQLite only.
  
@@ -610,13 +610,13 @@ diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_comp
      (
          "I adore Silver Lanterns I love every part of it, especially the arrangement",
 -        "silver lanterns", "adores",
--    ),
--    (
--        "I enjoy Northwind Atlas, I love all aspects of it including the maps",
--        "northwind atlas", "enjoys",
 +        "Silver Lanterns", "adore",
      ),
      (
+-        "I enjoy Northwind Atlas, I love all aspects of it including the maps",
+-        "northwind atlas", "enjoys",
+-    ),
+-    (
 -        "I like Paper Gardens. I really love every bit of it, particularly the illustrations.",
 -        "paper gardens", "likes",
 +        "I enjoy Northwind Atlas; its maps and page layout are delightful.",
@@ -692,8 +692,14 @@ diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_comp
 -    assert again[0].value == states[0].value
 +    assert len(recalled) == 1
 +    assert recalled[0].source_ids == states[0].source_ids
-+
-+
+ 
+ 
+-@pytest.mark.parametrize("utterance", [
+-    "I love this I love every aspect of it.",
+-    "I love anything I love every part of it.",
+-    "I love Northern Lights and I love Paper Gardens.",
+-    "If I loved Northern Lights I would love every aspect of it.",
+-    "I love every aspect of it.",
 +def test_older_dialogue_is_context_only_never_evidence(tmp_path):
 +    provider = _ProposalProvider("Birch Lantern")
 +    manager = ContextManager(
@@ -710,14 +716,8 @@ diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_comp
 +    assert len(states) == 1
 +    linked = manager._get_store().fetch_messages_by_ids(states[0].source_ids)
 +    assert len(linked) == 1 and linked[0].role == "user"
- 
- 
--@pytest.mark.parametrize("utterance", [
--    "I love this I love every aspect of it.",
--    "I love anything I love every part of it.",
--    "I love Northern Lights and I love Paper Gardens.",
--    "If I loved Northern Lights I would love every aspect of it.",
--    "I love every aspect of it.",
++
++
 +@pytest.mark.parametrize("statement,subject", [
 +    ("Suppose I loved Grey Paper, that would be fictional.", "Grey Paper"),
 +    ("My sister loves Birch Lantern.", "Birch Lantern"),
@@ -772,7 +772,7 @@ diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_comp
 +        value="loves Silver Prism", subject="Silver Prism",
 +        predicate="love", actor="user", claim_kind="assertion",
 +        source_ids=[source_id], source_quote="I love Silver Prism.",
-     )
++    )
 +    valid, reason = validate_semantic_candidate(candidate, source)
 +    assert not valid and reason == "semantic_missing_exact_quote"
 +
@@ -782,9 +782,9 @@ diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_comp
 +    manager = ContextManager(db_path=tmp_path / "legacy.db", enable_memory_v2=False)
 +    manager.reconcile(
 +        [{"role": "user", "content": "I love Willow Trees."}], "s"
-+    )
+     )
 +    assert manager._get_store().fetch_states(scope="global", status="current")
-+
+ 
 +def test_negative_preference_supersedes_positive_without_affecting_other_topics(tmp_path):
 +    path = tmp_path / "correction.db"
 +    first = _ProposalProvider("Maple Board", "love")
@@ -807,12 +807,12 @@ diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_comp
 +        scope="global", concept="likes for maple board", status="superseded")
 +    assert len(prior) == 1 and prior[0].value == "loves Maple Board"
  
- 
 -def test_core_instruction_respects_answer_category_context():
 -    from PRIMORA.aurora.configuration import AuroraConfig
 -    instruction = AuroraConfig.from_env().system_instruction
 -    assert "interpret X within that category" in instruction
 -    assert "details already stated" in instruction
++
 +def test_repeated_reconciliation_is_idempotent(tmp_path):
 +    provider = _ProposalProvider("Winter Orchard")
 +    manager = ContextManager(db_path=tmp_path / "idempotent.db",
@@ -825,6 +825,38 @@ diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_comp
 +    assert len(manager._get_store().fetch_states(
 +        scope="global", concept="likes for winter orchard",
 +        status="current")) == 1
++
++
++@pytest.mark.parametrize("dimension,value", [
++    ("favorite instrument", "cello"),
++    ("favorite travel style", "slow train journeys"),
++])
++def test_model_formed_explicit_favorite_slots_keep_category_and_value(
++    tmp_path, dimension, value,
++):
++    class _FactProvider:
++        def invoke(self, capability, payload):
++            source = payload["messages"][-1]["content"]
++            return PrimeResult.success({"content": json.dumps({
++                "candidates": [{
++                    "kind": "state", "concept": dimension, "value": value,
++                    "claim_kind": "assertion", "actor": "user",
++                    "scope": "global", "source_ids": [payload["source_message_id"]],
++                    "source_quote": source, "confidence": 0.95,
++                }]
++            })})
++
++    manager = ContextManager(
++        db_path=tmp_path / "favorite.db", formation_provider=_FactProvider(),
++    )
++    message = f"My {dimension} is {value}."
++    manager.reconcile([{"role": "user", "content": message}], "s")
++    states = manager._get_store().fetch_states(
++        scope="global", concept=dimension, status="current",
++    )
++    assert len(states) == 1
++    assert states[0].value == value
++    assert manager._get_store().fetch_messages_by_ids(states[0].source_ids)[0].content == message
 diff --git a/TESTS/prime/test_memory_integrity_m13.py b/TESTS/prime/test_memory_integrity_m13.py
 new file mode 100644
 --- /dev/null
