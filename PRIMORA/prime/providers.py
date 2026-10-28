@@ -54,12 +54,11 @@ class OllamaProvider(Provider):
                 method="POST"
             )
             with local_model_request(url):
-                with local_model_request(url):
                 with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                        if resp.status != 200:
-                            return PrimeResult.failure(f"Ollama HTTP {resp.status}: {resp.read().decode('utf-8')}")
-                        response_data = json.loads(resp.read().decode("utf-8"))
-        
+                    if resp.status != 200:
+                        return PrimeResult.failure(f"Ollama HTTP {resp.status}: {resp.read().decode('utf-8')}")
+                    response_data = json.loads(resp.read().decode("utf-8"))
+
         except urllib.error.HTTPError as e:
             return PrimeResult.failure(f"Ollama HTTP error {e.code}: {e.read().decode('utf-8')}")
         except urllib.error.URLError as e:
@@ -182,10 +181,11 @@ class OpenAICompatibleProvider(Provider):
                 headers={"Content-Type": "application/json"},
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                if resp.status != 200:
-                    return PrimeResult.failure(f"OpenAI HTTP {resp.status}: {resp.read().decode('utf-8')}")
-                response_data = json.loads(resp.read().decode("utf-8"))
+            with local_model_request(url):
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    if resp.status != 200:
+                        return PrimeResult.failure(f"OpenAI HTTP {resp.status}: {resp.read().decode('utf-8')}")
+                    response_data = json.loads(resp.read().decode("utf-8"))
 
         except urllib.error.HTTPError as e:
             return PrimeResult.failure(f"OpenAI HTTP error {e.code}: {e.read().decode('utf-8')}")
