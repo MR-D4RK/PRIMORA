@@ -325,23 +325,43 @@ class Aurora:
         # does not apply to, so nothing is added by default.
         guidance_instruction = build_guidance_instruction(self._config)
 
-        if messages and messages[0].get("role") == "system":
-            system_content = messages[0]["content"]
-            if IDENTITY_HEADER not in system_content:
-                system_content += identity_instruction
-            if capability_instruction:
-                system_content += capability_instruction
-            if guidance_instruction and GUIDANCE_HEADER not in system_content:
-                system_content += guidance_instruction
-            return [{"role": "system", "content": system_content}] + list(messages[1:])
+        # The live llama.cpp path has a conservative character-based token
+        # counter. A prompt that fits the model tokenizer may exceed that
+        # estimate, leaving no room even for a two-word user turn. Fit the
+        # *optional catalogues* before Mind.build applies the hard ceiling;
+        # never raise the ceiling or truncate the user/identity/safety rules.
+        from PRIMORA.aurora.prompt_fit import fit_system_prompt
 
-        system_content = self._config.system_instruction
-        if IDENTITY_HEADER not in system_content:
-            system_content += identity_instruction
-        system_content += capability_instruction
-        if guidance_instruction and GUIDANCE_HEADER not in system_content:
-            system_content += guidance_instruction
-        return [{"role": "system", "content": system_content}] + list(messages)
+        has_system = bool(messages and messages[0].get("role") == "system")
+        core = (str(messages[0].get("content", ""))
+                if has_system else self._config.system_instruction)
+        identity = "" if IDENTITY_HEADER in core else identity_instruction
+        guidance = ("" if GUIDANCE_HEADER in core else guidance_instruction)
+
+        def measured_tokens(content: str) -> int:
+            try:
+                amount = int(self._brain.count_tokens([
+                    {"role": "system", "content": content}
+                ]))
+                if amount > 0:
+                    return amount
+            except Exception:
+                pass
+            # Exact counting is not available before HF model warmup. Match
+            # OpenAIBrain's conservative estimator rather than undercount.
+            return max(1, len(content) // 4) + 4
+
+        system_content = fit_system_prompt(
+            core, identity, capability_instruction,
+            build_specialist_instruction(self._prime),
+            build_tool_instruction(self._prime), guidance,
+            count=measured_tokens,
+            ceiling=self._config.context_ceiling,
+            target=self._config.context_target,
+        )
+        return [{"role": "system", "content": system_content}] + (
+            list(messages[1:]) if has_system else list(messages)
+        )
 
     def _budget(self) -> BudgetConfig:
         return BudgetConfig(
