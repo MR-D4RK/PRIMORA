@@ -409,6 +409,11 @@ class ContextStore:
                     f"user-authority memory requires an existing user source "
                     f"(source_id={source_id})"
                 )
+            if con.execute(
+                "SELECT 1 FROM suppressed_memory WHERE kind='messages' "
+                "AND ref_id=? LIMIT 1", (source_id,),
+            ).fetchone() is not None:
+                raise ValueError("user source has been suppressed by forgetting")
             if str(row[0]).casefold() != "user":
                 raise ValueError(
                     "user-authority memory requires a user source "
@@ -1062,6 +1067,8 @@ class ContextStore:
             "SELECT id, session_id, seq, role, content, timestamp,"
             " fingerprint, importance FROM messages"
             " WHERE session_id = ? AND seq >= ?"
+            " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+            " WHERE s.kind='messages' AND s.ref_id=messages.id)"
         )
         params: list[Any] = [session_id, start_seq]
         if end_seq is not None:
@@ -1130,7 +1137,10 @@ class ContextStore:
             rows = con.execute(
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages"
-                " WHERE session_id = ? ORDER BY seq DESC, id DESC LIMIT ?",
+                " WHERE session_id = ?"
+                " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+                " WHERE s.kind='messages' AND s.ref_id=messages.id)"
+                " ORDER BY seq DESC, id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         return [StoredMessage(*r) for r in self._visible("messages", list(reversed(rows)), lambda r: r[0])]
@@ -1163,6 +1173,8 @@ class ContextStore:
                 " WHERE session_id = ? AND id > ?"
                 " AND role IN ('user', 'assistant')"
                 " AND content NOT LIKE ?"
+                " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+                " WHERE s.kind='messages' AND s.ref_id=messages.id)"
                 " ORDER BY id DESC LIMIT ?",
                 (session_id, after_id, "%<prime_request>%", int(limit)),
             ).fetchall()
@@ -1212,6 +1224,8 @@ class ContextStore:
                 " m.timestamp, m.fingerprint, m.importance"
                 " FROM messages_fts f JOIN messages m ON m.id = f.rowid"
                 " WHERE messages_fts MATCH ?"
+                " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+                " WHERE s.kind='messages' AND s.ref_id=m.id)"
             )
             params: list[Any] = [self._fts_phrase(query)]
             if session_id is not None:
@@ -1224,6 +1238,8 @@ class ContextStore:
                 "SELECT id, session_id, seq, role, content, timestamp,"
                 " fingerprint, importance FROM messages"
                 " WHERE content LIKE ?"
+                " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+                " WHERE s.kind='messages' AND s.ref_id=messages.id)"
             )
             params = [f"%{query}%"]
             if session_id is not None:
@@ -1248,7 +1264,11 @@ class ContextStore:
         """
         if not 1 <= limit <= 300:
             raise ValueError("evidence limit must be 1..300")
-        parts = ["role = 'user'"]
+        parts = [
+            "role = 'user'",
+            "NOT EXISTS (SELECT 1 FROM suppressed_memory s "
+            "WHERE s.kind='messages' AND s.ref_id=messages.id)",
+        ]
         params: list[Any] = []
         if start is not None:
             parts.append("timestamp >= ?")
@@ -2115,6 +2135,8 @@ class ContextStore:
             " created_at, status, supersedes_id, authority, memory_type,"
             " confidence, observed_at, valid_from, valid_until, superseded_at"
             " FROM states WHERE 1=1"
+            " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+            " WHERE s.kind='states' AND s.ref_id=states.id)"
         )
         params: list[Any] = []
         if session_id is not None:
@@ -3380,7 +3402,10 @@ class ContextStore:
             rows = con.execute(
                 "SELECT id, session_id, source_ids, seq_start, seq_end,"
                 " created_at, digest_type, content FROM digests"
-                " WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                " WHERE session_id = ?"
+                " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+                " WHERE s.kind='digests' AND s.ref_id=digests.id)"
+                " ORDER BY id DESC LIMIT ?",
                 (session_id, limit),
             ).fetchall()
         out = []
