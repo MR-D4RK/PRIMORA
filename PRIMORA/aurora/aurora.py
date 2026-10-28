@@ -331,6 +331,18 @@ class Aurora:
         has_system = bool(messages and messages[0].get("role") == "system")
         core = (str(messages[0].get("content", ""))
                 if has_system else self._config.system_instruction)
+        # A caller may return a previously assembled system message.
+        # Don't append the same catalogue again on each invocation.
+        if "Available Prime Capabilities" in core:
+            capability_instruction = ""
+        specialist_instruction = (
+            "" if "Available Specialists:" in core
+            else build_specialist_instruction(self._prime)
+        )
+        tool_instruction = (
+            "" if "Available Tools:" in core
+            else build_tool_instruction(self._prime)
+        )
         identity = "" if IDENTITY_HEADER in core else identity_instruction
         guidance = ("" if GUIDANCE_HEADER in core else guidance_instruction)
 
@@ -349,8 +361,7 @@ class Aurora:
 
         system_content = fit_system_prompt(
             core, identity, capability_instruction,
-            build_specialist_instruction(self._prime),
-            build_tool_instruction(self._prime), guidance,
+            specialist_instruction, tool_instruction, guidance,
             count=measured_tokens,
             ceiling=self._config.context_ceiling,
             target=self._config.context_target,
