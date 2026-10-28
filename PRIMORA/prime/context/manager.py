@@ -2647,6 +2647,8 @@ class ContextManager:
                         item.startswith((
                             "episode_capture_failed", "state_failed", "m5_failed",
                             "entity_failed", "formation_status_failed",
+                            "semantic_formation:provider_unavailable",
+                            "typed_formation:provider_", "typed_formation:malformed",
                         )) for item in formation_diags
                     )
                     try:
@@ -2729,8 +2731,13 @@ class ContextManager:
                     failed = any(
                         item.startswith("typed_formation:provider_")
                         or item.startswith("typed_formation:malformed")
+                        or item.startswith("typed_formation:proposal_write_failed")
                         for item in items
                     )
+                    if (self.semantic_formation and typed.candidates
+                            and not typed.admitted_ids and not typed.held_ids):
+                        failed = True
+                        items.append("typed_formation:no_verified_proposals_admitted")
                     store.finish_formation_job(
                         job["job_id"], "failed" if failed else "complete",
                         "provider_or_parse_failure" if failed else "",
