@@ -220,3 +220,35 @@ def test_repeated_reconciliation_is_idempotent(tmp_path):
     assert len(manager._get_store().fetch_states(
         scope="global", concept="likes for winter orchard",
         status="current")) == 1
+
+
+@pytest.mark.parametrize("dimension,value", [
+    ("favorite instrument", "cello"),
+    ("favorite travel style", "slow train journeys"),
+])
+def test_model_formed_explicit_favorite_slots_keep_category_and_value(
+    tmp_path, dimension, value,
+):
+    class _FactProvider:
+        def invoke(self, capability, payload):
+            source = payload["messages"][-1]["content"]
+            return PrimeResult.success({"content": json.dumps({
+                "candidates": [{
+                    "kind": "state", "concept": dimension, "value": value,
+                    "claim_kind": "assertion", "actor": "user",
+                    "scope": "global", "source_ids": [payload["source_message_id"]],
+                    "source_quote": source, "confidence": 0.95,
+                }]
+            })})
+
+    manager = ContextManager(
+        db_path=tmp_path / "favorite.db", formation_provider=_FactProvider(),
+    )
+    message = f"My {dimension} is {value}."
+    manager.reconcile([{"role": "user", "content": message}], "s")
+    states = manager._get_store().fetch_states(
+        scope="global", concept=dimension, status="current",
+    )
+    assert len(states) == 1
+    assert states[0].value == value
+    assert manager._get_store().fetch_messages_by_ids(states[0].source_ids)[0].content == message
