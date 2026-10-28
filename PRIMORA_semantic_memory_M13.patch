@@ -269,7 +269,16 @@ diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
                          formation_diags.extend(
                              self._extract_entities(
                                  store, session_id, message_id, content,
-@@ -2695,9 +2714,13 @@ def drain_formation(
+@@ -2628,6 +2647,8 @@ def reconcile(
+                         item.startswith((
+                             "episode_capture_failed", "state_failed", "m5_failed",
+                             "entity_failed", "formation_status_failed",
++                            "semantic_formation:provider_unavailable",
++                            "typed_formation:provider_", "typed_formation:malformed",
+                         )) for item in formation_diags
+                     )
+                     try:
+@@ -2695,9 +2716,13 @@ def drain_formation(
                      )
                      continue
                  try:
@@ -283,7 +292,21 @@ diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
                      )
                      self._last_formation_timings = dict(typed.timings_ms)
                      items = [
-@@ -2745,7 +2768,7 @@ def replay_formation(
+@@ -2706,8 +2731,13 @@ def drain_formation(
+                     failed = any(
+                         item.startswith("typed_formation:provider_")
+                         or item.startswith("typed_formation:malformed")
++                        or item.startswith("typed_formation:proposal_write_failed")
+                         for item in items
+                     )
++                    if (self.semantic_formation and typed.candidates
++                            and not typed.admitted_ids and not typed.held_ids):
++                        failed = True
++                        items.append("typed_formation:no_verified_proposals_admitted")
+                     store.finish_formation_job(
+                         job["job_id"], "failed" if failed else "complete",
+                         "provider_or_parse_failure" if failed else "",
+@@ -2745,7 +2775,7 @@ def replay_formation(
          diagnostics: list[str] = []
          try:
              store.set_formation_status(message_id, session_id, "processing")
@@ -292,7 +315,7 @@ diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
                  claim = extract_experience_claim(
                      message.content, message.role,
                      reported_at=message.timestamp,
-@@ -2758,17 +2781,18 @@ def replay_formation(
+@@ -2758,17 +2788,18 @@ def replay_formation(
              prior_user = self._prior_user_text(store, session_id, message_id)
              prior_assistant = self._prior_assistant_text(
                  store, session_id, message_id)
@@ -317,7 +340,7 @@ diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
                      diagnostics.append(
                          "typed_formation:skipped_already_processed_source"
                      )
-@@ -2779,7 +2803,7 @@ def replay_formation(
+@@ -2779,7 +2810,7 @@ def replay_formation(
                      diagnostics.append("typed_formation:queued")
                      if not self._formation_deferred:
                          diagnostics.extend(self.drain_formation())
