@@ -84,16 +84,32 @@ def test_env_opt_in_worker_drains_queue_without_manual_call(tmp_path, monkeypatc
         manager.reconcile([{"role": "user", "content": "I enjoy paper lanterns."}], "s")
         deadline = time.monotonic() + 12.0
         while time.monotonic() < deadline:
-            if manager.formation_jobs("s", "complete"):
+            # The queue job and its derived-memory status are separate writes.
+            if (manager.formation_jobs("s", "complete")
+                    and manager.formation_status("s", "complete")):
                 break
             time.sleep(0.05)
         assert provider.called.is_set()
         assert provider.calls == 1
         assert len(manager.formation_jobs("s", "complete")) == 1
-        assert len(manager._get_store().fetch_range("s")) == 1
+        messages = manager._get_store().fetch_range("s")
+        assert len(messages) == 1
+        # Deterministic formation already stores this as "likes for paper
+        # lanterns". Typed formation reuses that sourced preference rather
+        # than creating a duplicate named just "paper lanterns".
+        matching = [
+            state for state in manager._get_store().fetch_states(
+                scope="global", status="current"
+            )
+            if state.value == "enjoys paper lanterns"
+            and "paper lanterns" in state.concept
+            and messages[0].message_id in state.source_ids
+        ]
+        assert len(matching) == 1
         assert any(
-            state.concept == "paper lanterns"
-            for state in manager._get_store().fetch_states(scope="global", status="current")
+            diag.startswith("typed_formation:proposal_deduplicated:")
+            for record in manager.formation_status("s", "complete")
+            for diag in record["diagnostics"]
         )
     finally:
         manager.stop_formation_worker(timeout=2.0)
