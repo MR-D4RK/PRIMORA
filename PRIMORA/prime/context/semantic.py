@@ -231,7 +231,8 @@ class SemanticIndex:
         query = (
             "SELECT id, session_id, scope, entity_type, display_name,"
             " normalized_name, status, merged_into_entity_id, source_ids,"
-            " authority, confidence, created_at, observed_at, merged_at"
+            " authority, confidence, created_at, observed_at, merged_at,"
+            " source_episode_ids, valid_from, valid_until"
             f" FROM entities WHERE status IN ({statuses})"
             " AND authority = 'user'"
         )
