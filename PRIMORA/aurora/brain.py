@@ -6,6 +6,7 @@ import os
 import re
 import time
 import urllib.error
+from PRIMORA.local_model_gate import local_model_request
 import urllib.request
 
 from PRIMORA.logutil import emit_block
@@ -682,19 +683,20 @@ class OpenAIBrain(Brain):
                 headers={"Content-Type": "application/json"},
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                if resp.status != 200:
-                    return BrainResult.failure(
-                        f"OpenAI HTTP {resp.status}: "
-                        f"{resp.read().decode('utf-8')}",
-                        self.get_model_name(),
-                    )
-                if on_delta is None:
-                    response_data = json.loads(resp.read().decode("utf-8"))
-                else:
-                    return self._generate_streaming(
-                        resp, on_delta, cancelled)
-
+            with local_model_request(url):
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    if resp.status != 200:
+                        return BrainResult.failure(
+                            f"OpenAI HTTP {resp.status}: "
+                            f"{resp.read().decode('utf-8')}",
+                            self.get_model_name(),
+                        )
+                    if on_delta is None:
+                        response_data = json.loads(resp.read().decode("utf-8"))
+                    else:
+                        return self._generate_streaming(
+                            resp, on_delta, cancelled)
+    
         except urllib.error.HTTPError as e:
             return BrainResult.failure(
                 f"OpenAI HTTP error {e.code}: {e.read().decode('utf-8')}",
