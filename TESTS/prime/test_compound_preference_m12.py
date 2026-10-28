@@ -1,99 +1,186 @@
-"""M12 preference parsing regression: speech without punctuation or item metadata.
+"""Integrated semantic-first memory acceptance: disposable SQLite only.
 
-No game/music/car-specific hardcoding and no production memory access.
+No topic- or product-specific runtime extraction. The provider is a fixture
+that stands in for Qwen's interpretation; live Qwen must be tested separately.
 """
 from __future__ import annotations
 
+import json
 import pytest
 
+from PRIMORA.prime.contract import PrimeResult
 from PRIMORA.prime.context import ContextManager
-from PRIMORA.prime.context.state import extract_candidates
+from PRIMORA.prime.context.formation import validate_semantic_candidate, TypedMemoryCandidate
+from PRIMORA.prime.context.store import ContextStore
 
 
-@pytest.mark.parametrize(("utterance", "subject", "verb"), [
+class _ProposalProvider:
+    def __init__(self, subject, predicate="love", claim_kind="assertion", fail=False):
+        self.subject = subject
+        self.predicate = predicate
+        self.claim_kind = claim_kind
+        self.fail = fail
+        self.calls = []
+
+    def invoke(self, capability, payload):
+        assert capability == "memory_formation"
+        self.calls.append(payload)
+        if self.fail:
+            return PrimeResult.failure("offline")
+        if not self.subject:
+            return PrimeResult.success({"content": '{"candidates":[]}'})
+        source = payload["messages"][-1]["content"]
+        subject = self.subject
+        verb = {
+            "love": "loves", "like": "likes", "adore": "adores",
+            "enjoy": "enjoys", "prefer": "prefers",
+            "hate": "hates", "dislike": "dislikes",
+        }[self.predicate]
+        candidate = {
+            "kind": "preference",
+            "concept": f"likes for {subject}",
+            "value": f"{verb} {subject}",
+            "subject": subject,
+            "predicate": self.predicate,
+            "claim_kind": self.claim_kind,
+            "actor": "user",
+            "scope": "global",
+            "source_ids": [payload["source_message_id"]],
+            "source_quote": source,
+            "confidence": .95,
+        }
+        return PrimeResult.success({"content": json.dumps({"candidates":[candidate]})})
+
+
+@pytest.fixture(autouse=True)
+def semantic_mode(monkeypatch):
+    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_MODE", "semantic")
+    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_DEFERRED", "0")
+
+
+@pytest.mark.parametrize("statement,subject,predicate", [
     (
         "i love cyberpunk i love every aspect of it whether its story "
         "its gameplay or visual all of those are the best",
-        "cyberpunk", "loves",
+        "cyberpunk", "love",
     ),
     (
         "I adore Silver Lanterns I love every part of it, especially the arrangement",
-        "silver lanterns", "adores",
+        "Silver Lanterns", "adore",
     ),
     (
-        "I enjoy Northwind Atlas, I love all aspects of it including the maps",
-        "northwind atlas", "enjoys",
-    ),
-    (
-        "I like Paper Gardens. I really love every bit of it, particularly the illustrations.",
-        "paper gardens", "likes",
+        "I enjoy Northwind Atlas; its maps and page layout are delightful.",
+        "Northwind Atlas", "enjoy",
     ),
 ])
-def test_repeated_liking_names_one_actual_subject(utterance, subject, verb):
-    candidates = extract_candidates(utterance, "user")
-    assert len(candidates) == 1, candidates
-    candidate = candidates[0]
-    assert candidate.concept == f"likes for {subject}"
-    assert candidate.value.lower() == f"{verb} {subject}"
-    assert candidate.scope == "global"
-    assert candidate.auto_confirm
-    assert candidate.rationale == ""  # Details remain sourced, not invented.
-
-
-def test_compound_preference_survives_restart_with_user_source(tmp_path):
-    path = tmp_path / "preference.db"
-    original = (
-        "i love cyberpunk i love every aspect of it whether its story "
-        "its gameplay or visual all of those are the best"
+def test_unfamiliar_compound_claims_are_canonical_and_source_backed(
+    tmp_path, statement, subject, predicate,
+):
+    path = tmp_path / "semantic.db"
+    provider = _ProposalProvider(subject, predicate)
+    manager = ContextManager(
+        db_path=path, formation_provider=provider, hybrid_retrieval=False,
     )
-    manager = ContextManager(db_path=path, hybrid_retrieval=False)
+    assert manager.semantic_formation
     manager.reconcile([
-        {"role": "user", "content": "What do you remember about my fav video games?"},
-        {"role": "assistant", "content": "I don't have a verified entry. Tell me about one."},
-        {"role": "user", "content": original},
-    ], "session")
+        {"role": "user", "content": "Which items do I like most?"},
+        {"role": "assistant", "content": "Tell me which one you enjoy."},
+        {"role": "user", "content": statement},
+    ], "conversation")
     states = manager._get_store().fetch_states(
-        scope="global", concept="likes for cyberpunk", status="current",
+        scope="global", concept=f"likes for {subject.casefold()}",
+        status="current",
     )
-    assert len(states) == 1
-    assert states[0].value == "loves cyberpunk"
-    assert len(states[0].source_ids) == 1
-    source = manager._get_store().fetch_messages_by_ids(states[0].source_ids)
-    assert len(source) == 1 and source[0].content == original
-    assert "story" in source[0].content
-    assert "gameplay" in source[0].content
-    assert "visual" in source[0].content
+    assert len(states) == 1, manager._get_store().fetch_states(scope="global")
+    assert states[0].value.lower() == {
+        "love": "loves", "adore": "adores", "enjoy": "enjoys",
+    }[predicate] + " " + subject.casefold()
+    evidence = manager._get_store().fetch_messages_by_ids(states[0].source_ids)
+    assert len(evidence) == 1 and evidence[0].content == statement
+    # The fallback regex must not have stored a second, giant concept.
+    assert not any("every aspect" in row.concept
+                   for row in manager._get_store().fetch_states())
 
     restarted = ContextManager(db_path=path, hybrid_retrieval=False)
-    again = restarted._get_store().fetch_states(
-        scope="global", concept="likes for cyberpunk", status="current",
+    recalled = restarted._get_store().fetch_states(
+        scope="global", concept=f"likes for {subject.casefold()}", status="current"
     )
-    assert len(again) == 1
-    assert again[0].source_ids == states[0].source_ids
-    assert again[0].value == states[0].value
+    assert len(recalled) == 1
+    assert recalled[0].source_ids == states[0].source_ids
 
 
-@pytest.mark.parametrize("utterance", [
-    "I love this I love every aspect of it.",
-    "I love anything I love every part of it.",
-    "I love Northern Lights and I love Paper Gardens.",
-    "If I loved Northern Lights I would love every aspect of it.",
-    "I love every aspect of it.",
+def test_older_dialogue_is_context_only_never_evidence(tmp_path):
+    provider = _ProposalProvider("Birch Lantern")
+    manager = ContextManager(
+        db_path=tmp_path / "dialogue.db", formation_provider=provider,
+    )
+    manager.reconcile([
+        {"role": "assistant", "content": "Remember your Birch Lantern project?"},
+        {"role": "user", "content": "I love Birch Lantern for its shape."},
+    ], "s")
+    payload = provider.calls[-1]
+    assert payload["messages"][-1]["content"] == "I love Birch Lantern for its shape."
+    assert any(m["role"] == "assistant" for m in payload["messages"][1:-1])
+    states = manager._get_store().fetch_states(scope="global", status="current")
+    assert len(states) == 1
+    linked = manager._get_store().fetch_messages_by_ids(states[0].source_ids)
+    assert len(linked) == 1 and linked[0].role == "user"
+
+
+@pytest.mark.parametrize("statement,subject", [
+    ("Suppose I loved Grey Paper, that would be fictional.", "Grey Paper"),
+    ("My sister loves Birch Lantern.", "Birch Lantern"),
+    ("I love this I love every aspect of it.", "this"),
+    ("I love Indigo Dusk I love every aspect of it.", "Indigo Dusk I love every aspect"),
 ])
-def test_no_false_named_preference_from_pronouns_or_conditional(utterance):
-    candidates = extract_candidates(utterance, "user")
-    # No high-confidence structured preference that turns a nonspecific
-    # reference/conditional into a current named user preference.
-    assert not any(
-        c.auto_confirm and c.concept in (
-            "likes for this", "likes for anything", "likes for northern lights"
-        )
-        for c in candidates
+def test_unsafe_model_proposals_do_not_become_current_memory(tmp_path, statement, subject):
+    provider = _ProposalProvider(subject)
+    manager = ContextManager(db_path=tmp_path / "unsafe.db",
+                             formation_provider=provider)
+    manager.reconcile([{"role": "user", "content": statement}], "s")
+    assert manager._get_store().fetch_states(status="current") == []
+    assert manager._get_store().fetch_range("s")[0].content == statement
+
+
+def test_provider_failure_leaves_raw_only_without_legacy_fallback(tmp_path):
+    path = tmp_path / "down.db"
+    provider = _ProposalProvider("Cedar Kite", fail=True)
+    manager = ContextManager(db_path=path, formation_provider=provider)
+    manager.reconcile(
+        [{"role": "user", "content": "I love Cedar Kite a lot."}], "s"
     )
+    assert manager._get_store().fetch_states(status="current") == []
+    assert manager._get_store().fetch_range("s")
+    assert manager.formation_jobs(status="failed")
 
 
-def test_core_instruction_respects_answer_category_context():
-    from PRIMORA.aurora.configuration import AuroraConfig
-    instruction = AuroraConfig.from_env().system_instruction
-    assert "interpret X within that category" in instruction
-    assert "details already stated" in instruction
+def test_no_provider_is_raw_only(tmp_path):
+    manager = ContextManager(db_path=tmp_path / "noprov.db")
+    manager.reconcile(
+        [{"role": "user", "content": "I love New Horizon."}], "s"
+    )
+    assert manager._get_store().fetch_states(status="current") == []
+    assert manager._get_store().fetch_range("s")
+
+
+def test_source_quote_cannot_be_fabricated(tmp_path):
+    store = ContextStore(tmp_path / "proof.db")
+    source_id, _, _ = store.append("s", 0, "user", "I enjoy Silver Prism.")
+    source = store.fetch_message(source_id)
+    candidate = TypedMemoryCandidate(
+        kind="preference", concept="likes for Silver Prism",
+        value="loves Silver Prism", subject="Silver Prism",
+        predicate="love", actor="user", claim_kind="assertion",
+        source_ids=[source_id], source_quote="I love Silver Prism.",
+    )
+    valid, reason = validate_semantic_candidate(candidate, source)
+    assert not valid and reason == "semantic_missing_exact_quote"
+
+
+def test_legacy_remains_explicit_rollback(tmp_path, monkeypatch):
+    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_MODE", "legacy")
+    manager = ContextManager(db_path=tmp_path / "legacy.db", enable_memory_v2=False)
+    manager.reconcile(
+        [{"role": "user", "content": "I love Willow Trees."}], "s"
+    )
+    assert manager._get_store().fetch_states(scope="global", status="current")
