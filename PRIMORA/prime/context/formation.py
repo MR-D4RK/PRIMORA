@@ -422,9 +422,10 @@ def validate_semantic_candidate(candidate: TypedMemoryCandidate, message: Any) -
         quote, re.I,
     ):
         return False, "semantic_attitude_not_first_person"
-    # Reject clear hypothetical framing even if the model mislabeled it.
+    # Fictional entities can be genuine user preferences. Reject imagined
+    # preference statements, not factual likes about fictional subjects.
     if re.search(
-        r"\b(?:hypothetical|fictional|pretend(?:ing)?|imaginary|"
+        r"\b(?:hypothetical(?:ly)?|suppose|pretend(?:ing)?|"
         r"imagine\s+(?:that|if)|if\s+i\s+(?:were|had|could|would))\b",
         message.content, re.I,
     ):
@@ -454,7 +455,7 @@ def provider_proposals(
                 '{"candidates":[{"kind":"preference|state|event|relationship|observation",'
                 '"concept":"...","value":"...","claim_kind":"assertion|hypothesis|question|fiction|negation|third_party|assistant",'
                 '"actor":"user","scope":"session|global","source_ids":[ID],"source_quote":"exact substring",'
-                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, and hypotheses are not assertions; direct dislike or hate is a real negative preference, for which claim_kind=negation is acceptable. In the preference kind, provide a short exact named subject, the attitude predicate (love/like/adore/enjoy/prefer/hate/dislike), concept as likes for <subject>, and third-person value as loves/likes/adores/enjoys/prefers/hates/dislikes <subject>. Separate subject from descriptive attributes. For an explicit personal fact or favorite slot (my favorite <category> is <value>), propose kind=state, concept=favorite <category>, and value as the exact stated <value>. Do not treat it as an attitude toward the category. If no reliable claim return an empty candidates array. Earlier dialogue resolves references only, never supplies personal evidence.'
+                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fictional roleplay, and hypotheses are not assertions; a genuine user preference about a fictional object IS a real preference. Direct dislike or hate is a real negative preference, for which claim_kind=negation is acceptable. In the preference kind, provide a short exact named subject, the attitude predicate (love/like/adore/enjoy/prefer/hate/dislike), concept as likes for <subject>, and third-person value as loves/likes/adores/enjoys/prefers/hates/dislikes <subject>. Separate subject from descriptive attributes. For an explicit personal fact or favorite slot (my favorite <category> is <value>), propose kind=state, concept=favorite <category>, and value as the exact stated <value>. Do not treat it as an attitude toward the category. If no reliable claim return an empty candidates array. Earlier dialogue resolves references only, never supplies personal evidence.'
             )},
             *prior,
             {"role": "user", "content": message.content},

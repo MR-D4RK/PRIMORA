@@ -6,6 +6,7 @@ that stands in for Qwen's interpretation; live Qwen must be tested separately.
 from __future__ import annotations
 
 import json
+import os
 import pytest
 
 from PRIMORA.prime.contract import PrimeResult
@@ -175,6 +176,103 @@ def test_source_quote_cannot_be_fabricated(tmp_path):
     )
     valid, reason = validate_semantic_candidate(candidate, source)
     assert not valid and reason == "semantic_missing_exact_quote"
+
+
+
+def test_real_preference_about_fictional_subject_is_not_hypothetical(tmp_path):
+    """The existence of a fictional object does not make the user's like fictional."""
+    statement = "I really love a fictional band called Candle Harbor."
+    manager = ContextManager(
+        db_path=tmp_path / "fictional-entity.db",
+        formation_provider=_ProposalProvider("Candle Harbor", "love"),
+    )
+    manager.reconcile([{"role": "user", "content": statement}], "first")
+    rows = manager._get_store().fetch_states(
+        scope="global", concept="likes for candle harbor", status="current",
+    )
+    assert len(rows) == 1, manager.formation_jobs(status="failed")
+    assert manager._get_store().fetch_messages_by_ids(rows[0].source_ids)[0].content == statement
+
+
+def test_compound_correction_creates_independent_history_across_sessions(tmp_path):
+    """Two independent likes plus a mixed-polarity correction retain provenance."""
+    class BatchProvider:
+        def __init__(self, proposals):
+            self.proposals = proposals
+
+        def invoke(self, capability, payload):
+            assert capability == "memory_formation"
+            source = payload["messages"][-1]["content"]
+            candidates = []
+            for subject, predicate in self.proposals[source]:
+                verb = {
+                    "like": "likes", "love": "loves", "dislike": "dislikes",
+                }[predicate]
+                candidates.append({
+                    "kind": "preference",
+                    "concept": "likes for " + subject,
+                    "value": verb + " " + subject,
+                    "subject": subject,
+                    "predicate": predicate,
+                    "claim_kind": "negation" if predicate == "dislike" else "assertion",
+                    "actor": "user",
+                    "scope": "global",
+                    "source_ids": [payload["source_message_id"]],
+                    "source_quote": source,
+                    "confidence": 0.95,
+                })
+            return PrimeResult.success({"content": json.dumps({"candidates": candidates})})
+
+    first = "I recently started liking a fictional band called Candle Harbor."
+    second = "I also like a fictional band called Copper Orchard."
+    correction = "Actually, I don't like Candle Harbor anymore, but I still like Copper Orchard."
+    manager = ContextManager(
+        db_path=tmp_path / "compound.db",
+        formation_provider=BatchProvider({
+            first: [("Candle Harbor", "like")],
+            second: [("Copper Orchard", "like")],
+            correction: [("Candle Harbor", "dislike"), ("Copper Orchard", "like")],
+        }),
+    )
+    assert manager.semantic_formation
+    for session, statement in [
+        ("one", first), ("one", second), ("two", correction)
+    ]:
+        manager.reconcile([{"role": "user", "content": statement}], session)
+
+    store = manager._get_store()
+    harbor = store.fetch_states(
+        scope="global", concept="likes for candle harbor", status="current",
+    )
+    orchard = store.fetch_states(
+        scope="global", concept="likes for copper orchard", status="current",
+    )
+    assert len(harbor) == len(orchard) == 1
+    assert harbor[0].value == "dislikes Candle Harbor"
+    assert orchard[0].value == "likes Copper Orchard"
+    old_harbor = store.fetch_states(
+        scope="global", concept="likes for candle harbor", status="superseded",
+    )
+    assert len(old_harbor) == 1
+    assert old_harbor[0].value == "likes Candle Harbor"
+    assert store.fetch_messages_by_ids(harbor[0].source_ids)[0].content == correction
+    restarted = ContextManager(db_path=tmp_path / "compound.db")
+    assert len(restarted._get_store().fetch_states(
+        scope="global", concept="likes for copper orchard", status="current",
+    )) == 1
+
+
+def test_live_runtime_defaults_semantic_but_respects_legacy_override(monkeypatch):
+    from types import SimpleNamespace
+    from PRIMORA.main import configure_runtime_defaults
+
+    server = SimpleNamespace(base_url="http://127.0.0.1:8080/v1", alias="qwen3.5-9b")
+    monkeypatch.delenv("PRIMORA_MEMORY_FORMATION_MODE")
+    configure_runtime_defaults(server)
+    assert os.environ["PRIMORA_MEMORY_FORMATION_MODE"] == "semantic"
+    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_MODE", "legacy")
+    configure_runtime_defaults(server)
+    assert os.environ["PRIMORA_MEMORY_FORMATION_MODE"] == "legacy"
 
 
 def test_legacy_remains_explicit_rollback(tmp_path, monkeypatch):
