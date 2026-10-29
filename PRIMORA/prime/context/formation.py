@@ -568,12 +568,47 @@ _EXPLICIT_CAUSAL_SOURCE_RE = re.compile(
 )
 
 
-def _source_rationale(store: Any, source_ids: list[int]) -> str:
-    """Return an explicitly causal source clause, never a paraphrase."""
+_EXPLICIT_FOCUSED_ATTRIBUTE_RE = re.compile(
+    r"(?:^|[.!?;])\\s*(?P<reason>(?:i|we)\\s+"
+    r"(?:especially|particularly|mainly)\\s+"
+    r"(?:love|like|enjoy|adore|appreciate)\\s+"
+    r"(?:its|their)\\s+[^.!?;]+)",
+    re.IGNORECASE,
+)
+
+
+def _focused_attribute_reason(content: str, subject: str) -> str:
+    """Admit an emphasized attribute only when its antecedent is explicit.
+
+    'I like X. I especially love its design' attributes the feature to X.
+    If the sentence immediately before the pronoun names something else,
+    or the proposed subject is absent, no reason is assigned.
+    """
+    if not subject:
+        return ""
+    for match in _EXPLICIT_FOCUSED_ATTRIBUTE_RE.finditer(content):
+        preceding = content[:match.start()].rstrip(" .!?;")
+        previous_sentence = re.split(r"[.!?;]", preceding)[-1]
+        if not re.search(
+            r"(?<!\\w)" + re.escape(subject) + r"(?!\\w)",
+            previous_sentence, re.IGNORECASE,
+        ):
+            continue
+        return " ".join(match.group("reason").split()).strip()
+    return ""
+
+
+def _source_rationale(
+    store: Any, source_ids: list[int], subject: str = "",
+) -> str:
+    """Return an explicitly stated reason, never a model paraphrase."""
     for source_id in source_ids:
         source = store.fetch_message(source_id)
         if source is None or source.role != "user":
             continue
+        focused = _focused_attribute_reason(source.content, subject)
+        if focused and len(focused) >= 12:
+            return focused
         match = _EXPLICIT_CAUSAL_SOURCE_RE.search(source.content.strip())
         if match:
             value = " ".join(match.group(1).split()).strip(" .!?;")
@@ -590,6 +625,7 @@ _EXPLICIT_ATTRIBUTE_CAUSE_RE = re.compile(
 
 def _rationale_supported_by_user_source(
     store: Any, source_ids: list[int], rationale: str,
+    subject: str = "",
 ) -> bool:
     """Require a reason within an explicit causal clause, not just any quote.
 
@@ -610,7 +646,9 @@ def _rationale_supported_by_user_source(
             continue
         content = " ".join(source.content.split())
         _head, because_reason = _split_rationale(content)
-        reasons = [because_reason, _source_rationale(store, [source_id])]
+        reasons = [
+            because_reason, _source_rationale(store, [source_id], subject),
+        ]
         # "I admire this for its unusual shape" explicitly states an
         # attribute as a reason. "I use this for travel notes" is a
         # purpose/context and is not necessarily why it is preferred.
@@ -678,6 +716,7 @@ def apply_proposals(
         # causal clause. Reject invented standalone rationale states.
         if candidate.rationale and not _rationale_supported_by_user_source(
             store, candidate.source_ids, candidate.rationale,
+            subject=candidate.subject if candidate.kind == "preference" else "",
         ):
             from dataclasses import replace
             candidate = replace(candidate, rationale="")
@@ -707,7 +746,10 @@ def apply_proposals(
                 concept="likes for " + " ".join(candidate.subject.split()).casefold(),
             )
         if candidate.kind == "preference" and not candidate.rationale:
-            explicit_rationale = _source_rationale(store, candidate.source_ids)
+            explicit_rationale = _source_rationale(
+                store, candidate.source_ids,
+                subject=candidate.subject if semantic_first else "",
+            )
             if explicit_rationale:
                 from dataclasses import replace
                 candidate = replace(candidate, rationale=explicit_rationale)
@@ -843,6 +885,22 @@ def apply_proposals(
                     valid_until=candidate.valid_until,
                 )
             admitted.append(state_id)
+            if candidate.kind == "preference" and candidate.predicate in (
+                "dislike", "hate"
+            ):
+                # When a liking becomes a dislike, its old explanation is
+                # still valid history but no longer a current preference
+                # rationale. Preserve the original sourced row as superseded.
+                previous_reasons = store.fetch_states(
+                    scope=scope,
+                    concept="rationale for " + candidate.concept,
+                    status="current",
+                )
+                if previous_reasons:
+                    store.supersede_states(
+                        [st.state_id for st in previous_reasons],
+                        transition_time=message.timestamp,
+                    )
             diagnostics.extend(_admit_rationale(
                 store, session_id, scope, state_id, candidate, message,
                 admission=admission,

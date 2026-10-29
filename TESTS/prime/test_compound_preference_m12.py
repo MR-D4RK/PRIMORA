@@ -219,6 +219,80 @@ def test_first_person_preference_variants_have_source_evidence(
     assert validate_semantic_candidate(candidate, source) == (True, "ok")
 
 
+
+def test_semantic_formation_retains_emphasized_feature_as_reason(tmp_path):
+    statement = (
+        "I recently started liking a fictional band called Northglass. "
+        "I especially love its guitar melodies."
+    )
+    manager = ContextManager(
+        db_path=tmp_path / "feature-reason.db",
+        formation_provider=_ProposalProvider("Northglass", "like"),
+    )
+    manager.reconcile([{"role": "user", "content": statement}], "original")
+    store = manager._get_store()
+    preference = store.fetch_states(
+        scope="global", concept="likes for northglass", status="current",
+    )
+    reasons = store.fetch_states(
+        scope="global", concept="rationale for likes for northglass",
+        status="current",
+    )
+    assert len(preference) == 1
+    assert len(reasons) == 1, manager.formation_status()
+    assert reasons[0].value == "I especially love its guitar melodies"
+    assert reasons[0].memory_type == "RATIONALE"
+    assert reasons[0].source_ids == preference[0].source_ids
+    assert store.fetch_messages_by_ids(reasons[0].source_ids)[0].content == statement
+
+    # No in-memory chat history: the reason survives a full store reopen.
+    restarted = ContextManager(db_path=tmp_path / "feature-reason.db")
+    historical = restarted._get_store().fetch_states(
+        scope="global", concept="rationale for likes for northglass",
+    )
+    assert len(historical) == 1
+    assert historical[0].value == "I especially love its guitar melodies"
+
+    # A new-session correction retires the old explanation without erasing
+    # it or changing its original user-message provenance.
+    manager.set_formation_provider(
+        _ProposalProvider("Northglass", "dislike", "negation")
+    )
+    manager.reconcile(
+        [{"role": "user", "content": "I don't like Northglass anymore."}],
+        "corrected",
+    )
+    assert store.fetch_states(
+        scope="global", concept="rationale for likes for northglass",
+        status="current",
+    ) == []
+    old_reasons = store.fetch_states(
+        scope="global", concept="rationale for likes for northglass",
+        status="superseded",
+    )
+    assert len(old_reasons) == 1
+    assert old_reasons[0].value == "I especially love its guitar melodies"
+    current = store.fetch_states(
+        scope="global", concept="likes for northglass", status="current",
+    )
+    assert len(current) == 1 and current[0].value == "dislikes Northglass"
+
+
+def test_focused_feature_does_not_attach_to_wrong_subject(tmp_path):
+    statement = (
+        "I like Northglass. I also like Copper Vale. "
+        "I especially love its singer's voice."
+    )
+    manager = ContextManager(
+        db_path=tmp_path / "subject-reference.db",
+        formation_provider=_ProposalProvider("Northglass", "like"),
+    )
+    manager.reconcile([{"role": "user", "content": statement}], "first")
+    assert not manager._get_store().fetch_states(
+        scope="global", concept="rationale for likes for northglass",
+    )
+
+
 def test_compound_correction_creates_independent_history_across_sessions(tmp_path):
     """Two independent likes plus a mixed-polarity correction retain provenance."""
     class BatchProvider:
