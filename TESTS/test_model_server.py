@@ -65,9 +65,10 @@ def test_from_env_defaults_match_the_launcher():
     svc = ModelServerService.from_env(env={})
     assert svc.exe == ms.DEFAULT_SERVER_EXE
     assert svc.model == ms.DEFAULT_MODEL_PATH
+    assert svc.mmproj == ms.DEFAULT_MMPROJ_PATH
     assert svc.host == "127.0.0.1"
     assert svc.port == 8080
-    assert svc.alias == "qwen3-8b-heretic"
+    assert svc.alias == "qwen3.5-9b"
     assert svc.ctx == 4096
     assert svc.wait_seconds == 180
     assert svc.keep is False
@@ -79,6 +80,7 @@ def test_from_env_honours_overrides():
     svc = ModelServerService.from_env(env={
         "PRIMORA_LLAMACPP_SERVER": r"D:\bin\llama-server.exe",
         "PRIMORA_LLAMACPP_MODEL": r"D:\models\a.gguf",
+        "PRIMORA_LLAMACPP_MMPROJ": r"D:\models\mmproj.gguf",
         "PRIMORA_MODEL_SERVER_PORT": "8081",
         "PRIMORA_MODEL_SERVER_CTX": "2048",
         "PRIMORA_MODEL_SERVER_ALIAS": "served-alias",
@@ -88,12 +90,27 @@ def test_from_env_honours_overrides():
     })
     assert str(svc.exe) == r"D:\bin\llama-server.exe"
     assert str(svc.model) == r"D:\models\a.gguf"
+    assert str(svc.mmproj) == r"D:\models\mmproj.gguf"
     assert svc.port == 8081
     assert svc.ctx == 2048
     assert svc.alias == "served-alias"
     assert svc.wait_seconds == 30
     assert svc.keep is True
     assert svc.mode == "on"
+
+
+def test_custom_model_does_not_inherit_incompatible_projector():
+    svc = ModelServerService.from_env(env={
+        "PRIMORA_LLAMACPP_MODEL": r"D:\models\different.gguf",
+    })
+    assert svc.mmproj is None
+
+
+def test_project_assets_resolve_from_repository_root():
+    svc = ModelServerService.from_env(env={})
+    assert svc.model.parent == ms.DEFAULT_MMPROJ_PATH.parent
+    assert svc.model.name == "Qwen3.5-9B-Q4_K_M.gguf"
+    assert svc.mmproj.name == "mmproj-Qwen3.5-9B-f16.gguf"
 
 
 def test_from_env_rejects_unknown_mode():
@@ -258,7 +275,7 @@ def test_start_uses_the_launcher_arguments_and_reports_started(
         "--port", "8080",
         "-c", "4096",
         "-ngl", "99",
-        "--alias", "qwen3-8b-heretic",
+        "--alias", "qwen3.5-9b",
     ]
     assert svc.log_path.exists()
     assert registered and registered[0] == svc._atexit_stop
@@ -307,6 +324,69 @@ def test_timeout_terminates_only_the_server_we_started(
     else:
         raise AssertionError("timeout must fail closed")
     assert proc.terminated >= 1 or proc.killed >= 1
+
+
+def test_missing_projector_is_actionable(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "health", lambda *args, **kwargs: False)
+    svc = _service(tmp_path, mmproj=tmp_path / "missing-mmproj.gguf")
+    _write_assets(svc)
+    try:
+        svc.ensure()
+    except ModelServerError as exc:
+        assert "multimodal projector" in str(exc)
+        assert str(svc.mmproj) in str(exc)
+    else:
+        raise AssertionError("Missing projector should fail before spawn")
+
+
+def test_multimodal_start_passes_matching_projector_and_jinja(tmp_path, monkeypatch):
+    calls = {"health": 0}
+    def health(*args, **kwargs):
+        calls["health"] += 1
+        return calls["health"] > 1
+
+    monkeypatch.setattr(ms, "health", health)
+    seen = []
+    monkeypatch.setattr(
+        ms.subprocess, "Popen",
+        lambda args, **kwargs: (seen.append(args) or _FakeProc()),
+    )
+    monkeypatch.setattr(ms.atexit, "register", lambda *args: None)
+    svc = _service(
+        tmp_path, mmproj=tmp_path / "mmproj.gguf", alias="qwen3.5-9b"
+    )
+    _write_assets(svc)
+    svc.mmproj.write_bytes(b"GGUF")
+    assert svc.ensure().state == "started"
+    assert seen[0][-3:] == ["--mmproj", str(svc.mmproj), "--jinja"]
+
+
+def test_existing_old_server_cannot_be_silently_adopted(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        ms, "_served_model_ids", lambda *args: ("qwen3-8b-heretic",)
+    )
+    svc = _service(
+        tmp_path, mmproj=tmp_path / "mmproj.gguf", alias="qwen3.5-9b"
+    )
+    try:
+        svc.ensure()
+    except ModelServerError as exc:
+        assert "qwen3-8b-heretic" in str(exc)
+        assert "Stop the existing llama-server" in str(exc)
+    else:
+        raise AssertionError("Old server must not be adopted")
+
+
+def test_existing_matching_server_can_be_adopted(tmp_path, monkeypatch):
+    monkeypatch.setattr(ms, "health", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        ms, "_served_model_ids", lambda *args: ("qwen3.5-9b",)
+    )
+    svc = _service(
+        tmp_path, mmproj=tmp_path / "mmproj.gguf", alias="qwen3.5-9b"
+    )
+    assert svc.ensure().state == "adopted"
 
 
 # --- stop ------------------------------------------------------------------
