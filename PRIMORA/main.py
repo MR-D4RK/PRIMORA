@@ -66,6 +66,11 @@ def configure_runtime_defaults(service):
     os.environ.setdefault("PRIMORA_OPENAI_URL", service.base_url)
     os.environ.setdefault("PRIMORA_OPENAI_MODEL", service.alias)
     os.environ.setdefault("PRIMORA_OPENAI_TIMEOUT", DEFAULT_OPENAI_TIMEOUT)
+    # Production uses the source-verified model-first memory pipeline. The
+    # legacy regex extractor remains available via an explicit env override.
+    # Do not force semantic mode in ContextManager itself: deterministic
+    # acceptance fixtures and embedders retain their own chosen defaults.
+    os.environ.setdefault("PRIMORA_MEMORY_FORMATION_MODE", "semantic")
 
 
 def research_provider_from_env(env=None):

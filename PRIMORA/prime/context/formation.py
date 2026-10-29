@@ -362,10 +362,100 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
     return True, "ok"
 
 
-def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[list[TypedMemoryCandidate], str]:
+
+# Strict, domain-independent admission shape for the model-first path.
+# This is a semantic schema check, not an entity-specific extraction regex.
+_PREFERENCE_WORDING = {
+    "love": "loves", "like": "likes", "adore": "adores",
+    "enjoy": "enjoys", "prefer": "prefers",
+    "hate": "hates", "dislike": "dislikes",
+}
+_NON_REFERENTIAL = frozenset({
+    "it", "this", "that", "them", "everything", "anything", "something",
+    "someone", "anyone", "everyone", "nothing",
+})
+
+
+def validate_semantic_candidate(candidate: TypedMemoryCandidate, message: Any) -> tuple[bool, str]:
+    """Check canonical meaning and literal user evidence before durable write."""
+    quote = candidate.source_quote.strip()
+    if candidate.source_ids != [message.message_id]:
+        return False, "semantic_source_must_be_current_user"
+    if not quote or quote.casefold() not in message.content.casefold():
+        return False, "semantic_missing_exact_quote"
+    negative_preference = (
+        candidate.kind == "preference"
+        and candidate.claim_kind == "negation"
+        and candidate.predicate in ("dislike", "hate")
+    )
+    if candidate.claim_kind != "assertion" and not negative_preference:
+        return False, "semantic_non_assertion"
+    if candidate.kind != "preference":
+        # Other types remain constrained by the existing provenance validator.
+        return True, "ok"
+    subject = " ".join(candidate.subject.split())
+    if (not subject or len(subject) > 90 or len(subject.split()) > 9
+            or subject.casefold() in _NON_REFERENTIAL):
+        return False, "semantic_invalid_subject"
+    if re.search(r"\b(?:i|we|you|they)\s+(?:love|like|adore|enjoy|"
+                 r"prefer|hate|dislike|think|feel|say)\b", subject, re.I):
+        return False, "semantic_subject_is_sentence"
+    if not re.search(r"(?<!\w)" + re.escape(subject) + r"(?!\w)", quote, re.I):
+        return False, "semantic_subject_not_in_quote"
+    if candidate.concept.casefold() != "likes for " + subject.casefold():
+        return False, "semantic_bad_concept"
+    predicate = candidate.predicate.casefold()
+    verb = _PREFERENCE_WORDING.get(predicate)
+    if verb is None:
+        return False, "semantic_unknown_attitude"
+    if candidate.value.casefold().strip(" .!") != f"{verb} {subject}".casefold():
+        return False, "semantic_bad_value"
+    if predicate not in _source_preference_verbs(quote):
+        return False, "semantic_attitude_unproven"
+    # Naming an object and an attitude in someone else's report is not
+    # evidence of the user's own preference.
+    # Preserve first-person authority while recognizing ordinary aspect and
+    # continuity markers: "I recently started liking", "I also like", and
+    # "I still like" are genuine user statements, not third-party reports.
+    # The model's proposed predicate and named subject are independently
+    # checked above against the exact user quote.
+    if not re.search(
+        r"\b(?:i|we)\s+"
+        r"(?:(?:have\s+)?(?:recently\s+)?(?:started|began)\s+)?"
+        r"(?:(?:really|truly|absolutely|also|still|currently|now|"
+        r"no\s+longer)\s+){0,3}"
+        r"(?:love|like|liking|adore|enjoy|prefer|hate|dislike|"
+        r"don't\s+like|do\s+not\s+like)\b"
+        r"|\bmy\s+(?:fav|favorite|favourite)\b",
+        quote, re.I,
+    ):
+        return False, "semantic_attitude_not_first_person"
+    # Fictional entities can be genuine user preferences. Reject imagined
+    # preference statements, not factual likes about fictional subjects.
+    if re.search(
+        r"\b(?:hypothetical(?:ly)?|suppose|pretend(?:ing)?|"
+        r"imagine\s+(?:that|if)|if\s+i\s+(?:were|had|could|would))\b",
+        message.content, re.I,
+    ):
+        return False, "semantic_nonfactual_source"
+    return True, "ok"
+
+
+def provider_proposals(
+    provider: Any, message: Any, session_id: str, *,
+    context: Optional[list[dict[str, str]]] = None,
+    semantic_first: bool = False,
+) -> tuple[list[TypedMemoryCandidate], str]:
     """Make one bounded provider call and parse its strict response."""
     if provider is None:
         return [], "provider_not_configured"
+    prior = []
+    if semantic_first:
+        for turn in (context or [])[-4:]:
+            role = str(turn.get("role", ""))
+            content = str(turn.get("content", ""))[:320]
+            if role in ("user", "assistant") and content:
+                prior.append({"role": role, "content": content})
     payload = {
         "messages": [
             {"role": "system", "content": (
@@ -373,8 +463,9 @@ def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[li
                 '{"candidates":[{"kind":"preference|state|event|relationship|observation",'
                 '"concept":"...","value":"...","claim_kind":"assertion|hypothesis|question|fiction|negation|third_party|assistant",'
                 '"actor":"user","scope":"session|global","source_ids":[ID],"source_quote":"exact substring",'
-                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
+                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fictional roleplay, and hypotheses are not assertions; a genuine user preference about a fictional object IS a real preference. Direct dislike or hate is a real negative preference, for which claim_kind=negation is acceptable. In the preference kind, provide a short exact named subject, the attitude predicate (love/like/adore/enjoy/prefer/hate/dislike), concept as likes for <subject>, and third-person value as loves/likes/adores/enjoys/prefers/hates/dislikes <subject>. Separate subject from descriptive attributes. For an explicit personal fact or favorite slot (my favorite <category> is <value>), propose kind=state, concept=favorite <category>, and value as the exact stated <value>. Do not treat it as an attitude toward the category. If no reliable claim return an empty candidates array. Earlier dialogue resolves references only, never supplies personal evidence.'
             )},
+            *prior,
             {"role": "user", "content": message.content},
         ],
         "session_id": session_id,
@@ -477,12 +568,47 @@ _EXPLICIT_CAUSAL_SOURCE_RE = re.compile(
 )
 
 
-def _source_rationale(store: Any, source_ids: list[int]) -> str:
-    """Return an explicitly causal source clause, never a paraphrase."""
+_EXPLICIT_FOCUSED_ATTRIBUTE_RE = re.compile(
+    r"(?:^|[.!?;])\\s*(?P<reason>(?:i|we)\\s+"
+    r"(?:especially|particularly|mainly)\\s+"
+    r"(?:love|like|enjoy|adore|appreciate)\\s+"
+    r"(?:its|their)\\s+[^.!?;]+)",
+    re.IGNORECASE,
+)
+
+
+def _focused_attribute_reason(content: str, subject: str) -> str:
+    """Admit an emphasized attribute only when its antecedent is explicit.
+
+    'I like X. I especially love its design' attributes the feature to X.
+    If the sentence immediately before the pronoun names something else,
+    or the proposed subject is absent, no reason is assigned.
+    """
+    if not subject:
+        return ""
+    for match in _EXPLICIT_FOCUSED_ATTRIBUTE_RE.finditer(content):
+        preceding = content[:match.start()].rstrip(" .!?;")
+        previous_sentence = re.split(r"[.!?;]", preceding)[-1]
+        if not re.search(
+            r"(?<!\\w)" + re.escape(subject) + r"(?!\\w)",
+            previous_sentence, re.IGNORECASE,
+        ):
+            continue
+        return " ".join(match.group("reason").split()).strip()
+    return ""
+
+
+def _source_rationale(
+    store: Any, source_ids: list[int], subject: str = "",
+) -> str:
+    """Return an explicitly stated reason, never a model paraphrase."""
     for source_id in source_ids:
         source = store.fetch_message(source_id)
         if source is None or source.role != "user":
             continue
+        focused = _focused_attribute_reason(source.content, subject)
+        if focused and len(focused) >= 12:
+            return focused
         match = _EXPLICIT_CAUSAL_SOURCE_RE.search(source.content.strip())
         if match:
             value = " ".join(match.group(1).split()).strip(" .!?;")
@@ -499,6 +625,7 @@ _EXPLICIT_ATTRIBUTE_CAUSE_RE = re.compile(
 
 def _rationale_supported_by_user_source(
     store: Any, source_ids: list[int], rationale: str,
+    subject: str = "",
 ) -> bool:
     """Require a reason within an explicit causal clause, not just any quote.
 
@@ -519,7 +646,9 @@ def _rationale_supported_by_user_source(
             continue
         content = " ".join(source.content.split())
         _head, because_reason = _split_rationale(content)
-        reasons = [because_reason, _source_rationale(store, [source_id])]
+        reasons = [
+            because_reason, _source_rationale(store, [source_id], subject),
+        ]
         # "I admire this for its unusual shape" explicitly states an
         # attribute as a reason. "I use this for travel notes" is a
         # purpose/context and is not necessarily why it is preferred.
@@ -534,14 +663,21 @@ def _rationale_supported_by_user_source(
     return False
 
 
-def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) -> FormationResult:
+def apply_proposals(
+    store: Any, session_id: str, message: Any, provider: Any, *,
+    context: Optional[list[dict[str, str]]] = None,
+    semantic_first: bool = False,
+) -> FormationResult:
     """Validate and admit proposals; deterministic extraction remains separate."""
     timed_store = _TimingStore(store)
     store = timed_store
     admission = MemoryAdmissionGateway(store)
     started = time.perf_counter()
     provider_started = time.perf_counter()
-    candidates, diagnostic = provider_proposals(provider, message, session_id)
+    candidates, diagnostic = provider_proposals(
+        provider, message, session_id, context=context,
+        semantic_first=semantic_first,
+    )
     provider_ms = (time.perf_counter() - provider_started) * 1000
     timings = {"provider_ms": provider_ms}
     if diagnostic != "ok":
@@ -580,6 +716,7 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
         # causal clause. Reject invented standalone rationale states.
         if candidate.rationale and not _rationale_supported_by_user_source(
             store, candidate.source_ids, candidate.rationale,
+            subject=candidate.subject if candidate.kind == "preference" else "",
         ):
             from dataclasses import replace
             candidate = replace(candidate, rationale="")
@@ -594,11 +731,25 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
             candidate, session_id=session_id, message=message,
             source_lookup=store.fetch_message,
         )
+        if valid and semantic_first:
+            valid, reason = validate_semantic_candidate(candidate, message)
         if not valid:
             diagnostics.append(f"proposal_rejected:{reason}")
             continue
+        if semantic_first and candidate.kind == "preference":
+            # The model's capitalization is presentation, not identity.
+            # Normalize the key only after validating the sourced subject.
+            # Preserve the value verbatim and keep the source evidence.
+            from dataclasses import replace
+            candidate = replace(
+                candidate,
+                concept="likes for " + " ".join(candidate.subject.split()).casefold(),
+            )
         if candidate.kind == "preference" and not candidate.rationale:
-            explicit_rationale = _source_rationale(store, candidate.source_ids)
+            explicit_rationale = _source_rationale(
+                store, candidate.source_ids,
+                subject=candidate.subject if semantic_first else "",
+            )
             if explicit_rationale:
                 from dataclasses import replace
                 candidate = replace(candidate, rationale=explicit_rationale)
@@ -645,6 +796,18 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
                     admitted.append(event_id)
             continue
         scope = "global" if candidate.scope == "global" else session_id
+        if semantic_first and candidate.kind == "state":
+            # A paraphrased generic assertion is not automatically a user
+            # fact. Without literal evidence for its value, keep it pending
+            # for review rather than promote speculative model prose.
+            if candidate.value.casefold() not in candidate.source_quote.casefold():
+                held.append(admission.create_pending(
+                    session_id, scope, candidate.source_ids, candidate.kind,
+                    candidate.concept, candidate.value, candidate.rationale,
+                    "user", candidate.confidence,
+                ))
+                diagnostics.append("state_proposal_held:not_literal_source_value")
+                continue
         existing = [state for state in store.fetch_states(scope=scope, concept=candidate.concept, status="current")]
         if candidate.kind == "preference":
             candidate_terms = _preference_fingerprint(
@@ -722,6 +885,22 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
                     valid_until=candidate.valid_until,
                 )
             admitted.append(state_id)
+            if candidate.kind == "preference" and candidate.predicate in (
+                "dislike", "hate"
+            ):
+                # When a liking becomes a dislike, its old explanation is
+                # still valid history but no longer a current preference
+                # rationale. Preserve the original sourced row as superseded.
+                previous_reasons = store.fetch_states(
+                    scope=scope,
+                    concept="rationale for " + candidate.concept,
+                    status="current",
+                )
+                if previous_reasons:
+                    store.supersede_states(
+                        [st.state_id for st in previous_reasons],
+                        transition_time=message.timestamp,
+                    )
             diagnostics.extend(_admit_rationale(
                 store, session_id, scope, state_id, candidate, message,
                 admission=admission,

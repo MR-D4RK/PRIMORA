@@ -1180,6 +1180,35 @@ class ContextStore:
             ).fetchall()
         return [StoredMessage(*r) for r in self._visible("messages", list(reversed(rows)), lambda r: r[0])]
 
+    def fetch_context_before(
+        self, message_id: int, *, limit: int = 4,
+    ) -> list[StoredMessage]:
+        """Nearby prior dialogue, excluding protocol and forgotten evidence.
+
+        A queued job processed hours later must never receive subsequent
+        conversation as if it preceded the source statement.
+        """
+        if not 1 <= limit <= 8:
+            raise ValueError("context limit must be 1..8")
+        with self._connection() as con:
+            source = con.execute(
+                "SELECT session_id FROM messages WHERE id=?", (int(message_id),)
+            ).fetchone()
+            if source is None:
+                return []
+            rows = con.execute(
+                "SELECT m.id, m.session_id, m.seq, m.role, m.content,"
+                " m.timestamp, m.fingerprint, m.importance FROM messages m"
+                " WHERE m.session_id=? AND m.id < ?"
+                " AND m.role IN ('user', 'assistant')"
+                " AND m.content NOT LIKE ?"
+                " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
+                " WHERE s.kind='messages' AND s.ref_id=m.id)"
+                " ORDER BY m.id DESC LIMIT ?",
+                (source[0], int(message_id), "%<prime_request>%", limit),
+            ).fetchall()
+        return [StoredMessage(*row) for row in reversed(rows)]
+
     def max_seq(self, session_id: str) -> int:
         """Highest stored sequence in this session, or -1 when there is none."""
         with self._connection() as con:

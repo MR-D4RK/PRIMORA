@@ -1,0 +1,950 @@
+diff --git a/PRIMORA/aurora/configuration.py b/PRIMORA/aurora/configuration.py
+--- a/PRIMORA/aurora/configuration.py
++++ b/PRIMORA/aurora/configuration.py
+@@ -122,9 +122,9 @@ def get_project_root() -> Path:
+     "it an assumption, acknowledge the mistake instead of denying it. "
+     "A correction supersedes your prior interpretation. Focus "
+     "on the latest user message, even if earlier tool results disagree. "
+-    "When an 'I love X' statement answers a category question, interpret "
+-    "X within that category, not as a generic topic. Acknowledge the "
+-    "details already stated without inventing new ones.\n"
++    "Preserve conversational referents and distinguish an entity from "
++    "its attributes. Never guess an entity category or attribute unless "
++    "the user's own words or relevant dialogue actually establish it.\n"
+     "\n"
+     "Never do Prime's work yourself and never claim that you did."
+ )
+diff --git a/PRIMORA/prime/context/formation.py b/PRIMORA/prime/context/formation.py
+--- a/PRIMORA/prime/context/formation.py
++++ b/PRIMORA/prime/context/formation.py
+@@ -362,19 +362,101 @@ def validate_candidate(candidate: TypedMemoryCandidate, *, session_id: str,
+     return True, "ok"
+ 
+ 
+-def provider_proposals(provider: Any, message: Any, session_id: str) -> tuple[list[TypedMemoryCandidate], str]:
++
++# Strict, domain-independent admission shape for the model-first path.
++# This is a semantic schema check, not an entity-specific extraction regex.
++_PREFERENCE_WORDING = {
++    "love": "loves", "like": "likes", "adore": "adores",
++    "enjoy": "enjoys", "prefer": "prefers",
++    "hate": "hates", "dislike": "dislikes",
++}
++_NON_REFERENTIAL = frozenset({
++    "it", "this", "that", "them", "everything", "anything", "something",
++    "someone", "anyone", "everyone", "nothing",
++})
++
++
++def validate_semantic_candidate(candidate: TypedMemoryCandidate, message: Any) -> tuple[bool, str]:
++    """Check canonical meaning and literal user evidence before durable write."""
++    quote = candidate.source_quote.strip()
++    if candidate.source_ids != [message.message_id]:
++        return False, "semantic_source_must_be_current_user"
++    if not quote or quote.casefold() not in message.content.casefold():
++        return False, "semantic_missing_exact_quote"
++    negative_preference = (
++        candidate.kind == "preference"
++        and candidate.claim_kind == "negation"
++        and candidate.predicate in ("dislike", "hate")
++    )
++    if candidate.claim_kind != "assertion" and not negative_preference:
++        return False, "semantic_non_assertion"
++    if candidate.kind != "preference":
++        # Other types remain constrained by the existing provenance validator.
++        return True, "ok"
++    subject = " ".join(candidate.subject.split())
++    if (not subject or len(subject) > 90 or len(subject.split()) > 9
++            or subject.casefold() in _NON_REFERENTIAL):
++        return False, "semantic_invalid_subject"
++    if re.search(r"\b(?:i|we|you|they)\s+(?:love|like|adore|enjoy|"
++                 r"prefer|hate|dislike|think|feel|say)\b", subject, re.I):
++        return False, "semantic_subject_is_sentence"
++    if not re.search(r"(?<!\w)" + re.escape(subject) + r"(?!\w)", quote, re.I):
++        return False, "semantic_subject_not_in_quote"
++    if candidate.concept.casefold() != "likes for " + subject.casefold():
++        return False, "semantic_bad_concept"
++    predicate = candidate.predicate.casefold()
++    verb = _PREFERENCE_WORDING.get(predicate)
++    if verb is None:
++        return False, "semantic_unknown_attitude"
++    if candidate.value.casefold().strip(" .!") != f"{verb} {subject}".casefold():
++        return False, "semantic_bad_value"
++    if predicate not in _source_preference_verbs(quote):
++        return False, "semantic_attitude_unproven"
++    # Naming an object and an attitude in someone else's report is not
++    # evidence of the user's own preference.
++    if not re.search(
++        r"\b(?:i|we)\s+(?:(?:really|truly|absolutely)\s+)?"
++        r"(?:love|like|adore|enjoy|prefer|hate|dislike|"
++        r"don't\s+like|do\s+not\s+like)\b"
++        r"|\bmy\s+(?:fav|favorite|favourite)\b",
++        quote, re.I,
++    ):
++        return False, "semantic_attitude_not_first_person"
++    # Reject clear hypothetical framing even if the model mislabeled it.
++    if re.search(
++        r"\b(?:hypothetical|fictional|pretend(?:ing)?|imaginary|"
++        r"imagine\s+(?:that|if)|if\s+i\s+(?:were|had|could|would))\b",
++        message.content, re.I,
++    ):
++        return False, "semantic_nonfactual_source"
++    return True, "ok"
++
++
++def provider_proposals(
++    provider: Any, message: Any, session_id: str, *,
++    context: Optional[list[dict[str, str]]] = None,
++    semantic_first: bool = False,
++) -> tuple[list[TypedMemoryCandidate], str]:
+     """Make one bounded provider call and parse its strict response."""
+     if provider is None:
+         return [], "provider_not_configured"
++    prior = []
++    if semantic_first:
++        for turn in (context or [])[-4:]:
++            role = str(turn.get("role", ""))
++            content = str(turn.get("content", ""))[:320]
++            if role in ("user", "assistant") and content:
++                prior.append({"role": role, "content": content})
+     payload = {
+         "messages": [
+             {"role": "system", "content": (
+                 "Extract only explicit user-authored memory proposals. Return JSON only: "
+                 '{"candidates":[{"kind":"preference|state|event|relationship|observation",'
+                 '"concept":"...","value":"...","claim_kind":"assertion|hypothesis|question|fiction|negation|third_party|assistant",'
+                 '"actor":"user","scope":"session|global","source_ids":[ID],"source_quote":"exact substring",'
+-                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, negation, and hypotheses are not assertions.'
++                f'"predicate":"...","rationale":"exact user-stated reason"}}]}} . Use global for a personal preference unless the user explicitly makes it temporary or session-only. The only admissible source is source_message_id={message.message_id}; copy that integer and an exact substring from the user message as source_quote. If a reason is present, copy an exact user-authored causal clause into rationale. Never infer from an assistant message. Questions, fiction, and hypotheses are not assertions; direct dislike or hate is a real negative preference, for which claim_kind=negation is acceptable. In the preference kind, provide a short exact named subject, the attitude predicate (love/like/adore/enjoy/prefer/hate/dislike), concept as likes for <subject>, and third-person value as loves/likes/adores/enjoys/prefers/hates/dislikes <subject>. Separate subject from descriptive attributes. For an explicit personal fact or favorite slot (my favorite <category> is <value>), propose kind=state, concept=favorite <category>, and value as the exact stated <value>. Do not treat it as an attitude toward the category. If no reliable claim return an empty candidates array. Earlier dialogue resolves references only, never supplies personal evidence.'
+             )},
++            *prior,
+             {"role": "user", "content": message.content},
+         ],
+         "session_id": session_id,
+@@ -534,14 +616,21 @@ def _rationale_supported_by_user_source(
+     return False
+ 
+ 
+-def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) -> FormationResult:
++def apply_proposals(
++    store: Any, session_id: str, message: Any, provider: Any, *,
++    context: Optional[list[dict[str, str]]] = None,
++    semantic_first: bool = False,
++) -> FormationResult:
+     """Validate and admit proposals; deterministic extraction remains separate."""
+     timed_store = _TimingStore(store)
+     store = timed_store
+     admission = MemoryAdmissionGateway(store)
+     started = time.perf_counter()
+     provider_started = time.perf_counter()
+-    candidates, diagnostic = provider_proposals(provider, message, session_id)
++    candidates, diagnostic = provider_proposals(
++        provider, message, session_id, context=context,
++        semantic_first=semantic_first,
++    )
+     provider_ms = (time.perf_counter() - provider_started) * 1000
+     timings = {"provider_ms": provider_ms}
+     if diagnostic != "ok":
+@@ -594,6 +683,8 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+             candidate, session_id=session_id, message=message,
+             source_lookup=store.fetch_message,
+         )
++        if valid and semantic_first:
++            valid, reason = validate_semantic_candidate(candidate, message)
+         if not valid:
+             diagnostics.append(f"proposal_rejected:{reason}")
+             continue
+@@ -645,6 +736,18 @@ def apply_proposals(store: Any, session_id: str, message: Any, provider: Any) ->
+                     admitted.append(event_id)
+             continue
+         scope = "global" if candidate.scope == "global" else session_id
++        if semantic_first and candidate.kind == "state":
++            # A paraphrased generic assertion is not automatically a user
++            # fact. Without literal evidence for its value, keep it pending
++            # for review rather than promote speculative model prose.
++            if candidate.value.casefold() not in candidate.source_quote.casefold():
++                held.append(admission.create_pending(
++                    session_id, scope, candidate.source_ids, candidate.kind,
++                    candidate.concept, candidate.value, candidate.rationale,
++                    "user", candidate.confidence,
++                ))
++                diagnostics.append("state_proposal_held:not_literal_source_value")
++                continue
+         existing = [state for state in store.fetch_states(scope=scope, concept=candidate.concept, status="current")]
+         if candidate.kind == "preference":
+             candidate_terms = _preference_fingerprint(
+diff --git a/PRIMORA/prime/context/manager.py b/PRIMORA/prime/context/manager.py
+--- a/PRIMORA/prime/context/manager.py
++++ b/PRIMORA/prime/context/manager.py
+@@ -245,6 +245,15 @@ def __init__(
+         self._budget = budget or BudgetConfig.from_env()
+         self._memory_provider = memory_provider
+         self._formation_provider = formation_provider
++        # Explicit opt-in. In semantic mode no deterministic extractor may
++        # write a current personal fact ahead of source-verified model analysis.
++        # The old pipeline remains an available rollback.
++        self._formation_mode = (
++            os.environ.get("PRIMORA_MEMORY_FORMATION_MODE", "legacy")
++            .strip().casefold()
++        )
++        if self._formation_mode not in ("legacy", "semantic"):
++            raise ValueError("PRIMORA_MEMORY_FORMATION_MODE must be legacy or semantic")
+         if enable_memory_v2 is None:
+             enable_memory_v2 = memory_v2
+         if enable_memory_v2 is None:
+@@ -253,9 +262,10 @@ def __init__(
+                 os.environ.get("PRIMORA_MEMORY_V2_FORMATION", "0"),
+                 os.environ.get("PRIMORA_MEMORY_V2_RETRIEVAL", "0"),
+             )
+-            enable_memory_v2 = any(
+-                value.strip().lower() in ("1", "true", "yes", "on")
+-                for value in enabled_values
++            enable_memory_v2 = (
++                self._formation_mode == "semantic"
++                or any(value.strip().lower() in ("1", "true", "yes", "on")
++                       for value in enabled_values)
+             )
+         self._memory_v2_enabled = bool(enable_memory_v2)
+         self._store: Optional[ContextStore] = None
+@@ -312,6 +322,10 @@ def admission(self) -> MemoryAdmissionGateway:
+             self._admission = MemoryAdmissionGateway(self._get_store())
+         return self._admission
+ 
++    @property
++    def semantic_formation(self) -> bool:
++        return self._formation_mode == "semantic" and self._memory_v2_enabled
++
+     @property
+     def formation_deferred(self) -> bool:
+         return self._formation_deferred
+@@ -2549,7 +2563,7 @@ def reconcile(
+                     # M3 episodic evidence is independent of semantic memory.
+                     # Only new explicit user reports are admitted, and the
+                     # original message is the source of both text and time.
+-                    if role == "user":
++                    if role == "user" and not self.semantic_formation:
+                         try:
+                             source_message = store.fetch_message(message_id)
+                             claim = extract_experience_claim(
+@@ -2587,13 +2601,18 @@ def reconcile(
+                             assistant_question = self._prior_assistant_text(
+                                 store, session_id, message_id
+                             )
+-                    formation_diags.extend(
+-                        self._extract_states(
+-                            store, session_id, message_id, role, content,
+-                            context_question, assistant_question,
+-                            global_personal_preferences=self._memory_v2_enabled,
++                    if not (role == "user" and self.semantic_formation):
++                        formation_diags.extend(
++                            self._extract_states(
++                                store, session_id, message_id, role, content,
++                                context_question, assistant_question,
++                                global_personal_preferences=self._memory_v2_enabled,
++                            )
++                        )
++                    elif self._formation_provider is None:
++                        formation_diags.append(
++                            "semantic_formation:provider_unavailable_raw_only"
+                         )
+-                    )
+                     # V2 typed formation is opt-in and proposal-only.  The
+                     # deterministic extractor above always runs first, so a
+                     # provider timeout or malformed response cannot remove
+@@ -2604,7 +2623,7 @@ def reconcile(
+                         and self._memory_v2_enabled
+                         and self._formation_provider is not None
+                     ):
+-                        if replayed_user_source:
++                        if replayed_user_source and not self.semantic_formation:
+                             formation_diags.append(
+                                 "typed_formation:skipped_already_processed_source"
+                             )
+@@ -2616,7 +2635,7 @@ def reconcile(
+                             formation_diags.append("typed_formation:queued")
+                             if not self._formation_deferred:
+                                 formation_diags.extend(self.drain_formation())
+-                    if role == "user":
++                    if role == "user" and not self.semantic_formation:
+                         formation_diags.extend(
+                             self._extract_entities(
+                                 store, session_id, message_id, content,
+@@ -2628,6 +2647,8 @@ def reconcile(
+                         item.startswith((
+                             "episode_capture_failed", "state_failed", "m5_failed",
+                             "entity_failed", "formation_status_failed",
++                            "semantic_formation:provider_unavailable",
++                            "typed_formation:provider_", "typed_formation:malformed",
+                         )) for item in formation_diags
+                     )
+                     try:
+@@ -2695,9 +2716,13 @@ def drain_formation(
+                     )
+                     continue
+                 try:
++                    prior = store.fetch_context_before(message.message_id, limit=4)
+                     typed = formation_mod.apply_proposals(
+                         store, job["session_id"], message,
+                         self._formation_provider,
++                        context=[{"role": row.role, "content": row.content}
++                                 for row in prior],
++                        semantic_first=self.semantic_formation,
+                     )
+                     self._last_formation_timings = dict(typed.timings_ms)
+                     items = [
+@@ -2706,8 +2731,13 @@ def drain_formation(
+                     failed = any(
+                         item.startswith("typed_formation:provider_")
+                         or item.startswith("typed_formation:malformed")
++                        or item.startswith("typed_formation:proposal_write_failed")
+                         for item in items
+                     )
++                    if (self.semantic_formation and typed.candidates
++                            and not typed.admitted_ids and not typed.held_ids):
++                        failed = True
++                        items.append("typed_formation:no_verified_proposals_admitted")
+                     store.finish_formation_job(
+                         job["job_id"], "failed" if failed else "complete",
+                         "provider_or_parse_failure" if failed else "",
+@@ -2745,7 +2775,7 @@ def replay_formation(
+         diagnostics: list[str] = []
+         try:
+             store.set_formation_status(message_id, session_id, "processing")
+-            if message.role == "user":
++            if message.role == "user" and not self.semantic_formation:
+                 claim = extract_experience_claim(
+                     message.content, message.role,
+                     reported_at=message.timestamp,
+@@ -2758,17 +2788,18 @@ def replay_formation(
+             prior_user = self._prior_user_text(store, session_id, message_id)
+             prior_assistant = self._prior_assistant_text(
+                 store, session_id, message_id)
+-            diagnostics.extend(self._extract_states(
+-                store, session_id, message_id, message.role, message.content,
+-                prior_user, prior_assistant,
+-                global_personal_preferences=self._memory_v2_enabled))
++            if not (message.role == "user" and self.semantic_formation):
++                diagnostics.extend(self._extract_states(
++                    store, session_id, message_id, message.role, message.content,
++                    prior_user, prior_assistant,
++                    global_personal_preferences=self._memory_v2_enabled))
+             if (
+                 message.role == "user"
+                 and self._memory_v2_enabled
+                 and self._formation_provider is not None
+             ):
+-                if store.has_user_content(
+-                        message.content, exclude_id=message.message_id):
++                if (not self.semantic_formation and store.has_user_content(
++                        message.content, exclude_id=message.message_id)):
+                     diagnostics.append(
+                         "typed_formation:skipped_already_processed_source"
+                     )
+@@ -2779,7 +2810,7 @@ def replay_formation(
+                     diagnostics.append("typed_formation:queued")
+                     if not self._formation_deferred:
+                         diagnostics.extend(self.drain_formation())
+-            if message.role == "user":
++            if message.role == "user" and not self.semantic_formation:
+                 diagnostics.extend(self._extract_entities(
+                     store, session_id, message_id, message.content,
+                     message.timestamp))
+diff --git a/PRIMORA/prime/context/memory_integrity_m13.py b/PRIMORA/prime/context/memory_integrity_m13.py
+new file mode 100644
+--- /dev/null
++++ b/PRIMORA/prime/context/memory_integrity_m13.py
+@@ -0,0 +1,93 @@
++"""Read-only audit and explicit, backed-up retirement of malformed legacy states.
++
++This migration never infers a replacement fact and never deletes source text.
++Run preview before the user-authorized --apply; a SQLite backup is mandatory.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import re
++import sqlite3
++import sys
++from pathlib import Path
++
++from .store import ContextStore
++
++
++def suspicious_preference(state) -> str | None:
++    """Flag sentence-shaped subject fields; no topic-specific vocabulary."""
++    if not state.concept.startswith("likes for "):
++        return None
++    subject = state.concept[len("likes for "):].strip()
++    if re.search(
++        r"\b(?:i|we|you|they)\s+(?:love|like|adore|enjoy|"
++        r"prefer|hate|dislike|think|feel|say)\b",
++        subject, re.I,
++    ):
++        return "subject_contains_conversational_clause"
++    if len(subject) > 90 or len(subject.split()) > 12:
++        return "subject_exceeds_conservative_entity_limit"
++    return None
++
++
++def preview(store: ContextStore) -> list[dict]:
++    result = []
++    for state in store.fetch_states(status="current"):
++        reason = suspicious_preference(state)
++        if reason:
++            result.append({
++                "state_id": state.state_id, "scope": state.scope,
++                "concept": state.concept, "value": state.value,
++                "source_ids": list(state.source_ids), "reason": reason,
++            })
++    return result
++
++
++def apply_reviewed(db_path: Path, state_ids: list[int]) -> dict:
++    """Retire only explicitly reviewed IDs with an atomic SQLite backup."""
++    if not state_ids:
++        return {"backed_up": None, "retired": 0}
++    db_path = Path(db_path).resolve()
++    if not db_path.exists():
++        raise FileNotFoundError(db_path)
++    store = ContextStore(db_path)
++    flagged = {record["state_id"] for record in preview(store)}
++    ids = list(dict.fromkeys(int(i) for i in state_ids))
++    if not set(ids) <= flagged:
++        raise ValueError("state ids changed or are not reviewable; rerun preview")
++    backup = db_path.with_name(db_path.name + ".before-m13.sqlite")
++    if backup.exists():
++        raise FileExistsError(
++            f"refusing to overwrite existing migration backup: {backup}"
++        )
++    # Backup through SQLite to capture committed WAL contents consistently.
++    with sqlite3.connect(str(db_path)) as source:
++        with sqlite3.connect(str(backup)) as destination:
++            source.backup(destination)
++    # The repository's existing state lifecycle, never direct SQL deletion.
++    store.supersede_states(ids)
++    return {"backed_up": str(backup), "retired": len(ids)}
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--db", required=True, type=Path)
++    parser.add_argument("--apply", action="store_true")
++    parser.add_argument("--state-ids", type=int, nargs="+")
++    parser.add_argument("--confirm-reviewed", action="store_true")
++    args = parser.parse_args(argv)
++    if not args.db.exists():
++        parser.error("database file not found")
++    store = ContextStore(args.db)
++    report = preview(store)
++    print(json.dumps({"flagged": report, "count": len(report)}, indent=2))
++    if args.apply:
++        if not args.confirm_reviewed or not args.state_ids:
++            parser.error("--apply requires --confirm-reviewed and --state-ids")
++        print(json.dumps(apply_reviewed(args.db, args.state_ids), indent=2))
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/PRIMORA/prime/context/state.py b/PRIMORA/prime/context/state.py
+--- a/PRIMORA/prime/context/state.py
++++ b/PRIMORA/prime/context/state.py
+@@ -191,51 +191,6 @@ def _extract_all_shades(text: str) -> list["StateCandidate"]:
+         return []
+     return [normalized, relationship[0]]
+ 
+-# In speech, punctuation is frequently missing: "I love Aurora I love
+-# every aspect of it, especially the design". The generic likes slot would
+-# otherwise treat the entire repeated clause as the *name of the thing*.
+-# Accept only a repeated FIRST-PERSON preference with a pronoun referring
+-# back to one clearly named subject. The remainder is preserved verbatim in
+-# its user source, not reinterpreted as a new fact or invented motive.
+-_REPEATED_SUBJECT_LIKE_RE = re.compile(
+-    r"^i\s+(?:really\s+)?(?P<verb>love|like|adore|enjoy)\s+"
+-    r"(?P<subject>[a-z][a-z0-9 '&\-]{1,74}?)"
+-    r"\s*[,;.]?\s+i\s+(?:really\s+)?(?:love|like|adore|enjoy)\s+"
+-    r"(?:(?:every|each)\s+(?:aspect|part|bit)\s+of|"
+-    r"all\s+(?:the\s+)?(?:aspects|parts|bits)\s+of)\s+"
+-    r"(?:it|them)\b(?P<details>.*)$",
+-    re.IGNORECASE | re.DOTALL,
+-)
+-_REPEATED_SUBJECT_JUNK = re.compile(
+-    r"\b(?:i|you|we|they|he|she|my|your|our|their|his|her|"
+-    r"this|that|it|them|anything|everything|something|everyone|"
+-    r"because|whether|but|if|when|which|what)\b",
+-    re.IGNORECASE,
+-)
+-
+-
+-def _extract_repeated_subject_preference(text: str) -> list["StateCandidate"]:
+-    """Preserve the actual item rather than making its details part of its name.
+-
+-    No domain-specific classification (music, games, books, etc.) is inferred.
+-    It remains an ordinary, source-backed liked-item preference; the entire
+-    text is retained as evidence for its explicitly described dimensions.
+-    """
+-    match = _REPEATED_SUBJECT_LIKE_RE.fullmatch(text.strip())
+-    if not match:
+-        return []
+-    subject = " ".join(match.group("subject").split()).strip(" .,!;")
+-    if (not subject or len(subject.split()) > 7
+-            or _REPEATED_SUBJECT_JUNK.search(subject)):
+-        return []
+-    first_clause = f"I {match.group('verb')} {subject}"
+-    candidates = _extract_slots(first_clause)
+-    if (len(candidates) != 1 or candidates[0].slot != "likes"
+-            or not candidates[0].auto_confirm):
+-        return []
+-    return candidates
+-
+-
+ # High-confidence natural-language car preferences that the generic likes
+ # slot cannot parse correctly. Keep these anchored: speculative noun/brand
+ # guessing would create false personal memories.
+@@ -1060,13 +1015,6 @@ def extract_candidates(
+         cands = _extract_explicit_car_preferences(head)
+     if not cands:
+         cands = _extract_all_shades(head)
+-    if not cands and _REPEATED_SUBJECT_LIKE_RE.fullmatch(head.strip()):
+-        cands = _extract_repeated_subject_preference(head)
+-        if not cands:
+-            # An ambiguous subject ("this"/"anything") is not a named
+-            # preference. Do not let the generic greedy likes slot treat
+-            # the whole utterance as an item name instead.
+-            return []
+     if not cands:
+         cands = _extract_slots(head)
+     if not cands:
+diff --git a/PRIMORA/prime/context/store.py b/PRIMORA/prime/context/store.py
+--- a/PRIMORA/prime/context/store.py
++++ b/PRIMORA/prime/context/store.py
+@@ -1180,6 +1180,35 @@ def fetch_conversation(
+             ).fetchall()
+         return [StoredMessage(*r) for r in self._visible("messages", list(reversed(rows)), lambda r: r[0])]
+ 
++    def fetch_context_before(
++        self, message_id: int, *, limit: int = 4,
++    ) -> list[StoredMessage]:
++        """Nearby prior dialogue, excluding protocol and forgotten evidence.
++
++        A queued job processed hours later must never receive subsequent
++        conversation as if it preceded the source statement.
++        """
++        if not 1 <= limit <= 8:
++            raise ValueError("context limit must be 1..8")
++        with self._connection() as con:
++            source = con.execute(
++                "SELECT session_id FROM messages WHERE id=?", (int(message_id),)
++            ).fetchone()
++            if source is None:
++                return []
++            rows = con.execute(
++                "SELECT m.id, m.session_id, m.seq, m.role, m.content,"
++                " m.timestamp, m.fingerprint, m.importance FROM messages m"
++                " WHERE m.session_id=? AND m.id < ?"
++                " AND m.role IN ('user', 'assistant')"
++                " AND m.content NOT LIKE ?"
++                " AND NOT EXISTS (SELECT 1 FROM suppressed_memory s"
++                " WHERE s.kind='messages' AND s.ref_id=m.id)"
++                " ORDER BY m.id DESC LIMIT ?",
++                (source[0], int(message_id), "%<prime_request>%", limit),
++            ).fetchall()
++        return [StoredMessage(*row) for row in reversed(rows)]
++
+     def max_seq(self, session_id: str) -> int:
+         """Highest stored sequence in this session, or -1 when there is none."""
+         with self._connection() as con:
+diff --git a/TESTS/prime/test_compound_preference_m12.py b/TESTS/prime/test_compound_preference_m12.py
+--- a/TESTS/prime/test_compound_preference_m12.py
++++ b/TESTS/prime/test_compound_preference_m12.py
+@@ -1,99 +1,254 @@
+-"""M12 preference parsing regression: speech without punctuation or item metadata.
++"""Integrated semantic-first memory acceptance: disposable SQLite only.
+ 
+-No game/music/car-specific hardcoding and no production memory access.
++No topic- or product-specific runtime extraction. The provider is a fixture
++that stands in for Qwen's interpretation; live Qwen must be tested separately.
+ """
+ from __future__ import annotations
+ 
++import json
+ import pytest
+ 
++from PRIMORA.prime.contract import PrimeResult
+ from PRIMORA.prime.context import ContextManager
+-from PRIMORA.prime.context.state import extract_candidates
++from PRIMORA.prime.context.formation import validate_semantic_candidate, TypedMemoryCandidate
++from PRIMORA.prime.context.store import ContextStore
+ 
+ 
+-@pytest.mark.parametrize(("utterance", "subject", "verb"), [
++class _ProposalProvider:
++    def __init__(self, subject, predicate="love", claim_kind="assertion", fail=False):
++        self.subject = subject
++        self.predicate = predicate
++        self.claim_kind = claim_kind
++        self.fail = fail
++        self.calls = []
++
++    def invoke(self, capability, payload):
++        assert capability == "memory_formation"
++        self.calls.append(payload)
++        if self.fail:
++            return PrimeResult.failure("offline")
++        if not self.subject:
++            return PrimeResult.success({"content": '{"candidates":[]}'})
++        source = payload["messages"][-1]["content"]
++        subject = self.subject
++        verb = {
++            "love": "loves", "like": "likes", "adore": "adores",
++            "enjoy": "enjoys", "prefer": "prefers",
++            "hate": "hates", "dislike": "dislikes",
++        }[self.predicate]
++        candidate = {
++            "kind": "preference",
++            "concept": f"likes for {subject}",
++            "value": f"{verb} {subject}",
++            "subject": subject,
++            "predicate": self.predicate,
++            "claim_kind": self.claim_kind,
++            "actor": "user",
++            "scope": "global",
++            "source_ids": [payload["source_message_id"]],
++            "source_quote": source,
++            "confidence": .95,
++        }
++        return PrimeResult.success({"content": json.dumps({"candidates":[candidate]})})
++
++
++@pytest.fixture(autouse=True)
++def semantic_mode(monkeypatch):
++    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_MODE", "semantic")
++    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_DEFERRED", "0")
++
++
++@pytest.mark.parametrize("statement,subject,predicate", [
+     (
+         "i love cyberpunk i love every aspect of it whether its story "
+         "its gameplay or visual all of those are the best",
+-        "cyberpunk", "loves",
++        "cyberpunk", "love",
+     ),
+     (
+         "I adore Silver Lanterns I love every part of it, especially the arrangement",
+-        "silver lanterns", "adores",
++        "Silver Lanterns", "adore",
+     ),
+     (
+-        "I enjoy Northwind Atlas, I love all aspects of it including the maps",
+-        "northwind atlas", "enjoys",
+-    ),
+-    (
+-        "I like Paper Gardens. I really love every bit of it, particularly the illustrations.",
+-        "paper gardens", "likes",
++        "I enjoy Northwind Atlas; its maps and page layout are delightful.",
++        "Northwind Atlas", "enjoy",
+     ),
+ ])
+-def test_repeated_liking_names_one_actual_subject(utterance, subject, verb):
+-    candidates = extract_candidates(utterance, "user")
+-    assert len(candidates) == 1, candidates
+-    candidate = candidates[0]
+-    assert candidate.concept == f"likes for {subject}"
+-    assert candidate.value.lower() == f"{verb} {subject}"
+-    assert candidate.scope == "global"
+-    assert candidate.auto_confirm
+-    assert candidate.rationale == ""  # Details remain sourced, not invented.
+-
+-
+-def test_compound_preference_survives_restart_with_user_source(tmp_path):
+-    path = tmp_path / "preference.db"
+-    original = (
+-        "i love cyberpunk i love every aspect of it whether its story "
+-        "its gameplay or visual all of those are the best"
++def test_unfamiliar_compound_claims_are_canonical_and_source_backed(
++    tmp_path, statement, subject, predicate,
++):
++    path = tmp_path / "semantic.db"
++    provider = _ProposalProvider(subject, predicate)
++    manager = ContextManager(
++        db_path=path, formation_provider=provider, hybrid_retrieval=False,
+     )
+-    manager = ContextManager(db_path=path, hybrid_retrieval=False)
++    assert manager.semantic_formation
+     manager.reconcile([
+-        {"role": "user", "content": "What do you remember about my fav video games?"},
+-        {"role": "assistant", "content": "I don't have a verified entry. Tell me about one."},
+-        {"role": "user", "content": original},
+-    ], "session")
++        {"role": "user", "content": "Which items do I like most?"},
++        {"role": "assistant", "content": "Tell me which one you enjoy."},
++        {"role": "user", "content": statement},
++    ], "conversation")
+     states = manager._get_store().fetch_states(
+-        scope="global", concept="likes for cyberpunk", status="current",
++        scope="global", concept=f"likes for {subject.casefold()}",
++        status="current",
+     )
+-    assert len(states) == 1
+-    assert states[0].value == "loves cyberpunk"
+-    assert len(states[0].source_ids) == 1
+-    source = manager._get_store().fetch_messages_by_ids(states[0].source_ids)
+-    assert len(source) == 1 and source[0].content == original
+-    assert "story" in source[0].content
+-    assert "gameplay" in source[0].content
+-    assert "visual" in source[0].content
++    assert len(states) == 1, manager._get_store().fetch_states(scope="global")
++    assert states[0].value.lower() == {
++        "love": "loves", "adore": "adores", "enjoy": "enjoys",
++    }[predicate] + " " + subject.casefold()
++    evidence = manager._get_store().fetch_messages_by_ids(states[0].source_ids)
++    assert len(evidence) == 1 and evidence[0].content == statement
++    # The fallback regex must not have stored a second, giant concept.
++    assert not any("every aspect" in row.concept
++                   for row in manager._get_store().fetch_states())
+ 
+     restarted = ContextManager(db_path=path, hybrid_retrieval=False)
+-    again = restarted._get_store().fetch_states(
+-        scope="global", concept="likes for cyberpunk", status="current",
++    recalled = restarted._get_store().fetch_states(
++        scope="global", concept=f"likes for {subject.casefold()}", status="current"
+     )
+-    assert len(again) == 1
+-    assert again[0].source_ids == states[0].source_ids
+-    assert again[0].value == states[0].value
++    assert len(recalled) == 1
++    assert recalled[0].source_ids == states[0].source_ids
+ 
+ 
+-@pytest.mark.parametrize("utterance", [
+-    "I love this I love every aspect of it.",
+-    "I love anything I love every part of it.",
+-    "I love Northern Lights and I love Paper Gardens.",
+-    "If I loved Northern Lights I would love every aspect of it.",
+-    "I love every aspect of it.",
++def test_older_dialogue_is_context_only_never_evidence(tmp_path):
++    provider = _ProposalProvider("Birch Lantern")
++    manager = ContextManager(
++        db_path=tmp_path / "dialogue.db", formation_provider=provider,
++    )
++    manager.reconcile([
++        {"role": "assistant", "content": "Remember your Birch Lantern project?"},
++        {"role": "user", "content": "I love Birch Lantern for its shape."},
++    ], "s")
++    payload = provider.calls[-1]
++    assert payload["messages"][-1]["content"] == "I love Birch Lantern for its shape."
++    assert any(m["role"] == "assistant" for m in payload["messages"][1:-1])
++    states = manager._get_store().fetch_states(scope="global", status="current")
++    assert len(states) == 1
++    linked = manager._get_store().fetch_messages_by_ids(states[0].source_ids)
++    assert len(linked) == 1 and linked[0].role == "user"
++
++
++@pytest.mark.parametrize("statement,subject", [
++    ("Suppose I loved Grey Paper, that would be fictional.", "Grey Paper"),
++    ("My sister loves Birch Lantern.", "Birch Lantern"),
++    ("I love this I love every aspect of it.", "this"),
++    ("I love Indigo Dusk I love every aspect of it.", "Indigo Dusk I love every aspect"),
+ ])
+-def test_no_false_named_preference_from_pronouns_or_conditional(utterance):
+-    candidates = extract_candidates(utterance, "user")
+-    # No high-confidence structured preference that turns a nonspecific
+-    # reference/conditional into a current named user preference.
+-    assert not any(
+-        c.auto_confirm and c.concept in (
+-            "likes for this", "likes for anything", "likes for northern lights"
+-        )
+-        for c in candidates
++def test_unsafe_model_proposals_do_not_become_current_memory(tmp_path, statement, subject):
++    provider = _ProposalProvider(subject)
++    manager = ContextManager(db_path=tmp_path / "unsafe.db",
++                             formation_provider=provider)
++    manager.reconcile([{"role": "user", "content": statement}], "s")
++    assert manager._get_store().fetch_states(status="current") == []
++    assert manager._get_store().fetch_range("s")[0].content == statement
++
++
++def test_provider_failure_leaves_raw_only_without_legacy_fallback(tmp_path):
++    path = tmp_path / "down.db"
++    provider = _ProposalProvider("Cedar Kite", fail=True)
++    manager = ContextManager(db_path=path, formation_provider=provider)
++    manager.reconcile(
++        [{"role": "user", "content": "I love Cedar Kite a lot."}], "s"
++    )
++    assert manager._get_store().fetch_states(status="current") == []
++    assert manager._get_store().fetch_range("s")
++    assert manager.formation_jobs(status="failed")
++
++
++def test_no_provider_is_raw_only(tmp_path):
++    manager = ContextManager(db_path=tmp_path / "noprov.db")
++    manager.reconcile(
++        [{"role": "user", "content": "I love New Horizon."}], "s"
++    )
++    assert manager._get_store().fetch_states(status="current") == []
++    assert manager._get_store().fetch_range("s")
++
++
++def test_source_quote_cannot_be_fabricated(tmp_path):
++    store = ContextStore(tmp_path / "proof.db")
++    source_id, _, _ = store.append("s", 0, "user", "I enjoy Silver Prism.")
++    source = store.fetch_message(source_id)
++    candidate = TypedMemoryCandidate(
++        kind="preference", concept="likes for Silver Prism",
++        value="loves Silver Prism", subject="Silver Prism",
++        predicate="love", actor="user", claim_kind="assertion",
++        source_ids=[source_id], source_quote="I love Silver Prism.",
++    )
++    valid, reason = validate_semantic_candidate(candidate, source)
++    assert not valid and reason == "semantic_missing_exact_quote"
++
++
++def test_legacy_remains_explicit_rollback(tmp_path, monkeypatch):
++    monkeypatch.setenv("PRIMORA_MEMORY_FORMATION_MODE", "legacy")
++    manager = ContextManager(db_path=tmp_path / "legacy.db", enable_memory_v2=False)
++    manager.reconcile(
++        [{"role": "user", "content": "I love Willow Trees."}], "s"
+     )
++    assert manager._get_store().fetch_states(scope="global", status="current")
+ 
++def test_negative_preference_supersedes_positive_without_affecting_other_topics(tmp_path):
++    path = tmp_path / "correction.db"
++    first = _ProposalProvider("Maple Board", "love")
++    manager = ContextManager(db_path=path, formation_provider=first)
++    manager.reconcile([
++        {"role": "user", "content": "I love Maple Board."},
++    ], "session")
++    assert len(manager._get_store().fetch_states(
++        scope="global", concept="likes for maple board", status="current")) == 1
++    second = _ProposalProvider("Maple Board", "dislike", "negation")
++    manager.set_formation_provider(second)
++    manager.reconcile([
++        {"role": "user", "content": "I don't like Maple Board anymore."},
++    ], "other-session")
++    currents = manager._get_store().fetch_states(
++        scope="global", concept="likes for maple board", status="current")
++    assert len(currents) == 1
++    assert currents[0].value == "dislikes Maple Board"
++    prior = manager._get_store().fetch_states(
++        scope="global", concept="likes for maple board", status="superseded")
++    assert len(prior) == 1 and prior[0].value == "loves Maple Board"
+ 
+-def test_core_instruction_respects_answer_category_context():
+-    from PRIMORA.aurora.configuration import AuroraConfig
+-    instruction = AuroraConfig.from_env().system_instruction
+-    assert "interpret X within that category" in instruction
+-    assert "details already stated" in instruction
++
++def test_repeated_reconciliation_is_idempotent(tmp_path):
++    provider = _ProposalProvider("Winter Orchard")
++    manager = ContextManager(db_path=tmp_path / "idempotent.db",
++                             formation_provider=provider)
++    turn = [{"role": "user", "content": "I love Winter Orchard."}]
++    manager.reconcile(turn, "session")
++    count_before = len(provider.calls)
++    manager.reconcile(turn, "session")
++    assert len(provider.calls) == count_before
++    assert len(manager._get_store().fetch_states(
++        scope="global", concept="likes for winter orchard",
++        status="current")) == 1
++
++
++@pytest.mark.parametrize("dimension,value", [
++    ("favorite instrument", "cello"),
++    ("favorite travel style", "slow train journeys"),
++])
++def test_model_formed_explicit_favorite_slots_keep_category_and_value(
++    tmp_path, dimension, value,
++):
++    class _FactProvider:
++        def invoke(self, capability, payload):
++            source = payload["messages"][-1]["content"]
++            return PrimeResult.success({"content": json.dumps({
++                "candidates": [{
++                    "kind": "state", "concept": dimension, "value": value,
++                    "claim_kind": "assertion", "actor": "user",
++                    "scope": "global", "source_ids": [payload["source_message_id"]],
++                    "source_quote": source, "confidence": 0.95,
++                }]
++            })})
++
++    manager = ContextManager(
++        db_path=tmp_path / "favorite.db", formation_provider=_FactProvider(),
++    )
++    message = f"My {dimension} is {value}."
++    manager.reconcile([{"role": "user", "content": message}], "s")
++    states = manager._get_store().fetch_states(
++        scope="global", concept=dimension, status="current",
++    )
++    assert len(states) == 1
++    assert states[0].value == value
++    assert manager._get_store().fetch_messages_by_ids(states[0].source_ids)[0].content == message
+diff --git a/TESTS/prime/test_memory_integrity_m13.py b/TESTS/prime/test_memory_integrity_m13.py
+new file mode 100644
+--- /dev/null
++++ b/TESTS/prime/test_memory_integrity_m13.py
+@@ -0,0 +1,63 @@
++"""Migration preview and gated retirement on disposable databases only."""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from PRIMORA.prime.context.store import ContextStore
++from PRIMORA.prime.context.memory_integrity_m13 import preview, apply_reviewed
++
++
++def test_preview_detects_giant_sentence_subject_without_changing_memory(tmp_path):
++    path = tmp_path / "malformed.db"
++    store = ContextStore(path)
++    bad_id, _, _ = store.append(
++        "s", 0, "user",
++        "I love Cedar Kite I love every aspect of it, including the design.",
++    )
++    good_id, _, _ = store.append("s", 1, "user", "I love Birch Lantern.")
++    bad_state = store.create_state(
++        "s", "global",
++        "likes for cedar kite i love every aspect of it including the design",
++        "loves cedar kite i love every aspect of it including the design",
++        [bad_id], memory_type="PREFERENCE",
++    )
++    good_state = store.create_state(
++        "s", "global", "likes for birch lantern", "loves birch lantern",
++        [good_id], memory_type="PREFERENCE",
++    )
++    flagged = preview(store)
++    assert len(flagged) == 1
++    assert flagged[0]["state_id"] == bad_state
++    assert store.fetch_states(state_ids=[bad_state], status="current")
++    with pytest.raises(ValueError):
++        apply_reviewed(path, [good_state])
++    assert store.fetch_states(state_ids=[bad_state], status="current")
++    assert not list(tmp_path.glob("*.before-m13.sqlite"))
++
++
++def test_explicit_retirement_backups_and_preserves_raw_sources(tmp_path):
++    path = tmp_path / "malformed.db"
++    store = ContextStore(path)
++    source_id, _, _ = store.append(
++        "s", 0, "user", "I adore Silver Lanterns I adore every aspect of it."
++    )
++    invalid = store.create_state(
++        "s", "global", "likes for silver lanterns i adore every aspect of it",
++        "adores silver lanterns i adore every aspect of it",
++        [source_id], memory_type="PREFERENCE",
++    )
++    receipt = apply_reviewed(path, [invalid])
++    assert receipt["retired"] == 1
++    assert receipt["backed_up"]
++    reopened = ContextStore(path)
++    assert reopened.fetch_states(state_ids=[invalid], status="current") == []
++    assert reopened.fetch_states(state_ids=[invalid], status="superseded")
++    assert reopened.fetch_message(source_id).role == "user"
++    with sqlite3.connect(receipt["backed_up"]) as con:
++        assert con.execute(
++            "SELECT status FROM states WHERE id=?", (invalid,)
++        ).fetchone()[0] == "current"
++    with pytest.raises(ValueError):
++        apply_reviewed(path, [invalid])
