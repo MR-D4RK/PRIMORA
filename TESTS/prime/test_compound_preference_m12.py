@@ -194,6 +194,31 @@ def test_real_preference_about_fictional_subject_is_not_hypothetical(tmp_path):
     assert manager._get_store().fetch_messages_by_ids(rows[0].source_ids)[0].content == statement
 
 
+@pytest.mark.parametrize("statement,subject,predicate,claim_kind", [
+    ("I recently started liking a fictional band called Willow Bay.",
+     "Willow Bay", "like", "assertion"),
+    ("I also like a fictional band called Copper Orchard.",
+     "Copper Orchard", "like", "assertion"),
+    ("I still like Copper Orchard.", "Copper Orchard", "like", "assertion"),
+    ("I don't like Willow Bay anymore.", "Willow Bay", "dislike", "negation"),
+    ("I no longer like Willow Bay.", "Willow Bay", "dislike", "negation"),
+])
+def test_first_person_preference_variants_have_source_evidence(
+        tmp_path, statement, subject, predicate, claim_kind):
+    store = ContextStore(tmp_path / "proof.db")
+    source_id, _, _ = store.append("session", 0, "user", statement)
+    source = store.fetch_message(source_id)
+    verbs = {"like": "likes", "dislike": "dislikes"}
+    candidate = TypedMemoryCandidate(
+        kind="preference", subject=subject, predicate=predicate,
+        concept="likes for " + subject,
+        value=verbs[predicate] + " " + subject,
+        actor="user", claim_kind=claim_kind,
+        source_ids=[source_id], source_quote=statement, scope="global",
+    )
+    assert validate_semantic_candidate(candidate, source) == (True, "ok")
+
+
 def test_compound_correction_creates_independent_history_across_sessions(tmp_path):
     """Two independent likes plus a mixed-polarity correction retain provenance."""
     class BatchProvider:
@@ -247,7 +272,7 @@ def test_compound_correction_creates_independent_history_across_sessions(tmp_pat
     orchard = store.fetch_states(
         scope="global", concept="likes for copper orchard", status="current",
     )
-    assert len(harbor) == len(orchard) == 1
+    assert len(harbor) == len(orchard) == 1, (manager.formation_status(), store.fetch_states(scope="global"))
     assert harbor[0].value == "dislikes Candle Harbor"
     assert orchard[0].value == "likes Copper Orchard"
     old_harbor = store.fetch_states(
