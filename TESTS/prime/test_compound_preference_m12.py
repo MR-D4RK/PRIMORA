@@ -253,6 +253,30 @@ def test_semantic_formation_retains_emphasized_feature_as_reason(tmp_path):
     assert len(historical) == 1
     assert historical[0].value == "I especially love its guitar melodies"
 
+    # A new-session correction retires the old explanation without erasing
+    # it or changing its original user-message provenance.
+    manager.set_formation_provider(
+        _ProposalProvider("Northglass", "dislike", "negation")
+    )
+    manager.reconcile(
+        [{"role": "user", "content": "I don't like Northglass anymore."}],
+        "corrected",
+    )
+    assert store.fetch_states(
+        scope="global", concept="rationale for likes for northglass",
+        status="current",
+    ) == []
+    old_reasons = store.fetch_states(
+        scope="global", concept="rationale for likes for northglass",
+        status="superseded",
+    )
+    assert len(old_reasons) == 1
+    assert old_reasons[0].value == "I especially love its guitar melodies"
+    current = store.fetch_states(
+        scope="global", concept="likes for northglass", status="current",
+    )
+    assert len(current) == 1 and current[0].value == "dislikes Northglass"
+
 
 def test_focused_feature_does_not_attach_to_wrong_subject(tmp_path):
     statement = (
