@@ -31,20 +31,22 @@ Management is opt-in per process through ``PRIMORA_MODEL_SERVER``:
     Never probe, start, or stop anything; the operator runs the server
     (or the endpoint) themselves. Zero I/O.
 
-Environment (all optional; defaults match the launcher):
+Environment (all optional; defaults select Qwen3.5 9B vision):
 
 ``PRIMORA_LLAMACPP_SERVER``   llama-server executable
-``PRIMORA_LLAMACPP_MODEL``    the GGUF model file
+``PRIMORA_LLAMACPP_MODEL``    GGUF model file (defaults to project Qwen3.5 9B)
+``PRIMORA_LLAMACPP_MMPROJ``   matching multimodal projector GGUF (default for project model)
 ``PRIMORA_MODEL_SERVER_PORT`` port (default 8080; host is 127.0.0.1)
 ``PRIMORA_MODEL_SERVER_WAIT`` readiness wait in seconds (default 180)
 ``PRIMORA_MODEL_SERVER_CTX``  context size passed as -c (default 4096)
-``PRIMORA_MODEL_SERVER_ALIAS``served model alias (default qwen3-8b-heretic)
+``PRIMORA_MODEL_SERVER_ALIAS`` served model alias (default qwen3.5-9b)
 ``PRIMORA_MODEL_SERVER_KEEP`` 1/true/yes/on leaves a started server running
 """
 
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import subprocess
 import time
@@ -55,24 +57,29 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
-# Defaults taken verbatim from launch-aurora-llamacpp.ps1 so behaviour
-# does not drift between the launcher and the entry point.
+# The default model assets live in the project; operator-provided paths
+# still override both through environment variables.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SERVER_EXE = Path(
     r"C:\Users\M\Downloads\Llama"
     r"\llama-b10615-bin-win-cuda-12.4-x64\llama-server.exe"
 )
-DEFAULT_MODEL_PATH = Path(
-    r"C:\Users\M\Downloads\qwen3-8b-heretic-Q4_K_M.gguf"
+DEFAULT_MODEL_PATH = (
+    _PROJECT_ROOT / "RESOURCES" / "aurora" / "qwen3.5-9b"
+    / "Qwen3.5-9B-Q4_K_M.gguf"
+)
+DEFAULT_MMPROJ_PATH = (
+    _PROJECT_ROOT / "RESOURCES" / "aurora" / "qwen3.5-9b"
+    / "mmproj-Qwen3.5-9B-f16.gguf"
 )
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8080
 DEFAULT_CTX = 4096
 DEFAULT_NGL = "99"
-DEFAULT_ALIAS = "qwen3-8b-heretic"
+DEFAULT_ALIAS = "qwen3.5-9b"
 DEFAULT_WAIT_SECONDS = 180
 DEFAULT_TIMEOUT_SECONDS = "300"
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_LOG_PATH = _PROJECT_ROOT / "logs" / "llama-server.log"
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -103,6 +110,26 @@ def health(host: str, port: int, timeout: float = 2.0) -> bool:
             return resp.status == 200
     except (urllib.error.URLError, OSError, ValueError):
         return False
+
+
+def _served_model_ids(host: str, port: int) -> tuple[str, ...]:
+    """Inspect the local llama-server model registry before adopting it.
+
+    Do not silently connect the new Qwen3.5 runtime to an old Heretic server.
+    An unreadable model registry fails closed for multimodal deployments.
+    """
+    url = f"http://{host}:{port}/v1/models"
+    try:
+        with urllib.request.urlopen(url, timeout=3.0) as resp:
+            payload = json.load(resp)
+    except (urllib.error.URLError, OSError, ValueError, TypeError):
+        return ()
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return ()
+    return tuple(
+        item["id"] for item in payload["data"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    )
 
 
 def _truthy(value: str) -> bool:
@@ -163,6 +190,7 @@ class ModelServerService:
     keep: bool = False
     mode: str = "auto"
     log_path: Path = DEFAULT_LOG_PATH
+    mmproj: Optional[Path] = None
     _proc: Optional[subprocess.Popen] = field(
         default=None, repr=False, compare=False)
     _atexit_registered: bool = field(
@@ -184,13 +212,17 @@ class ModelServerService:
                 f"unsupported PRIMORA_MODEL_SERVER={mode!r}; "
                 "expected 'auto', 'on' or 'off'"
             )
+        configured_model = source.get("PRIMORA_LLAMACPP_MODEL")
+        configured_mmproj = source.get("PRIMORA_LLAMACPP_MMPROJ")
         return cls(
             exe=Path(
                 source.get("PRIMORA_LLAMACPP_SERVER") or DEFAULT_SERVER_EXE
             ),
-            model=Path(
-                source.get("PRIMORA_LLAMACPP_MODEL") or DEFAULT_MODEL_PATH
-            ),
+            model=Path(configured_model or DEFAULT_MODEL_PATH),
+            # Custom models opt out of the default projector unless supplied
+            # explicitly; a projector from another architecture is unsafe.
+            mmproj=(Path(configured_mmproj) if configured_mmproj
+                    else DEFAULT_MMPROJ_PATH if not configured_model else None),
             host=DEFAULT_HOST,
             port=_int("PRIMORA_MODEL_SERVER_PORT", DEFAULT_PORT),
             alias=str(
@@ -232,6 +264,16 @@ class ModelServerService:
     def ensure(self) -> ModelServerStatus:
         """Adopt a healthy server or start one; never download anything."""
         if health(self.host, self.port):
+            if self.mmproj is not None:
+                ids = _served_model_ids(self.host, self.port)
+                if self.alias not in ids:
+                    raise ModelServerError(
+                        f"A different or unverifiable llama-server is already "
+                        f"running on port {self.port}. Expected alias "
+                        f"{self.alias!r}; detected {ids or 'unknown'}. "
+                        "Stop the existing llama-server and retry. "
+                        "PRIMORA will not stop an adopted process."
+                    )
             return ModelServerStatus(
                 state="adopted", base_url=self.base_url)
 
@@ -247,6 +289,12 @@ class ModelServerService:
                 self.model,
                 "Set PRIMORA_LLAMACPP_MODEL to the GGUF file.",
             )
+        if self.mmproj is not None and not self.mmproj.is_file():
+            raise self._missing(
+                "multimodal projector GGUF",
+                self.mmproj,
+                "Set PRIMORA_LLAMACPP_MMPROJ to the matching projector file.",
+            )
 
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         args = [
@@ -258,6 +306,8 @@ class ModelServerService:
             "-ngl", DEFAULT_NGL,
             "--alias", self.alias,
         ]
+        if self.mmproj is not None:
+            args.extend(["--mmproj", str(self.mmproj), "--jinja"])
         with open(self.log_path, "ab") as log_f:
             proc = subprocess.Popen(
                 args,
