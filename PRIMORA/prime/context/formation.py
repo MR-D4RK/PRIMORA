@@ -414,9 +414,17 @@ def validate_semantic_candidate(candidate: TypedMemoryCandidate, message: Any) -
         return False, "semantic_attitude_unproven"
     # Naming an object and an attitude in someone else's report is not
     # evidence of the user's own preference.
+    # Preserve first-person authority while recognizing ordinary aspect and
+    # continuity markers: "I recently started liking", "I also like", and
+    # "I still like" are genuine user statements, not third-party reports.
+    # The model's proposed predicate and named subject are independently
+    # checked above against the exact user quote.
     if not re.search(
-        r"\b(?:i|we)\s+(?:(?:really|truly|absolutely)\s+)?"
-        r"(?:love|like|adore|enjoy|prefer|hate|dislike|"
+        r"\b(?:i|we)\s+"
+        r"(?:(?:have\s+)?(?:recently\s+)?(?:started|began)\s+)?"
+        r"(?:(?:really|truly|absolutely|also|still|currently|now|"
+        r"no\s+longer)\s+){0,3}"
+        r"(?:love|like|liking|adore|enjoy|prefer|hate|dislike|"
         r"don't\s+like|do\s+not\s+like)\b"
         r"|\bmy\s+(?:fav|favorite|favourite)\b",
         quote, re.I,
