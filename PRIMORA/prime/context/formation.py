@@ -885,6 +885,22 @@ def apply_proposals(
                     valid_until=candidate.valid_until,
                 )
             admitted.append(state_id)
+            if candidate.kind == "preference" and candidate.predicate in (
+                "dislike", "hate"
+            ):
+                # When a liking becomes a dislike, its old explanation is
+                # still valid history but no longer a current preference
+                # rationale. Preserve the original sourced row as superseded.
+                previous_reasons = store.fetch_states(
+                    scope=scope,
+                    concept="rationale for " + candidate.concept,
+                    status="current",
+                )
+                if previous_reasons:
+                    store.supersede_states(
+                        [st.state_id for st in previous_reasons],
+                        transition_time=message.timestamp,
+                    )
             diagnostics.extend(_admit_rationale(
                 store, session_id, scope, state_id, candidate, message,
                 admission=admission,
