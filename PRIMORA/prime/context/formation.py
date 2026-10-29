@@ -688,6 +688,15 @@ def apply_proposals(
         if not valid:
             diagnostics.append(f"proposal_rejected:{reason}")
             continue
+        if semantic_first and candidate.kind == "preference":
+            # The model's capitalization is presentation, not identity.
+            # Normalize the key only after validating the sourced subject.
+            # Preserve the value verbatim and keep the source evidence.
+            from dataclasses import replace
+            candidate = replace(
+                candidate,
+                concept="likes for " + " ".join(candidate.subject.split()).casefold(),
+            )
         if candidate.kind == "preference" and not candidate.rationale:
             explicit_rationale = _source_rationale(store, candidate.source_ids)
             if explicit_rationale:
